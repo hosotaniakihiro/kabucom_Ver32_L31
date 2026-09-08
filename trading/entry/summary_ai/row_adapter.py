@@ -31,6 +31,34 @@ import pandas as pd
 from .utils import first_value, normalize_symbol, safe_float, safe_int, safe_str
 
 
+_SCORE_3M_KEYS = ["score_3m", "buy_score_3m", "summary_score_3m", "combined_score_3m"]
+_SCORE_5M_KEYS = ["score_5m", "buy_score_5m", "summary_score_5m", "combined_score_5m"]
+
+
+def _has_any_key(row: Any, keys: list) -> bool:
+    """その列が実際に来ているか。欠損を 0 と区別するために使う。
+
+    値が NaN/None のものは「来ていない」と扱う。0.0 が入っているものだけを
+    「本当に 0」とみなす。
+    """
+    try:
+        for k in keys:
+            if k not in row:
+                continue
+            v = row[k]
+            if v is None:
+                continue
+            try:
+                if pd.isna(v):
+                    continue
+            except Exception:
+                pass
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def _safe_bool(v: Any, default: bool = False) -> bool:
     try:
         if isinstance(v, bool):
@@ -170,6 +198,12 @@ def convert_summary_row_to_ai_gate_row(
         "score_penalty": safe_float(first_value(row, ["ai_score_penalty", "disp_pen", "score_penalty", "breakdown_pen"], 0.0)),
 
         # entry_gate.py の3m/5m補正用
-        "score_3m": safe_float(first_value(row, ["score_3m", "buy_score_3m", "summary_score_3m"], 0.0)),
-        "score_5m": safe_float(first_value(row, ["score_5m", "buy_score_5m", "summary_score_5m"], 0.0)),
+        # 値は従来どおり 0.0 既定のまま返す (後段の互換のため) が、
+        # 「列が無かった」のか「本当に 0 だった」のかを別フラグで持つ。
+        # これが無いと entry_gate の reason が両方 3m=0.00 になり、
+        # attach 失敗が「3分足が弱い」に化けていた。
+        "score_3m": safe_float(first_value(row, _SCORE_3M_KEYS, 0.0)),
+        "score_5m": safe_float(first_value(row, _SCORE_5M_KEYS, 0.0)),
+        "score_3m_present": _has_any_key(row, _SCORE_3M_KEYS),
+        "score_5m_present": _has_any_key(row, _SCORE_5M_KEYS),
     }

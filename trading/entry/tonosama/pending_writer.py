@@ -24,6 +24,7 @@ import pandas as pd
 
 from trading.entry.pending_manager import add_pending, get_bucket, replace_bucket, snapshot_root
 from .config import TONOSAMA_EXPIRE_SEC
+from .config import MIN_LATEST_VOLUME as _CFG_MIN_LATEST_VOLUME
 from .utils import normalize_symbol, safe_float
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,10 @@ SELLING_CLIMAX_MIN_PRICE_DROP_PCT = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_PRIC
 
 MAX_BUY_PREV_3M5M_UP_STREAK = _env_int("TONOSAMA_MAX_BUY_PREV_3M5M_UP_STREAK", 2)
 MAX_SELL_PREV_3M5M_DOWN_STREAK = _env_int("TONOSAMA_MAX_SELL_PREV_3M5M_DOWN_STREAK", 2)
-MIN_FINAL_LATEST_VOLUME = _env_float("TONOSAMA_MIN_FINAL_LATEST_VOLUME", _env_float("TONOSAMA_MIN_LATEST_VOLUME", 50000.0))
+# 既定値は config.MIN_LATEST_VOLUME (数値の持ち主は config.py だけ)。
+# 2026-09-01 まではここに 50000 が直書きされており、
+# config 側を 10000 に直しても最終ガードだけ 50000 のまま残っていた。
+MIN_FINAL_LATEST_VOLUME = _env_float("TONOSAMA_MIN_FINAL_LATEST_VOLUME", _CFG_MIN_LATEST_VOLUME)
 
 # final direction / optional 5sec guard
 MIN_FINAL_5SEC_CHANGE_PCT = _env_float("TONOSAMA_FINAL_MIN_5SEC_CHANGE_PCT", _env_float("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", 0.01))
@@ -600,7 +604,7 @@ def _side_ok_by_3m5m(cond: dict[str, Any], side: str, ma_info: dict[str, Any]) -
     slope = _relax_sf(cond.get("slope"), 0.0)
     price_chg = _relax_sf(cond.get("max_price_change_pct"), 0.0)
     latest_volume = _relax_sf(cond.get("latest_volume"), 0.0)
-    min_volume = _relax_sf(cond.get("min_final_latest_volume"), _relax_env_float("TONOSAMA_MIN_FINAL_LATEST_VOLUME", 50000.0))
+    min_volume = _relax_sf(cond.get("min_final_latest_volume"), _relax_env_float("TONOSAMA_MIN_FINAL_LATEST_VOLUME", MIN_FINAL_LATEST_VOLUME))
     ma3_slope = _relax_sf(ma_info.get("ma3_slope"), 0.0)
     ma5_slope = _relax_sf(ma_info.get("ma5_slope"), 0.0)
     ma_reason = str(ma_info.get("reason") or "")

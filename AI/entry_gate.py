@@ -271,20 +271,52 @@ def _block(reason: str, confidence: float = 0.0, model_used: str = "NONE") -> di
     }
 
 
+ENTRY_SCORE_MAX = 1.50
+
+
 def _allow(
     *,
     confidence: float,
     lot_multiplier: float,
     reason: str,
     model_used: str,
+    ai_confidence: float | None = None,
+    ai_inference: bool = False,
+    confidence_source: str = "rule_entry_score",
 ) -> dict:
-    return {
+    """ENTRY 許可を返す。
+
+    2026-09-02 の整理:
+      confidence という 1 変数に
+        dominant_ratio x ranking_conf x mtf_conf x immediate_p x momentum_boost
+        (+ 3m/5m の x1.10 ボーナス)
+      を全部掛けて clamp(1.50) していたため、AI 信頼度のつもりの値が
+      1.100 のように 1.0 を超えていた。これは確率ではなく **ルール由来の
+      複合エントリースコア**なので、名前と範囲を分けて持つ。
+
+      entry_score    ルール複合スコア (0.0〜ENTRY_SCORE_MAX)
+      ai_confidence  実 AI モデルが出した信頼度だけ (0.0〜1.0)。
+                     モデルを使っていなければ None
+      confidence     後方互換のため従来値のまま (判定は一切変えない)
+    """
+    conf = float(confidence)
+    out = {
         "allow": True,
-        "confidence": float(confidence),
+        "confidence": conf,
+        "entry_score": conf,
+        "entry_score_max": float(ENTRY_SCORE_MAX),
         "lot_multiplier": float(lot_multiplier),
         "reason": str(reason),
         "model_used": model_used,
+        "ai_inference": bool(ai_inference),
+        "confidence_source": str(confidence_source),
     }
+    if ai_inference and ai_confidence is not None:
+        # AI 信頼度は確率なので 0..1 を保証する
+        out["ai_confidence"] = max(0.0, min(1.0, float(ai_confidence)))
+    else:
+        out["ai_confidence"] = None
+    return out
 
 
 def _ranking_momentum_boost(row: dict) -> float:
@@ -485,8 +517,16 @@ def _ai_final_entry_check_core(row: dict) -> dict:
     momentum_boost = _ranking_momentum_boost(row) if is_ranking else 1.0
     final_conf = dominant_ratio * ranking_conf * mtf_conf * immediate_p * momentum_boost
 
+    # score_3m / score_5m は row.get() が欠損時に None -> 0.0 になるため、
+    # 「3分足が弱い」と「3分足が attach されていない」が両方 3m=0.00 になって
+    # 区別できなかった。row_adapter が付ける *_present で切り分ける。
+    # 補正の適用条件 (>=4.0 / >=3.5) は一切変えていない。
     score_3m = _safe_float(row.get("score_3m"))
     score_5m = _safe_float(row.get("score_5m"))
+    has_3m = bool(row.get("score_3m_present", "score_3m" in row))
+    has_5m = bool(row.get("score_5m_present", "score_5m" in row))
+    txt_3m = ("%.2f" % score_3m) if has_3m else "NA"
+    txt_5m = ("%.2f" % score_5m) if has_5m else "NA"
     if score_3m >= 4.0:
         final_conf *= 1.10
     if score_5m >= 3.5:
@@ -500,8 +540,20 @@ def _ai_final_entry_check_core(row: dict) -> dict:
             pass
 
     lot_multiplier = max(0.5, min(2.0, 0.5 + final_conf))
+    if final_conf > ENTRY_SCORE_MAX + 1e-9:
+        logger.error(
+            "[AI ENTRY GATE] entry_score が上限を超えた symbol=%s value=%.3f max=%.2f "
+            "(dominant=%.2f ranking=%.2f mtf=%.2f imm=%.2f boost=%.2f)",
+            symbol, final_conf, ENTRY_SCORE_MAX,
+            dominant_ratio, ranking_conf, mtf_conf, immediate_p, momentum_boost,
+        )
     return _allow(
         confidence=final_conf,
+        ai_confidence=(ranking_conf if ranking_ai_used else None),
+        ai_inference=bool(ranking_ai_used),
+        confidence_source=(
+            "ai_model:ranking" if ranking_ai_used else "rule_entry_score:no_ai_model"
+        ),
         lot_multiplier=lot_multiplier,
         reason=(
             f"rankScore={ranking_score_final:.3f}|"
@@ -510,8 +562,9 @@ def _ai_final_entry_check_core(row: dict) -> dict:
             f"imm={immediate_p:.2f}|"
             f"dom={dominant_ratio:.2f}|"
             f"boost={momentum_boost:.2f}|"
-            f"3m={score_3m:.2f}|"
-            f"5m={score_5m:.2f}|"
+            f"3m={txt_3m}|"
+            f"5m={txt_5m}|"
+            f"mtf_data={'ok' if (has_3m and has_5m) else 'DATA_NOT_READY'}|"
             f"src={source}|"
             f"minScore={MIN_SCORE:.2f}"
         ),

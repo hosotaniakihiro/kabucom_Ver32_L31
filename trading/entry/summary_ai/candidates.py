@@ -43,7 +43,12 @@ DEFAULT_MIN_VOLUME = 1.0
 DEFAULT_MIN_PRICE = 200.0
 DEFAULT_MIN_BUY_SLOPE = 0.01
 DEFAULT_MAX_SELL_SLOPE = -0.01
-VERSION = "REV2.6-SUMMARY-1M-MOVEMENT-SCORE-BRIDGE-STRONG"
+VERSION = "REV2.7-SUMMARY-1M-MOVEMENT-SCORE-BRIDGE-STRONG-RANGE-PCT-PERCENT"
+
+# range_pct 系の列はすべて percent 単位 (1.88% = 1.88)。
+# 単位の定義は trading/entry/summary_ai/range_defs.py と揃えること。
+RANGE_PCT_SCALE = 100.0
+RANGE_PCT_RATIO_HINT = 1.0
 
 # 旧 tonosama_history_failclose_strict_patch._patch_summary_ai() の定数表。
 STRICT_CANDIDATE_CONSTANTS: dict[str, float] = {
@@ -276,7 +281,11 @@ def _movement_score_fallback(out: pd.DataFrame, final_buy: pd.Series, final_sell
         open_valid = open_.where(open_ > 0, close)
         co_pct = ((close - open_valid) / open_valid.where(open_valid > 0, 1.0)).fillna(0.0)
         hl_pct = ((high - low) / safe_close).where((high > 0) & (low > 0) & (high >= low), 0.0).fillna(0.0)
-        range_pct = _max_series(hl_pct.abs(), range_pct_col.abs())
+        # range_pct 列は percent 単位 (2026-09-01 に統一)。
+        # ここから下の内部計算は比率 (0-1) なので 100 で割って揃える。
+        # 割らずに混ぜると raw_strength が 100 倍になり、
+        # movement_ok が常に True になって低変動ガードが効かなくなる。
+        range_pct = _max_series(hl_pct.abs(), (range_pct_col.abs() / RANGE_PCT_SCALE))
         atr_pct = (atr.abs() / safe_close).fillna(0.0)
         macd_diff = ((macd - signal) / safe_close).fillna(0.0)
 
@@ -672,9 +681,21 @@ def _rpr_series(df: pd.DataFrame, names: tuple[str, ...], default: float = 0.0):
     return pd.Series(default, index=df.index, dtype="float64")
 
 
-def _rpr_fraction(s):
+def _rpr_percent(s):
+    """既存の range_pct 系列を percent 単位へ正規化する (入力境界で 1 回だけ)。
+
+    range_pct は percent 単位 (1.88% = 1.88) に統一した。
+    古い比率表記 (0.0188) が残っている場合だけ 100 倍して揃える。
+    実務上 1% 未満の値幅は「比率で書かれた古い値」か
+    「本当に 1% 未満」かの区別が付かないため、
+    0 < v < RANGE_PCT_RATIO_HINT のときだけ比率とみなす。
+    """
     ss = pd.to_numeric(s, errors="coerce").fillna(0.0).astype(float).abs()
-    return ss.mask(ss > 1.0, ss / 100.0)
+    return ss.mask((ss > 0.0) & (ss < RANGE_PCT_RATIO_HINT), ss * RANGE_PCT_SCALE)
+
+
+# 後方互換 alias (旧名で参照している箇所があっても壊さない)
+_rpr_fraction = _rpr_percent
 
 
 def _repair_range_pct_columns(out: pd.DataFrame) -> pd.DataFrame:
@@ -685,18 +706,18 @@ def _repair_range_pct_columns(out: pd.DataFrame) -> pd.DataFrame:
             return out
         close = _rpr_series(out, ("close", "close_price", "current_price", "price", "last_price", "ai_disp_close"), 0.0)
         safe_close = close.where(close > 0, 1.0)
-        existing = _rpr_fraction(_rpr_series(out, ("range_pct", "intraday_range_pct", "day_range_pct", "summary_ai_movement_range_pct"), 0.0))
+        existing = _rpr_percent(_rpr_series(out, ("range_pct", "intraday_range_pct", "day_range_pct", "summary_ai_movement_range_pct"), 0.0))
 
         high = _rpr_series(out, ("high",), 0.0)
         low = _rpr_series(out, ("low",), 0.0)
-        bar_rng = ((high - low) / safe_close).where((high > 0) & (low > 0) & (high >= low), 0.0).abs().fillna(0.0)
+        bar_rng = ((high - low) / safe_close * RANGE_PCT_SCALE).where((high > 0) & (low > 0) & (high >= low), 0.0).abs().fillna(0.0)
 
         day_high = _rpr_series(out, ("day_high", "today_high", "intraday_high", "session_high", "high_price", "high_price_day", "range_high"), 0.0)
         day_low = _rpr_series(out, ("day_low", "today_low", "intraday_low", "session_low", "low_price", "low_price_day", "range_low"), 0.0)
-        day_rng = ((day_high - day_low) / safe_close).where((day_high > 0) & (day_low > 0) & (day_high >= day_low), 0.0).abs().fillna(0.0)
+        day_rng = ((day_high - day_low) / safe_close * RANGE_PCT_SCALE).where((day_high > 0) & (day_low > 0) & (day_high >= day_low), 0.0).abs().fillna(0.0)
 
         open_ = _rpr_series(out, ("opening_price", "open_price", "open", "day_open"), 0.0)
-        open_rng = ((close - open_) / safe_close).where((open_ > 0) & (close > 0), 0.0).abs().fillna(0.0)
+        open_rng = ((close - open_) / safe_close * RANGE_PCT_SCALE).where((open_ > 0) & (close > 0), 0.0).abs().fillna(0.0)
 
         repaired = pd.concat([existing, bar_rng, day_rng, open_rng], axis=1).max(axis=1).fillna(0.0).astype(float)
         improved = repaired > (existing + 1e-12)

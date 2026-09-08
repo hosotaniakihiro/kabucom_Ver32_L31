@@ -41,6 +41,7 @@ from .config import (
     MIN_BODY_CHANGE_PCT,
     MIN_INTRABAR_RANGE_PCT,
     MIN_LATEST_VOLUME,
+    MIN_LATEST_TURNOVER,
     MIN_5SEC_PRICE_CHANGE_PCT,
     MAX_5SEC_DROP_PCT,
     REQUIRE_5SEC_BAR,
@@ -603,6 +604,49 @@ def _ensure_actual_movement_cols_core(df: pd.DataFrame) -> pd.DataFrame:
         x["_lower_wick_pct"] = 0.0
 
     x["_latest_volume"] = pd.to_numeric(x[volume_col], errors="coerce").fillna(0.0) if volume_col else 0.0
+
+    # ------------------------------------------------------------
+    # _latest_turnover: その 1 分足の売買代金
+    # ------------------------------------------------------------
+    # turnover 列があればそれを使い、無ければ volume x close で作る。
+    # 「出来高」と「売買代金」を同じ列名で持ち回らないため、
+    # 名前を _latest_volume / _latest_turnover に分ける。
+    turnover_col = _first_existing(
+        x, ["turnover", "turnover_1m", "trading_value", "trade_value", "value_1m"]
+    )
+    if turnover_col:
+        x["_latest_turnover"] = pd.to_numeric(x[turnover_col], errors="coerce").fillna(0.0)
+        x["_latest_turnover_source"] = turnover_col
+    else:
+        x["_latest_turnover"] = (
+            _num_series(x, "_latest_volume", 0.0)
+            * pd.to_numeric(x["_tonosama_close_for_move"], errors="coerce").fillna(0.0)
+        )
+        x["_latest_turnover_source"] = "volume_x_close"
+
+    # ------------------------------------------------------------
+    # _slope: 正規列名への 1 回だけの互換変換 (入力境界)
+    # ------------------------------------------------------------
+    # 2026-09-01 のログでは base summary に slope 列があるのに
+    #   [TONOSAMA FILTER WARN] stage=primary missing _slope -> slope filter skipped
+    # が出続け、傾きフィルターが一度も効いていなかった。
+    # 下流 (フィルタ / サンプル / rescue) は _slope を正規名として使うので、
+    # ここで 1 回だけ寄せる。値の変換はしない (別名の付け替えだけ)。
+    if "_slope" not in x.columns or not pd.to_numeric(x["_slope"], errors="coerce").notna().any():
+        slope_col = _first_existing(
+            x, ["slope", "slope_atr_scaled", "score_slope", "ma75_slope", "slope_1m"]
+        )
+        if slope_col:
+            x["_slope"] = pd.to_numeric(x[slope_col], errors="coerce")
+            x["_slope_source"] = slope_col
+            logger.warning(
+                "[TONOSAMA SLOPE ALIAS] _slope が無かったので %s から作った rows=%s nonnull=%s "
+                "(正規列名は _slope。互換変換は入力境界のここだけで行う)",
+                slope_col, len(x), int(x["_slope"].notna().sum()),
+            )
+        else:
+            x["_slope_source"] = "missing"
+
     return x
 
 
@@ -824,6 +868,12 @@ def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     x = _ensure_actual_movement_cols(x)
     base_rows = len(x)
+    try:
+        from .config import log_effective_config_once
+
+        log_effective_config_once()
+    except Exception:
+        logger.debug("[TONOSAMA CONFIG] effective config log failed", exc_info=True)
     _diagnose_base_frame(x)
     sample_cols = ["symbol", "symbolname", "close", "_latest_volume", "_body_change_pct", "_signed_body_change_pct", "_intrabar_range_pct", "_close_position_pct", "_upper_wick_pct", "_lower_wick_pct", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "score", "final_score", "score_mtf", "mtf"]
     if "close" in x.columns:
@@ -831,6 +881,11 @@ def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
         _log_filter_step(stage="primary", before=before, after=x, reason="close_below_min_price", threshold={"MIN_PRICE": MIN_PRICE}, sample_cols=sample_cols)
     before = x.copy(); x = x[_num_series(x, "_latest_volume") >= MIN_LATEST_VOLUME]
     _log_filter_step(stage="primary", before=before, after=x, reason="latest_volume_low_flat_alert_guard", threshold={"MIN_LATEST_VOLUME": MIN_LATEST_VOLUME}, sample_cols=sample_cols)
+    # 売買代金 (最新1分足) の下限。出来高だけだと低位株が通ってしまう。
+    # _latest_turnover は _ensure_actual_movement_cols_core が必ず作るので
+    # 「列が無くて全件落ちる」ことは起きない。
+    before = x.copy(); x = x[_num_series(x, "_latest_turnover") >= MIN_LATEST_TURNOVER]
+    _log_filter_step(stage="primary", before=before, after=x, reason="latest_turnover_low", threshold={"MIN_LATEST_TURNOVER": MIN_LATEST_TURNOVER}, sample_cols=sample_cols)
     before = x.copy(); x = x[_num_series(x, "_body_change_pct") >= MIN_BODY_CHANGE_PCT]
     _log_filter_step(stage="primary", before=before, after=x, reason="body_change_low_flat_alert_guard", threshold={"MIN_BODY_CHANGE_PCT": MIN_BODY_CHANGE_PCT}, sample_cols=sample_cols)
     before = x.copy(); x = x[_num_series(x, "_intrabar_range_pct") >= MIN_INTRABAR_RANGE_PCT]
@@ -849,7 +904,7 @@ def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
 
     x = _apply_climax_guards(x, stage="primary", sample_cols=sample_cols)
 
-    _LAST_FILTER_DIAG = {"stage": "primary", "base_rows": base_rows, "primary_rows": len(x), "thresholds": {"MIN_PRICE": MIN_PRICE, "MIN_LATEST_VOLUME": MIN_LATEST_VOLUME, "MIN_BODY_CHANGE_PCT": MIN_BODY_CHANGE_PCT, "MIN_INTRABAR_RANGE_PCT": MIN_INTRABAR_RANGE_PCT, "MIN_VOLUME_SURGE_RATIO": MIN_VOLUME_SURGE_RATIO, "MIN_PRICE_CHANGE_PCT": MIN_PRICE_CHANGE_PCT, "MIN_SLOPE": MIN_SLOPE, "MAX_BUY_PRICE_CHANGE_PCT": MAX_BUY_PRICE_CHANGE_PCT, "MAX_SELL_PRICE_DROP_PCT": MAX_SELL_PRICE_DROP_PCT, "BUY_REJECTED_CLOSE_POSITION_PCT": BUY_REJECTED_CLOSE_POSITION_PCT, "SELL_REJECTED_CLOSE_POSITION_PCT": SELL_REJECTED_CLOSE_POSITION_PCT}, "survivors": _sample_rows(x, sample_cols, limit=12)}
+    _LAST_FILTER_DIAG = {"stage": "primary", "base_rows": base_rows, "primary_rows": len(x), "thresholds": {"MIN_PRICE": MIN_PRICE, "MIN_LATEST_VOLUME": MIN_LATEST_VOLUME, "MIN_LATEST_TURNOVER": MIN_LATEST_TURNOVER, "MIN_BODY_CHANGE_PCT": MIN_BODY_CHANGE_PCT, "MIN_INTRABAR_RANGE_PCT": MIN_INTRABAR_RANGE_PCT, "MIN_VOLUME_SURGE_RATIO": MIN_VOLUME_SURGE_RATIO, "MIN_PRICE_CHANGE_PCT": MIN_PRICE_CHANGE_PCT, "MIN_SLOPE": MIN_SLOPE, "MAX_BUY_PRICE_CHANGE_PCT": MAX_BUY_PRICE_CHANGE_PCT, "MAX_SELL_PRICE_DROP_PCT": MAX_SELL_PRICE_DROP_PCT, "BUY_REJECTED_CLOSE_POSITION_PCT": BUY_REJECTED_CLOSE_POSITION_PCT, "SELL_REJECTED_CLOSE_POSITION_PCT": SELL_REJECTED_CLOSE_POSITION_PCT}, "survivors": _sample_rows(x, sample_cols, limit=12)}
     logger.warning("[TONOSAMA FILTER SUMMARY] stage=primary base_rows=%s primary_rows=%s survivors=%s thresholds=%s", base_rows, len(x), _LAST_FILTER_DIAG.get("survivors"), _LAST_FILTER_DIAG.get("thresholds"))
     return x
 

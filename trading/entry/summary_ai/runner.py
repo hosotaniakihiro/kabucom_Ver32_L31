@@ -210,11 +210,59 @@ def _wsf_summary_like(source: Any) -> bool:
 
 def _wsf_zero_confirm_reason(reason: str) -> bool:
     r = str(reason or "")
+    # 3m=NA は entry_gate が「attach されていない」と明示したもの。
+    # 従来はそれも 3m=0.00 として同じ経路で落ちていたので、
+    # ここで拾わないと挙動が変わってしまう (通ってしまう) 。落とす側で揃える。
     return (
         "rankScore=0.000" in r
-        and ("3m=0.00" in r or "3m=0.0" in r or "3m=0|" in r)
-        and ("5m=0.00" in r or "5m=0.0" in r or "5m=0|" in r)
+        and ("3m=0.00" in r or "3m=0.0" in r or "3m=0|" in r or "3m=NA" in r)
+        and ("5m=0.00" in r or "5m=0.0" in r or "5m=0|" in r or "5m=NA" in r)
     )
+
+
+def _wsf_reason_kind(reason: str) -> str:
+    """その NG が attach 失敗由来か、本当にスコア 0 かを返す。"""
+    r = str(reason or "")
+    if "mtf_data=DATA_NOT_READY" in r or "3m=NA" in r or "5m=NA" in r:
+        return "data_not_ready_attach_missing"
+    return "score_zero"
+
+
+def _wsf_interval_availability() -> dict:
+    """3m/5m が「無い」のか「あるがスコア 0」なのかを切り分けるための実測。
+
+    reason 文字列の "3m=0.00" は、3 分足が生成できていない場合も
+    3 分足が本当に弱い場合も同じ表示になる。判定 (reject) は変えないが、
+    どちらなのかログで区別できないと調査ができない。
+    データ不足を 0 とみなして通すことはしない。
+    """
+    out: dict = {}
+    try:
+        from global_state import global_data
+
+        cache = getattr(global_data, "ranking_summary_cache", None)
+        for iv in (3, 5):
+            df = None
+            if isinstance(cache, dict):
+                df = cache.get(iv)
+            if df is None:
+                df = getattr(global_data, f"ranking_summary_{iv}min_df", None)
+            if df is None or not hasattr(df, "empty"):
+                out[f"{iv}m"] = "missing"
+                continue
+            if df.empty:
+                out[f"{iv}m"] = "empty"
+                continue
+            latest = None
+            try:
+                if "datetime" in df.columns:
+                    latest = str(pd.to_datetime(df["datetime"], errors="coerce").max())
+            except Exception:
+                latest = None
+            out[f"{iv}m"] = "rows=%d latest=%s" % (len(df), latest)
+    except Exception:
+        logger.debug("[SUMMARY AI WEAK FILTER] interval availability probe failed", exc_info=True)
+    return out
 
 
 def run_ai_gate_for_candidates(*args: Any, **kwargs: Any):
@@ -228,17 +276,30 @@ def run_ai_gate_for_candidates(*args: Any, **kwargs: Any):
         return results
     out = []
     changed = []
+    kinds: dict = {}
     for row in results:
         if isinstance(row, dict) and bool(row.get("allow")) and _wsf_zero_confirm_reason(str(row.get("reason") or "")):
             new_row = dict(row)
             new_row["allow"] = False
-            new_row["reason"] = f"{new_row.get('reason', '')}|zero_3m5m_confirm_ng"
+            kind = _wsf_reason_kind(str(row.get("reason") or ""))
+            new_row["reason"] = f"{new_row.get('reason', '')}|zero_3m5m_confirm_ng:{kind}"
+            new_row["block_kind"] = kind
+            kinds[kind] = kinds.get(kind, 0) + 1
             changed.append(str(new_row.get("symbol") or ""))
             out.append(new_row)
         else:
             out.append(row)
     if changed:
-        logger.warning("[SUMMARY AI WEAK FILTER] zero 3m/5m confirmation ng source=%s symbols=%s", source, changed[:20])
+        avail = _wsf_interval_availability()
+        # kind=data_missing なら「3分足が作れていない」、kind=score_zero なら
+        # 「3分足はあるが弱い」。同じ 3m=0.00 でも意味が違う。
+        missing = [k for k, v in avail.items() if v in ("missing", "empty")]
+        kind = "data_missing" if missing else ("score_zero" if avail else "unknown")
+        logger.warning(
+            "[SUMMARY AI WEAK FILTER] zero 3m/5m confirmation ng kind=%s by_row_kind=%s missing=%s "
+            "availability=%s source=%s count=%s symbols=%s",
+            kind, kinds or "-", missing or "-", avail or "-", source, len(changed), changed[:20],
+        )
     return out
 
 

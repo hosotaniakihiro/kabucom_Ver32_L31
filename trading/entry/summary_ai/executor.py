@@ -52,7 +52,7 @@ import os
 import sys
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
@@ -185,7 +185,51 @@ def _pick_turnover(item: Dict[str, Any]) -> float:
     return price * vol if price > 0 and vol > 0 else 0.0
 
 
+# ------------------------------------------------------------
+# range_pct の単位 (2026-09-01 に統一)
+# ------------------------------------------------------------
+# range_pct は **百分率 (percent)** で扱う。1.88% は 1.88。
+#   range_pct = (high - low) / close * 100
+#
+# それ以前は
+#   _pick_range_pct        比率 (0.0188) を返す
+#   _blowoff_range_pct_value  raw<=0.5 なら 100 倍する推測変換
+#   SUMMARY_AI_BLOWOFF_DANGER_RANGE_PCT=2.5   「2.5%」のつもりの閾値
+# が同居しており、0.0188 >= 2.5 が成立しないため blowoff 危険判定が
+# 一度も発火していなかった。計算・閾値・ログをすべて percent に揃える。
+#
+# 閾値の既定値も percent へ直した:
+#   SUMMARY_AI_EXECUTOR_MIN_RANGE_PCT     0.005 (比率) -> 0.5 (percent)
+#   SUMMARY_AI_STRATEGY_MIN_RANGE_PCT_SOFT 0.004 (比率) -> 0.4 (percent)
+# 既存の ENV / settings に比率で書かれた値が残っていても壊れないよう、
+# _as_percent_threshold() が入力境界で 1 回だけ換算する。
+RANGE_PCT_UNIT = "percent"
+RANGE_PCT_SCALE = 100.0
+
+# これ未満は「比率で書かれた古い設定」とみなして 100 倍する。
+# 0.05% 未満の値幅を閾値にする運用は無いので誤変換しない。
+_RANGE_PCT_RATIO_HINT = 0.05
+
+
+def _as_percent_threshold(value: float, *, name: str = "") -> float:
+    """閾値を percent に正規化する (入力境界で 1 回だけ)。"""
+    try:
+        v = float(value)
+    except Exception:
+        return 0.0
+    if 0.0 < v < _RANGE_PCT_RATIO_HINT:
+        converted = v * RANGE_PCT_SCALE
+        logger.warning(
+            "[SUMMARY AI EXECUTOR] range 閾値が比率で指定されている name=%s raw=%s -> percent=%s "
+            "(range_pct は percent 単位。設定側も percent へ直すこと)",
+            name or "-", v, converted,
+        )
+        return converted
+    return v
+
+
 def _pick_range_pct(item: Dict[str, Any]) -> float:
+    """その足の値幅を percent で返す。0.0 は「値幅ゼロ」ではなく未算出も含む。"""
     for d in _dict_sources(item):
         for k in ("range_pct", "intrabar_range_pct", "_intrabar_range_pct"):
             x = safe_float(d.get(k), 0.0)
@@ -195,8 +239,178 @@ def _pick_range_pct(item: Dict[str, Any]) -> float:
     low = _pick_low(item)
     close = _pick_price(item)
     if close > 0 and high > 0 and low > 0 and high > low:
-        return abs(high - low) / close
+        return abs(high - low) / close * RANGE_PCT_SCALE
     return 0.0
+
+
+# ============================================================
+# F: REAL_AI と fail-open を数える
+# ------------------------------------------------------------
+# AI.entry_gate は fail-open 行に ai_inference=False /
+# model_used="FALLBACK_NO_AI:..." / confidence_source="fixed_failopen:..."
+# を必ず刻んでいるが、集計側は allow だけを見て AI_OK と数えていた。
+# ここでは判定を変えず、内訳を数えられるようにする。
+# ============================================================
+
+AI_SOURCE_REAL = "REAL_AI_OK"
+AI_SOURCE_FALLBACK = "FALLBACK_OK"
+AI_SOURCE_UNKNOWN = "AI_SOURCE_UNKNOWN"
+
+
+def classify_ai_source(item: Dict[str, Any]) -> str:
+    """1 候補が実 AI 推論由来か fail-open 由来かを返す。"""
+    for d in _dict_sources(item):
+        if not isinstance(d, dict):
+            continue
+        if d.get("ai_inference") is False:
+            return AI_SOURCE_FALLBACK
+        src = str(d.get("confidence_source") or "")
+        if src.startswith("fixed_failopen"):
+            return AI_SOURCE_FALLBACK
+        model = str(d.get("model_used") or "")
+        if model.startswith("FALLBACK_NO_AI"):
+            return AI_SOURCE_FALLBACK
+    for d in _dict_sources(item):
+        if isinstance(d, dict) and d.get("ai_inference") is True:
+            return AI_SOURCE_REAL
+    return AI_SOURCE_UNKNOWN
+
+
+def live_requires_real_ai() -> bool:
+    """実売買で AI 推論由来だけを発注対象にするか (既定 True = fail-closed)。"""
+    return _env_bool("SUMMARY_AI_LIVE_REQUIRE_REAL_AI", True)
+
+
+def drop_failopen_for_live(
+    ai_results: Any, *, dry_run: bool, interval: Any = None
+) -> List[Dict[str, Any]]:
+    """order path へ渡す前に fail-open 由来の AI_OK を落とす。
+
+    AI.entry_gate は救済行に
+        ai_inference=False / model_used="FALLBACK_NO_AI:..." /
+        confidence_source="fixed_failopen:..."
+    を刻んでいる。これは AI 推論結果ではなく固定値の fail-open なので、
+    実売買 (dry_run=False) の新規 ENTRY 根拠にしてはいけない。
+
+    dry_run では落とさない (診断・候補表示は従来どおり)。
+    """
+    items = [x for x in (ai_results or [])]
+    if dry_run or not live_requires_real_ai():
+        return items
+
+    kept: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
+    for x in items:
+        if isinstance(x, dict) and bool(x.get("allow")) and classify_ai_source(x) == AI_SOURCE_FALLBACK:
+            dropped.append(x)
+            continue
+        kept.append(x)
+
+    if dropped:
+        logger.error(
+            "[SUMMARY AI EXECUTOR][LIVE FAIL-CLOSED] fail-open 由来の AI_OK を発注対象から除外した "
+            "interval=%s dropped=%d kept_ok=%d symbols=%s "
+            "(AI 推論ではない固定 confidence のため実売買では ENTRY させない。"
+            "SUMMARY_AI_LIVE_REQUIRE_REAL_AI=0 で従来動作)",
+            interval, len(dropped),
+            sum(1 for x in kept if isinstance(x, dict) and x.get("allow")),
+            [
+                {
+                    "symbol": _pick_symbol(x),
+                    "side": _pick_side(x),
+                    "model": str(x.get("model_used") or "")[:40],
+                    "conf_source": str(x.get("confidence_source") or "")[:40],
+                }
+                for x in dropped[:10]
+            ],
+        )
+    return kept
+
+
+def _ai_source_counts(items: Any) -> Counter:
+    c: Counter = Counter()
+    try:
+        for it in items or []:
+            if isinstance(it, dict):
+                c[classify_ai_source(it)] += 1
+    except Exception:
+        logger.debug("[SUMMARY AI FUNNEL] ai source count failed", exc_info=True)
+    return c
+
+
+def _pick_hist_len(item: Dict[str, Any]) -> float:
+    """この銘柄の履歴本数。足りていなければ range は「小さい」ではなく「出せない」。"""
+    for d in _dict_sources(item):
+        for k in ("symbol_hist_len", "hist_len", "bar_count", "history_len"):
+            x = safe_float(d.get(k), -1.0)
+            if x >= 0:
+                return x
+    return -1.0
+
+
+# ============================================================
+# range_pct=0 の切り分け
+# ------------------------------------------------------------
+# range_pct は _pick_range_pct() の通り「その足の中の値幅」(intrabar) で、
+# 5 分レンジではない。仕様どおり。
+#
+# 問題は high == low == close になった時に、それが
+#   (a) 本当にその足で値が動かなかった (真の低ボラ)
+#   (b) その足が 1 tick しか無く値幅を出せない (データ不足)
+# のどちらか区別できず、両方 low_move_range_too_small として
+# 落ちていたこと。ログからは (b) と (a) が見分けられなかった。
+#
+# ここでは判定結果 (落とすこと) は変えない。理由を分けるだけ。
+# 不足データを 0 で埋めて通すことはしない。
+# ============================================================
+
+_RANGE_NOT_READY_MIN_HIST = 2.0
+
+
+def _classify_zero_range(item: Dict[str, Any], high: float, low: float, close: float) -> Tuple[str, Dict[str, Any]]:
+    """range が閾値未満のとき、その理由を data_not_ready と低ボラに分ける。
+
+    range の定義は trading.entry.summary_ai.range_defs に集約した。
+    _pick_high/_pick_low は day_high/day_low へフォールバックするため、
+    「その足で動いたか」を見たいのに当日値幅が混ざることがある。
+    ここでは用途別 (intrabar / day) を別々に実測してログへ残す。
+    """
+    hist_len = _pick_hist_len(item)
+    flat_bar = bool(high > 0 and low > 0 and high == low)
+    hl_missing = bool(high <= 0 or low <= 0)
+
+    detail = {
+        "high": high,
+        "low": low,
+        "close": close,
+        "hist_len": hist_len,
+        "flat_bar": flat_bar,
+        "high_low_missing": hl_missing,
+    }
+    try:
+        from .range_defs import compute_day_range_pct, compute_intrabar_range_pct, describe
+
+        intrabar = compute_intrabar_range_pct(item)
+        day = compute_day_range_pct(item)
+        detail["range_intrabar"] = describe(intrabar)
+        detail["range_day"] = describe(day)
+        # 判定に使った値がどちらの定義由来かを明示する
+        # (mixed = 1本足 high/low が無く day_high/day_low が使われた可能性)。
+        detail["range_source_mixed"] = bool(
+            intrabar.get("state") != "OK" and day.get("state") == "OK"
+        )
+        if intrabar.get("state") != "OK":
+            return "data_not_ready_intrabar_range", detail
+    except Exception:
+        logger.debug("[SUMMARY AI PREFILTER] range_defs probe failed", exc_info=True)
+
+    if hl_missing:
+        return "data_not_ready_high_low_missing", detail
+    if flat_bar and 0 <= hist_len < _RANGE_NOT_READY_MIN_HIST:
+        # 1 本しか履歴が無い足の high==low==close は「動かなかった」ではなく
+        # 「値幅を測れていない」。PUSH が薄いときにここへ来る。
+        return "data_not_ready_single_bar_no_range", detail
+    return "low_move_range_too_small", detail
 
 
 def _score_for_side(item: Dict[str, Any]) -> float:
@@ -331,18 +545,25 @@ def _passes_strict_candidate_quality_core(item: Dict[str, Any]) -> tuple[bool, D
     symbol = _pick_symbol(item)
     side = _pick_side(item)
     range_pct = _pick_range_pct(item)
-    min_range_pct = _env_float("SUMMARY_AI_EXECUTOR_MIN_RANGE_PCT", _env_float("SUMMARY_AI_LOW_MOVE_MIN_RANGE_PCT", 0.005))
+    min_range_pct = _as_percent_threshold(
+        _env_float("SUMMARY_AI_EXECUTOR_MIN_RANGE_PCT", _env_float("SUMMARY_AI_LOW_MOVE_MIN_RANGE_PCT", 0.5)),
+        name="SUMMARY_AI_EXECUTOR_MIN_RANGE_PCT",
+    )
     if min_range_pct > 0 and range_pct < min_range_pct:
+        high = _pick_high(item)
+        low = _pick_low(item)
+        close = _pick_price(item)
+        reason, range_detail = _classify_zero_range(item, high, low, close)
+        # 判定は変えない (どちらでも落とす)。ログで区別できるようにするだけ。
         return False, {
             "symbol": symbol,
             "side": side,
-            "reason": "low_move_range_too_small",
+            "reason": reason,
             "range_pct": range_pct,
             "min_range_pct": min_range_pct,
             "score": _score_for_side(item),
-            "price": _pick_price(item),
-            "high": _pick_high(item),
-            "low": _pick_low(item),
+            "price": close,
+            **range_detail,
         }
     return True, {}
 
@@ -391,8 +612,56 @@ def _base_filter_blocked_ai_ok_items_core(ok_items: List[Dict[str, Any]]) -> Lis
             continue
         kept.append(item)
     if skipped:
+        # D/F: 何件がどの理由で落ちたか、AI 実推論と fail-open の内訳を 1 行で出す。
+        # sample=skipped[:10] だけでは 67 件全滅の内訳が読めなかった。
+        reason_counts = Counter(str(s.get("reason") or "unknown") for s in skipped)
+        ai_counts = _ai_source_counts(ok_items)
+        logger.warning(
+            "[SUMMARY AI FUNNEL] stage=strict_prefilter in=%s kept=%s skipped=%s "
+            "by_reason=%s ai_source=%s version=%s",
+            len(ok_items), len(kept), len(skipped),
+            dict(reason_counts.most_common()),
+            dict(ai_counts),
+            VERSION,
+        )
+        _emit_prefilter_cycle_funnel(ok_items, kept, skipped, reason_counts, ai_counts)
         logger.warning("[SUMMARY AI EXECUTOR] strict prefilter skipped=%s kept=%s diag=%s sample=%s version=%s", len(skipped), len(kept), diag, skipped[:10], VERSION)
     return kept
+
+
+# prefilter の却下理由 -> candidate_trace の terminal_reason
+_PREFILTER_TERMINAL_MAP = {
+    "data_not_ready_intrabar_range": "RANGE_NOT_READY",
+    "data_not_ready_single_bar_no_range": "RANGE_NOT_READY",
+    "data_not_ready_high_low_missing": "RANGE_NOT_READY",
+    "low_move_range_too_small": "LOW_MOVE",
+    "price_below_min": "PRICE_OUT_OF_RANGE",
+    "price_over_max": "PRICE_OUT_OF_RANGE",
+    "low_volume": "LOW_LIQUIDITY",
+    "low_turnover": "LOW_LIQUIDITY",
+    "trade_restricted": "TRADE_RESTRICTED",
+    "sell_reject_cached": "SELL_CREDIT_NG",
+}
+
+
+def _emit_prefilter_cycle_funnel(ok_items, kept, skipped, reason_counts, ai_counts) -> None:
+    """サイクル単位 FUNNEL を 1 行で出す (件数のみ。判定はしない)。"""
+    try:
+        from .candidate_trace import CycleFunnel
+
+        f = CycleFunnel(source="strict_prefilter")
+        f.set("candidates", len(ok_items or []))
+        f.set("prefilter_kept", len(kept or []))
+        f.set("real_ai_ok", int(ai_counts.get("REAL_AI_OK", 0)))
+        f.set("fallback_ok", int(ai_counts.get("FALLBACK_OK", 0)))
+        not_ready = sum(n for r, n in reason_counts.items() if str(r).startswith("data_not_ready"))
+        f.set("data_not_ready", int(not_ready))
+        f.set("data_ready", max(0, len(ok_items or []) - int(not_ready)))
+        for reason, n in reason_counts.items():
+            f.add_terminal(_PREFILTER_TERMINAL_MAP.get(str(reason), str(reason).upper()), n)
+        f.emit()
+    except Exception:
+        logger.debug("[SUMMARY AI FUNNEL CYCLE] emit failed", exc_info=True)
 
 
 # ============================================================
@@ -1021,10 +1290,11 @@ def _blowoff_range_pct_value(row: Dict[str, Any], *, close: float, high: float, 
         if raw > 0:
             break
     if raw > 0:
-        return raw * 100.0 if raw <= 0.5 else raw
+        # range_pct は percent で統一済み。ここで推測変換しない。
+        return raw
     base = close if close > 0 else max(high, low, 1.0)
     if high > 0 and low > 0 and high > low and base > 0:
-        return abs(high - low) / base * 100.0
+        return abs(high - low) / base * RANGE_PCT_SCALE
     return 0.0
 
 
@@ -1043,7 +1313,10 @@ def _is_dangerous_blowoff_row(row: Dict[str, Any], *, side: str) -> Tuple[bool, 
     range_pct = _blowoff_range_pct_value(row, close=close, high=high, low=low)
     close_pos = _blowoff_close_position(row, close=close, high=high, low=low)
     min_rsi = _env_float("SUMMARY_AI_BLOWOFF_DANGER_RSI", 80.0)
-    min_range = _env_float("SUMMARY_AI_BLOWOFF_DANGER_RANGE_PCT", 2.5)
+    min_range = _as_percent_threshold(
+        _env_float("SUMMARY_AI_BLOWOFF_DANGER_RANGE_PCT", 2.5),
+        name="SUMMARY_AI_BLOWOFF_DANGER_RANGE_PCT",
+    )
     min_close_pos = _env_float("SUMMARY_AI_BLOWOFF_DANGER_CLOSE_POS", 0.85)
 
     side = _norm_side(side, "BUY")
@@ -1905,6 +2178,8 @@ def _approved_batches(ai_results: Sequence[Dict[str, Any]], *, max_entries: int)
 
 
 def _rev10_execute_ai_ok_entries_bulk(ai_results: Sequence[Dict[str, Any]], *, df_summary: pd.DataFrame, interval: int | str = 1, max_entries: int = DEFAULT_MAX_ENTRIES, dry_run: bool = True, require_market_open: bool = True, entry_pipeline: Optional[Callable[..., Any]] = None) -> Dict[str, Any]:
+    # 実売買では fail-open 由来 (FALLBACK_NO_AI / FIXED_FAILOPEN) を発注対象にしない。
+    ai_results = drop_failopen_for_live(ai_results, dry_run=dry_run, interval=interval)
     _ensure_core_filter(reason="execute_start")
     if require_market_open and not is_market_open():
         approved_rows = build_ai_ok_approved_rows(ai_results, max_entries=max_entries)
@@ -2041,6 +2316,8 @@ __all__ = [
     "DEFAULT_MIN_PRICE_FOR_ENTRY",
     "build_approved_row",
     "build_ai_ok_approved_rows",
+    "drop_failopen_for_live",
+    "live_requires_real_ai",
     "execute_ai_ok_entries_bulk",
     "_select_ai_ok_items",
     "_filter_blocked_ai_ok_items",
@@ -2209,7 +2486,8 @@ def _arr_repair_approved_row_range(approved_row: Any, item: Any = None) -> Any:
         _arr_put(approved_row, "day_high", repaired_high)
         _arr_put(approved_row, "day_low", repaired_low)
         try:
-            range_pct = abs(repaired_high - repaired_low) / max(float(close), 1.0)
+            # percent 単位 (range_pct の唯一の定義)
+            range_pct = abs(repaired_high - repaired_low) / max(float(close), 1.0) * RANGE_PCT_SCALE
             _arr_put(approved_row, "range_pct", range_pct)
             _arr_put(approved_row, "intraday_range_pct", range_pct)
             _arr_put(approved_row, "day_range_pct", range_pct)
@@ -2518,7 +2796,7 @@ def _sm_classify_core(row: dict[str, Any]) -> dict[str, Any]:
     atr = _sm_num(row, "atr", "ATR")
     range_pct = _sm_num(row, "range_pct", "intrabar_range_pct", "_intrabar_range_pct")
     if range_pct <= 0 and close > 0 and high > low:
-        range_pct = abs(high - low) / close
+        range_pct = abs(high - low) / close * RANGE_PCT_SCALE
     ma5, ma25, ma75 = _sm_ma_state(row)
     above_ma5 = close > 0 and ma5 > 0 and close >= ma5
     below_ma5 = close > 0 and ma5 > 0 and close <= ma5
@@ -2594,7 +2872,10 @@ def _sm_classify_core(row: dict[str, Any]) -> dict[str, Any]:
             reversal += 0.4; reasons.append("above_ma5_mean_revert")
 
     # Penalize low-volatility pseudo signals, but do not replace existing low-vol guard.
-    if range_pct > 0 and range_pct < _sm_env_float("SUMMARY_AI_STRATEGY_MIN_RANGE_PCT_SOFT", 0.004):
+    if range_pct > 0 and range_pct < _as_percent_threshold(
+        _sm_env_float("SUMMARY_AI_STRATEGY_MIN_RANGE_PCT_SOFT", 0.4),
+        name="SUMMARY_AI_STRATEGY_MIN_RANGE_PCT_SOFT",
+    ):
         breakout -= 0.4
         pullback -= 0.2
         reasons.append("strategy_low_range_soft_penalty")

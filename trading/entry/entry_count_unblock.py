@@ -90,8 +90,34 @@ def refresh_token_publish(ret):
 def get_valid_token_env_first(orig, *args, **kwargs):
     """旧 get_valid_token_patched (token_manager.get_valid_token 差し替え)。
 
-    env に十分な長さのトークンがあればそれを優先し、無ければ内側の層へ委ねる。
+    2026-09-01 修正:
+      settings.ini が正 (canonical) で、env はその写し。
+      旧実装は env を無条件に優先し、さらに token_manager.API_TOKEN を
+      env の値で上書きしていた。/token を取り直して settings.ini を
+      更新しても、env に古い token が残っているプロセスでは
+        - get_valid_token() が古い token を返す
+        - token_manager.API_TOKEN まで古い値に巻き戻される
+        - requests フックが X-API-KEY に古い token を載せる
+      となり、「発行したばかりの token なのに 4001009 APIキー不一致」に見えた。
+      env は settings.ini に token が無いときのフォールバックに戻す。
     """
+    settings_token = ""
+    try:
+        import token_manager
+
+        settings_token = str(token_manager.read_settings_token() or "").strip()
+    except Exception:
+        settings_token = ""
+
+    if len(settings_token) >= 16:
+        try:
+            import token_manager
+
+            token_manager.API_TOKEN = settings_token
+        except Exception:
+            pass
+        return settings_token
+
     token = None
     for env_name in ("KABUSAPI_TOKEN", "KABU_TOKEN", "KABU_API_KEY", "KABUSAPI_API_KEY", "X_API_KEY"):
         v = os.getenv(env_name)

@@ -175,7 +175,11 @@ def _range_rescue_ok(features: dict, *, side: str, min_surge: float, effective_s
     lower_wick = safe_float(features.get("lower_wick_pct"), 0.0)
 
     min_range = _env_float("TONOSAMA_AI_FALLBACK_MIN_RANGE_PCT", 3.0)
-    min_volume = _env_float("TONOSAMA_AI_FALLBACK_MIN_LATEST_VOLUME", 50000.0)
+    # 既定値は config.MIN_LATEST_VOLUME を使う (数値の持ち主は config.py だけ)。
+    min_volume = _env_float(
+        "TONOSAMA_AI_FALLBACK_MIN_LATEST_VOLUME",
+        float(_cfg("MIN_LATEST_VOLUME", 10000.0)),
+    )
     min_dir_change = _env_float_floor("TONOSAMA_AI_FALLBACK_RANGE_RESCUE_MIN_DIR_CHANGE", 0.10, 0.05)
     min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01)), 0.0)
     reject_zero_5s = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", False)

@@ -357,6 +357,123 @@ def _print_summary_ai_top20_console(results: list[dict[str, Any]], *, interval: 
         logger.exception("[SUMMARY AI TOP20 RESULT] console print failed interval=%s source=%s", interval, source)
 
 
+def _entry_ready_audit(df: pd.DataFrame, *, interval, source: str, side: str) -> dict:
+    """AI へ渡す直前の enrich 完了状況を 1 行で残す。
+
+    途中状態 (score_mtf=0 のまま / technical 未計算 / ranking 未マージ) の
+    DataFrame が AI に渡っていないかを、次回ログでそのまま検証できるようにする。
+    """
+    def _num(col: str):
+        try:
+            return pd.to_numeric(df[col], errors="coerce") if col in df.columns else None
+        except Exception:
+            return None
+
+    def _nonzero(col: str) -> int:
+        s = _num(col)
+        if s is None:
+            return 0
+        try:
+            return int((s.fillna(0) != 0).sum())
+        except Exception:
+            return 0
+
+    def _bool_true(col: str) -> int:
+        if col not in df.columns:
+            return 0
+        try:
+            return int(pd.Series(df[col]).fillna(False).astype(bool).sum())
+        except Exception:
+            return 0
+
+    rows = len(df)
+    technical_ready = _bool_true("technical_ready")
+    mtf_ready = max(_nonzero("score_mtf"), _nonzero("mtf"))
+    ranking_ready = max(_nonzero("ranking_score"), _nonzero("rank"))
+    # score_3m_present / score_5m_present は mtf_attach が立てる
+    # 「その足を実際に繋げたか」の旗。0.00 と欠損を区別する唯一の手段なので
+    # 最優先で見る (旧実装は存在しない列ばかり見て常に 0 を出していた)。
+    ready_3m = _bool_true("score_3m_present") or _nonzero("score_mtf_3m") or _nonzero("mtf_3m") or _nonzero("confirm_3m")
+    ready_5m = _bool_true("score_5m_present") or _nonzero("score_mtf_5m") or _nonzero("mtf_5m") or _nonzero("confirm_5m")
+
+    try:
+        src_counts = df["technical_source"].astype(str).value_counts().to_dict() if "technical_source" in df.columns else {}
+    except Exception:
+        src_counts = {}
+
+    audit = {
+        "rows": rows,
+        "technical_ready": technical_ready,
+        "3m_ready": int(ready_3m),
+        "5m_ready": int(ready_5m),
+        "mtf_ready": mtf_ready,
+        "ranking_ready": ranking_ready,
+        "technical_source": src_counts,
+    }
+
+    incomplete = rows > 0 and (technical_ready < rows or mtf_ready == 0)
+    log = logger.warning if incomplete else logger.info
+    log(
+        "[SUMMARY AI GATE][ENTRY READY AUDIT] interval=%s source=%s side=%s rows=%s "
+        "technical_ready=%s 3m_ready=%s 5m_ready=%s mtf_ready=%s ranking_ready=%s technical_source=%s%s",
+        interval, source, side, rows,
+        technical_ready, int(ready_3m), int(ready_5m), mtf_ready, ranking_ready, src_counts,
+        " (enrich 未完のまま AI へ渡している可能性がある)" if incomplete else "",
+    )
+    return audit
+
+
+def _ensure_mtf_attached_before_ai(df: pd.DataFrame, *, interval, source: str) -> pd.DataFrame:
+    """score_mtf/mtf が全て 0 のときだけ日足 MTF を attach する。
+
+    enrich 済みの DataFrame には触らない (二重計算しない)。
+    attach できなければ元の DataFrame をそのまま返し、
+    ENTRY READY AUDIT 側で mtf_ready=0 として可視化する。
+    """
+    if os.getenv("AI_GATE_ENSURE_MTF", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return df
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    def _nonzero(col: str) -> int:
+        if col not in df.columns:
+            return 0
+        try:
+            return int((pd.to_numeric(df[col], errors="coerce").fillna(0) != 0).sum())
+        except Exception:
+            return 0
+
+    before = max(_nonzero("score_mtf"), _nonzero("mtf"))
+    if before > 0:
+        return df
+
+    try:
+        from trading.summary.mtf.daily_runtime import merge_daily_mtf_for_ai
+
+        out = merge_daily_mtf_for_ai(df, source=f"AI_GATE_PRE_{source}")
+    except Exception:
+        logger.exception("[SUMMARY AI GATE] pre-AI daily MTF attach failed interval=%s", interval)
+        return df
+
+    if not isinstance(out, pd.DataFrame) or out.empty:
+        return df
+
+    try:
+        after = max(
+            int((pd.to_numeric(out.get("score_mtf", 0), errors="coerce").fillna(0) != 0).sum()),
+            int((pd.to_numeric(out.get("mtf", 0), errors="coerce").fillna(0) != 0).sum()),
+        )
+    except Exception:
+        after = 0
+
+    logger.warning(
+        "[SUMMARY AI GATE][PRE-AI MTF ATTACH] interval=%s source=%s rows=%s score_mtf_nonzero %s -> %s "
+        "(途中状態の score_mtf=0 を AI へ渡さないための最終 enrich)",
+        interval, source, len(out), before, after,
+    )
+    return out
+
+
 def _run_ai_gate_for_candidates_core(candidates_df: pd.DataFrame, *, interval: int | str = 1, source: str = "SUMMARY", min_ai_confidence: float = DEFAULT_MIN_AI_CONFIDENCE, default_dominant_ratio: float = 1.0, side: str = "BUY", use_daily_cache: bool = True, daily_filter_buy: bool = False, daily_hard_block_exit_warn: bool = False, daily_min_score: Optional[float] = None) -> List[Dict[str, Any]]:
     df = safe_df(candidates_df)
     if df.empty:
@@ -371,6 +488,26 @@ def _run_ai_gate_for_candidates_core(candidates_df: pd.DataFrame, *, interval: i
         side_counts = df.get("ai_side", df.get("side", pd.Series([default_side] * len(df)))).astype(str).str.upper().value_counts().to_dict()
     except Exception:
         side_counts = {default_side: len(df)}
+    # AI へ渡す直前に enrich を 1 回だけ確定させる。
+    # 途中状態 (score_mtf=0 のまま) の DataFrame が AI に渡ると、
+    # mtf_low を理由にした fallback 判定になってしまうため。
+    df = _ensure_mtf_attached_before_ai(df, interval=interval, source=source)
+
+    # 3 分足 / 5 分足を候補へ繋ぐ。
+    # これが無いと entry_gate が score_3m/score_5m を読めず、
+    # AI_OK になった行が直後の weak filter で全件 NG になる
+    # (2026-09-01: BUY 7 件 -> data_not_ready_attach_missing 7 件)。
+    try:
+        from .mtf_attach import attach_mtf_scores
+
+        df = attach_mtf_scores(df, interval=interval, source=source)
+    except Exception:
+        logger.exception("[SUMMARY AI GATE] 3m/5m attach failed interval=%s", interval)
+
+    try:
+        _entry_ready_audit(df, interval=interval, source=source, side=default_side)
+    except Exception:
+        logger.debug("[SUMMARY AI GATE] entry ready audit failed", exc_info=True)
     logger.warning("[SUMMARY AI GATE] SEND_TO_AI start default_side=%s rows=%s side_counts=%s interval=%s source=%s min_conf=%.2f symbols=%s", default_side, len(df), side_counts, interval, source, float(min_ai_confidence), list(df["symbol"].astype(str).head(40)) if "symbol" in df.columns else [])
     results: List[Dict[str, Any]] = []
     for _, row in df.iterrows():

@@ -140,7 +140,34 @@ MIN_SLOPE = _env_float_floor("TONOSAMA_MIN_SLOPE", 0.0010, 0.0010)
 
 MIN_BODY_CHANGE_PCT = _env_float("TONOSAMA_MIN_BODY_CHANGE_PCT", 0.0)
 MIN_INTRABAR_RANGE_PCT = _env_float_floor("TONOSAMA_MIN_INTRABAR_RANGE_PCT", 0.10, 0.10)
-MIN_LATEST_VOLUME = _env_float_floor("TONOSAMA_MIN_LATEST_VOLUME", 50000.0, 50000.0)
+
+# ------------------------------------------------------------
+# 流動性の下限 (TONOSAMA 本体フィルタ)
+# ------------------------------------------------------------
+# 2026-09-01 のログでは実効値が MIN_LATEST_VOLUME=50000 になっており、
+# base 39 行が 1 行残らず latest_volume_low で落ちていた。
+#
+# 原因は _env_float_floor(..., 50000.0, 50000.0) の **第3引数 (floor)**。
+# ENV / settings.ini で 10000 を指定しても max(50000, 10000) = 50000 になり、
+# 設定値が一切効かない「起動時上書き」になっていた。
+#
+# 想定設定 (運用側の意図):
+#     最小出来高     10,000 株
+#     最小売買代金  3,000,000 円
+# floor は「設定ミスで 0 にしない」ための下限なので、
+# 想定値そのものを floor にする (= 想定値より緩くはできないが、
+# ENV でより厳しくはできる)。
+#
+# _latest_volume の意味:
+#     **最新の確定 1 分足の出来高** (runner._ensure_actual_movement_cols_core が
+#     summary base の volume / volume_1m / latest_volume 列から取る)。
+#     当日累計出来高でも PUSH の最終 tick 出来高でもない。
+#     当日累計は TONOSAMA_MIN_DAY_VOLUME (別名) が担当する。
+# _latest_turnover の意味:
+#     **最新の確定 1 分足の売買代金** = _latest_volume x close。
+#     turnover 列がある場合はそれを優先する。
+MIN_LATEST_VOLUME = _env_float_floor("TONOSAMA_MIN_LATEST_VOLUME", 10000.0, 10000.0)
+MIN_LATEST_TURNOVER = _env_float_floor("TONOSAMA_MIN_LATEST_TURNOVER", 3_000_000.0, 3_000_000.0)
 
 # ------------------------------------------------------------
 # BUY buying climax / high-chase guard
@@ -173,3 +200,52 @@ MAX_CANDIDATES = _env_int("TONOSAMA_MAX_CANDIDATES", 40)
 SCHEDULER_INTERVAL_SEC = _env_int("TONOSAMA_SCHEDULER_INTERVAL_SEC", 15)
 DISCORD_NOTIFY_ON_PENDING = _env_bool("TONOSAMA_DISCORD_NOTIFY_ON_PENDING", True)
 MAX_5SEC_FEATURE_SYMBOLS = _env_int("TONOSAMA_MAX_5SEC_FEATURE_SYMBOLS", 20)
+
+
+# ============================================================
+# 実効設定の 1 回だけのログ
+# ------------------------------------------------------------
+# 2026-09-01: 「設定は 10000 のはずなのに実効値が 50000」だった件を
+# 二度と目視で追わなくて済むようにする。閾値の意味 (どの出来高か) も
+# 一緒に出す。呼び出しは runner の初回ループから。
+# ============================================================
+
+import logging as _logging
+
+_logger = _logging.getLogger(__name__)
+_EFFECTIVE_LOGGED = False
+
+
+def effective_liquidity_config() -> dict:
+    """TONOSAMA 本体フィルタの実効流動性設定 (テストからも読む)。"""
+    return {
+        "MIN_LATEST_VOLUME": MIN_LATEST_VOLUME,
+        "MIN_LATEST_TURNOVER": MIN_LATEST_TURNOVER,
+        "MIN_PRICE": MIN_PRICE,
+        "_latest_volume_meaning": "latest_completed_1min_bar_volume",
+        "_latest_turnover_meaning": "latest_completed_1min_bar_turnover(volume x close)",
+        "env_TONOSAMA_MIN_LATEST_VOLUME": os.getenv("TONOSAMA_MIN_LATEST_VOLUME"),
+        "env_TONOSAMA_MIN_LATEST_TURNOVER": os.getenv("TONOSAMA_MIN_LATEST_TURNOVER"),
+    }
+
+
+def log_effective_config_once() -> dict:
+    """起動時に 1 回だけ実効値を出す。"""
+    global _EFFECTIVE_LOGGED
+    cfg = effective_liquidity_config()
+    if _EFFECTIVE_LOGGED:
+        return cfg
+    _EFFECTIVE_LOGGED = True
+    _logger.warning(
+        "[TONOSAMA CONFIG] 実効流動性設定 %s "
+        "(_latest_volume = 最新の確定1分足の出来高。当日累計でも PUSH 最終tickでもない。"
+        " _latest_turnover = その1分足の売買代金。"
+        " 値の持ち主は trading/entry/tonosama/config.py だけ)",
+        cfg,
+    )
+    return cfg
+
+
+def reset_effective_log_for_test() -> None:
+    global _EFFECTIVE_LOGGED
+    _EFFECTIVE_LOGGED = False
