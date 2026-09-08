@@ -224,3 +224,60 @@ def test_writer_syncs_on_stop():
 
     assert "_sync_to_nas_safe" in inspect.getsource(RankingDBWriter.stop)
     assert "_start_bg_nas_sync" in inspect.getsource(RankingDBWriter)
+
+
+# ============================================================
+# 4. 実在しない関数を import して握り潰していないこと
+#    (2026-09-08: entry_from_ranking が ats.ats_ranking.db_path から
+#     resolve_ranking_db_path を import していた。その名前は存在せず、
+#     ImportError が debug で握り潰されてハードコードされた NAS の UNC
+#     パスへ落ちていた。そのため RANKING_DB_ROOT をローカルへ向けても
+#     この読み手だけは NAS を読み続け、db read empty -> no_ranking_df に
+#     なっていた。エントリーが出ない直接の原因。)
+# ============================================================
+
+def test_ats_db_path_does_not_export_resolve_ranking_db_path():
+    """存在しない名前を当てにしない。実在する API を確認する。"""
+    import ats.ats_ranking.db_path as d
+
+    assert not hasattr(d, "resolve_ranking_db_path"), (
+        "resolve_ranking_db_path が生えたなら、それを使う側の意図を確認すること"
+    )
+    assert hasattr(d, "get_usable_ranking_db_path")
+    assert hasattr(d, "get_today_ranking_db_path")
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "trading.ranking.entry_from_ranking",
+        "trading.entry.volume_direction_guard",
+    ],
+)
+def test_no_import_of_missing_resolver(module_name):
+    """壊れた import が残っていないこと。"""
+    import importlib
+    import inspect
+
+    src = inspect.getsource(importlib.import_module(module_name))
+    assert "import resolve_ranking_db_path" not in src, (
+        f"{module_name} が存在しない resolve_ranking_db_path を import している"
+    )
+
+
+def test_entry_from_ranking_resolves_local_first(loc):
+    """本命の読み手がローカルを返すこと。
+
+    ここが NAS を返すと `db read empty` -> `no_ranking_df` -> pending 0 で
+    エントリーが 1 件も出なくなる (2026-09-07/08 に実際に起きた)。
+    """
+    import importlib
+
+    from trading.ranking import entry_from_ranking
+
+    importlib.reload(entry_from_ranking)
+
+    # ローカルに実体が無いと candidates が NAS へ落ちるので、作ってから確認する
+    _make_db(loc.ranking_db_path(), rows=5).close()
+    resolved = entry_from_ranking._rsrc_resolve_db_path()
+    assert resolved == str(loc.ranking_db_path()), f"NAS を見ている: {resolved}"

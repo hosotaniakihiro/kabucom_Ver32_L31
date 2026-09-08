@@ -352,13 +352,27 @@ def _rsrc_quote(name: str) -> str:
 
 
 def _rsrc_resolve_db_path() -> Optional[str]:
+    """読みに行く ranking DB を決める。
+
+    2026-09-08: ここが **ずっと NAS を直読みしていた**。
+    `ats.ats_ranking.db_path` に `resolve_ranking_db_path` は存在せず
+    (実在するのは `get_usable_ranking_db_path`)、ImportError が debug で
+    握り潰されて末尾のハードコード UNC パスへ落ちていた。
+    そのため 09-07 に `RANKING_DB_ROOT` をローカルへ向けても、この読み手
+    だけは NAS を読み続け、`db read empty` -> `no_ranking_df` になっていた。
+
+    置き場所の判断は ranking_db_location に集約してあるので、まずそれを使う。
+    """
     try:
-        from ats.ats_ranking.db_path import resolve_ranking_db_path
-        p = resolve_ranking_db_path()
-        if p:
-            return str(p)
+        from trading.ranking import ranking_db_location
+
+        for cand in ranking_db_location.ranking_db_candidates():
+            if cand and os.path.exists(cand):
+                return cand
     except Exception as e:
-        logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] ats resolve failed: %s", e, exc_info=False)
+        logger.warning(
+            "[RANKING ENTRY SOURCE DB FALLBACK] ranking_db_location を使えない: %s", e
+        )
 
     for key in ("RANKING_DB_PATH", "ATS_RANKING_DB_PATH", "KABU_RANKING_DB_PATH"):
         try:
@@ -368,10 +382,24 @@ def _rsrc_resolve_db_path() -> Optional[str]:
         except Exception:
             pass
 
+    # ATS 側のリゾルバ (場中は当日 DB を優先し、古い DB へ逃げない)
+    try:
+        from ats.ats_ranking.db_path import get_usable_ranking_db_path
+
+        p = get_usable_ranking_db_path()
+        if p:
+            return str(p)
+    except Exception as e:
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] ats resolve failed: %s", e)
+
     try:
         today = dt.datetime.now().strftime("%Y%m%d")
         p = rf"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking\ranking{today}.db"
         if os.path.exists(p):
+            logger.warning(
+                "[RANKING ENTRY SOURCE DB FALLBACK] ローカルを解決できず NAS へ落ちた path=%s "
+                "(複製なので最大 30 分古い)", p,
+            )
             return p
     except Exception:
         pass

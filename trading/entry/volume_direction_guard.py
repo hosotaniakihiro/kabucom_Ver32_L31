@@ -129,19 +129,25 @@ def _close_price(row: dict) -> float:
 
 
 def _ranking_db_path() -> str:
-    try:
-        from ats.ats_ranking.db_path import resolve_ranking_db_path
-        p = resolve_ranking_db_path()
-        if p:
-            return str(p)
-    except Exception:
-        pass
     # 2026-09-07: ranking DB はローカルへ移した。ここを NAS 固定にすると
     # この経路だけ複製 (最大で複製間隔ぶん古い) を読むことになる。
     try:
         from trading.ranking import ranking_db_location
 
         return str(ranking_db_location.ranking_db_path())
+    except Exception:
+        pass
+
+    # 2026-09-08: ここは `resolve_ranking_db_path` を import していたが、
+    # その名前は ats.ats_ranking.db_path に存在せず、ImportError が
+    # 握り潰されて必ず下の NAS パスへ落ちていた (entry_from_ranking にも
+    # 同じ壊れ方があり、そちらは実害を出していた)。実在する関数に直す。
+    try:
+        from ats.ats_ranking.db_path import get_usable_ranking_db_path
+
+        p = get_usable_ranking_db_path()
+        if p:
+            return str(p)
     except Exception:
         pass
     today = dt.datetime.now().strftime("%Y%m%d")
