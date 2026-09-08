@@ -245,6 +245,11 @@ def _run_interval(
         )
         return pd.DataFrame()
 
+    # R18: runner 本体と後段 (cache/persist/display/AI hook/entry) を切り分ける。
+    # 後段には名前が付いておらず、1m で 16-22 秒が「どこにも出ない時間」だった。
+    _t_leg = time.perf_counter()
+    _el_runner_only = 0.0
+
     try:
         logger.info(
             "[RANKING SUMMARY JOB] start interval=%s force=%s lookback=%s yahoo_fill=%s persist=%s display=%s top_n=%s run_entry=%s",
@@ -263,6 +268,7 @@ def _run_interval(
 
         from trading.ranking.summary.runner import run_ranking_summary_once
 
+        _t_runner = time.perf_counter()
         df = run_ranking_summary_once(
             trade_date=trade_date,
             interval=interval,
@@ -272,9 +278,13 @@ def _run_interval(
             display=display,
             top_n=max(20, int(top_n or 20)),
         )
+        _el_runner_only = time.perf_counter() - _t_runner
 
         if df is not None and not df.empty:
+            # R18: post_runner の内訳を割る (cache 格納 と AI hook)
+            _t_cache = time.perf_counter()
             _store_ranking_summary_cache(interval, df)
+            _el_cache = time.perf_counter() - _t_cache
 
             logger.info(
                 "[RANKING SUMMARY JOB] done interval=%s rows=%s symbols=%s rsi_non_null=%s macd_non_null=%s",
@@ -286,7 +296,15 @@ def _run_interval(
             )
 
             if bool(run_entry):
+                _t_hook = time.perf_counter()
                 _run_ranking_ai_hook_v20(interval=interval, now=now, df=df)
+                _el_hook = time.perf_counter() - _t_hook
+                _log_ph = logger.warning if (_el_cache + _el_hook) >= 3.0 else logger.info
+                _log_ph(
+                    "[RANKING SUMMARY STAGE] interval=%s post_cache=%.3fs "
+                    "post_ai_hook=%.3fs rows=%s",
+                    interval, _el_cache, _el_hook, len(df),
+                )
             else:
                 logger.info(
                     "[RANKING SUMMARY JOB] AI hook=v20 skipped interval=%s reason=run_entry_false",
@@ -309,6 +327,19 @@ def _run_interval(
         return pd.DataFrame()
 
     finally:
+        try:
+            _el_leg = time.perf_counter() - _t_leg
+            _el_post = max(0.0, _el_leg - _el_runner_only)
+            _log = logger.warning if _el_leg >= 5.0 else logger.info
+            _log(
+                "[RANKING SUMMARY STAGE] interval=%s leg_total=%.3fs "
+                "runner=%.3fs post_runner=%.3fs "
+                "(post_runner = cache/persist/display/AI hook/entry)",
+                interval, _el_leg, _el_runner_only, _el_post,
+            )
+        except Exception:
+            logger.debug("[RANKING SUMMARY STAGE] 内訳ログに失敗", exc_info=True)
+
         _set_global_attr(f"ranking_summary_{interval}min_running", False)
         _set_global_attr("ranking_summary_running", False)
         try:
@@ -439,6 +470,103 @@ def _long_tf_mark_built(now: dt.datetime, interval: int) -> None:
         _LONG_TF_LAST_SLOT[iv] = slot
 
 
+# ============================================================
+# 2026-09-02 P0: 1 分足の Ranking Summary を 3/5 分足から切り離す
+# ------------------------------------------------------------
+# 本番実測 (2026-09-02 15:29):
+#   [RANKING SUMMARY ALL STAGE] total=74.579s
+#       iv1=43.119s iv3=31.460s iv5=0.001s
+#   -> iv5 は "cooperative stop before base_df (予算切れのため着手しない)"
+# 1 分ジョブが 3 分・5 分の直列フル計算を待っており、60 秒 budget を
+# 使い切っていた。timeout を伸ばすのではなく、待たせない構造にする。
+#
+#   - interval=1 は従来どおり同期でリアルタイム計算する
+#   - interval=3 / 5 は専用の 1 本ワーカーへ投げて即座に戻る
+#     (結果は _store_ranking_summary_cache 経由で publish される)
+#   - 3/5 が走っている間に次の 3/5 が来たら投げない (重ならない)
+#
+# エントリー条件・閾値・fail-closed には触れていない。
+# ============================================================
+
+_LONG_TF_EXECUTOR = None
+# RLock: _submit_long_tf() がこのロックを持ったまま _get_long_tf_executor() を
+# 呼ぶため、非再入ロックだと自分自身で固まる (2026-09-02 のテストで検出)。
+_LONG_TF_EXEC_LOCK = threading.RLock()
+_LONG_TF_INFLIGHT: dict = {}
+
+
+def _long_tf_async_enabled() -> bool:
+    v = os.getenv("RANKING_SUMMARY_LONG_TF_ASYNC")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _get_long_tf_executor():
+    global _LONG_TF_EXECUTOR
+    with _LONG_TF_EXEC_LOCK:
+        if _LONG_TF_EXECUTOR is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _LONG_TF_EXECUTOR = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ranking-longtf"
+            )
+        return _LONG_TF_EXECUTOR
+
+
+def ranking_long_tf_inflight() -> dict:
+    """診断用。3/5 分足ワーカーの在席状況。"""
+    out = {}
+    with _LONG_TF_EXEC_LOCK:
+        for iv, fut in list(_LONG_TF_INFLIGHT.items()):
+            try:
+                out[iv] = "running" if not fut.done() else "done"
+            except Exception:
+                out[iv] = "unknown"
+    return out
+
+
+def _submit_long_tf(iv: int, fn, kwargs: dict, now) -> str:
+    """3/5 分足を非同期で走らせる。既に走っていれば投げない。"""
+    with _LONG_TF_EXEC_LOCK:
+        fut = _LONG_TF_INFLIGHT.get(iv)
+        if fut is not None and not fut.done():
+            logger.warning(
+                "[RANKING SUMMARY JOB][LONG TF BUSY] interval=%s 前回の実行がまだ終わっていない "
+                "-> 今回は投げない (次回実行と重ねない)",
+                iv,
+            )
+            return "busy"
+
+        def _task():
+            t0 = time.perf_counter()
+            try:
+                df = fn(**kwargs)
+                rows = len(df) if isinstance(df, pd.DataFrame) else -1
+                logger.warning(
+                    "[RANKING SUMMARY JOB][LONG TF ASYNC DONE] interval=%s rows=%s elapsed=%.3fs "
+                    "(1 分足はこれを待っていない)",
+                    iv, rows, time.perf_counter() - t0,
+                )
+                if rows > 0:
+                    _long_tf_mark_built(now, iv)
+                return df
+            except Exception:
+                logger.exception(
+                    "[RANKING SUMMARY JOB][LONG TF ASYNC FAILED] interval=%s elapsed=%.3fs",
+                    iv, time.perf_counter() - t0,
+                )
+                return pd.DataFrame()
+
+        _LONG_TF_INFLIGHT[iv] = _get_long_tf_executor().submit(_task)
+        logger.warning(
+            "[RANKING SUMMARY JOB][LONG TF ASYNC SUBMIT] interval=%s now=%s "
+            "(1 分足は 3/5 分足の完了を待たない)",
+            iv, now.strftime("%H:%M:%S"),
+        )
+        return "submitted"
+
+
 def _job_ranking_summary_all_core(
     *,
     force: bool = False,
@@ -453,6 +581,17 @@ def _job_ranking_summary_all_core(
     now = _now()
     results: dict[int, pd.DataFrame] = {}
 
+    # P3: BG の stage は ranking_job_all の 1 段しか無く、
+    # stage_elapsed=70.1s / deadline_remaining=-10.3s が出ても
+    # その 70 秒が 1m / 3m / 5m のどれなのかが分からなかった。
+    # interval=3/5 には既に "long tf built ... elapsed" があるが
+    # interval=1 だけ足元の elapsed がどこにも出ていない。
+    # 1 実行につき 1 行だけ内訳を出す (段ごとの詳細は既存の
+    # [RANKING SUMMARY STAGE] / [RANKING DB READ STAGE] 側にある)。
+    _t_all = time.perf_counter()
+    _leg_sec: dict[int, float] = {}
+
+    _t_iv = time.perf_counter()
     results[1] = job_ranking_summary_1m(
         force=force,
         trade_date=trade_date,
@@ -463,6 +602,7 @@ def _job_ranking_summary_all_core(
         top_n=top_n,
         run_entry=run_entry,
     )
+    _leg_sec[1] = time.perf_counter() - _t_iv
 
     for iv, fn in ((3, job_ranking_summary_3m), (5, job_ranking_summary_5m)):
         due, why = _long_tf_due(now, iv, force=force)
@@ -472,13 +612,13 @@ def _job_ranking_summary_all_core(
                 iv, why, now.strftime("%H:%M:%S"),
             )
             results[iv] = pd.DataFrame()
+            _leg_sec[iv] = 0.0
             continue
         logger.warning(
             "[RANKING SUMMARY JOB] long tf due interval=%s reason=%s now=%s",
             iv, why, now.strftime("%H:%M:%S"),
         )
-        _t0 = time.perf_counter()
-        results[iv] = fn(
+        _kwargs = dict(
             force=force,
             trade_date=trade_date,
             lookback_minutes=lookback_minutes,
@@ -488,13 +628,43 @@ def _job_ranking_summary_all_core(
             top_n=top_n,
             run_entry=run_entry,
         )
+        _t0 = time.perf_counter()
+        if _long_tf_async_enabled():
+            # 1 分足のジョブを 3/5 分足で待たせない。
+            # 結果は _store_ranking_summary_cache 経由で publish される。
+            _status = _submit_long_tf(iv, fn, _kwargs, now)
+            results[iv] = pd.DataFrame()
+            _leg_sec[iv] = time.perf_counter() - _t0
+            logger.warning(
+                "[RANKING SUMMARY JOB] long tf dispatched interval=%s status=%s dispatch=%.3fs "
+                "(同期の直列計算はしない)",
+                iv, _status, _leg_sec[iv],
+            )
+            continue
+
+        results[iv] = fn(**_kwargs)
+        _leg_sec[iv] = time.perf_counter() - _t0
         _rows = len(results[iv]) if isinstance(results[iv], pd.DataFrame) else -1
         logger.warning(
             "[RANKING SUMMARY JOB] long tf built interval=%s rows=%s elapsed=%.3fs",
-            iv, _rows, time.perf_counter() - _t0,
+            iv, _rows, _leg_sec[iv],
         )
         if _rows > 0:
             _long_tf_mark_built(now, iv)
+
+    try:
+        _total = time.perf_counter() - _t_all
+        _sum = sum(_leg_sec.values())
+        _log = logger.warning if _total >= 10.0 else logger.info
+        _log(
+            "[RANKING SUMMARY ALL STAGE] total=%.3fs iv1=%.3fs iv3=%.3fs iv5=%.3fs "
+            "leg_sum=%.3fs unaccounted=%.3fs "
+            "(この total が BG の ranking_job_all stage_elapsed に対応する)",
+            _total, _leg_sec.get(1, 0.0), _leg_sec.get(3, 0.0), _leg_sec.get(5, 0.0),
+            _sum, max(0.0, _total - _sum),
+        )
+    except Exception:
+        logger.debug("[RANKING SUMMARY ALL STAGE] 内訳ログに失敗", exc_info=True)
 
     return results
 

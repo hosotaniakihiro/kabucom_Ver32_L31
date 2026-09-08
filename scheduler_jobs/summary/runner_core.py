@@ -568,23 +568,21 @@ def _fresh_input_hopeless(now_i) -> str:
             return _FRESH_PROBE_RESULT
     reason = ""
     try:
-        from scheduler_jobs.summary.memory_latest_1m import _push_db_path
+        # 2026-09-02 P0: probe ごとに sqlite3.connect しない。
+        # NAS + WAL 196MB では connect だけで 2-4 秒かかり、
+        # fresh_input_probe が 15.397 秒になっていた。
+        # 共有接続を使う軽量 probe へ寄せる (閾値は変更しない)。
+        from scheduler_jobs.summary.memory_latest_1m import push_db_probe
 
-        path = _push_db_path()
-        import sqlite3
-
-        conn = sqlite3.connect(str(path), timeout=1.0)
-        try:
-            conn.execute("PRAGMA query_only=ON")
-            # tick は追記専用なので rowid 最大 = 最新。
-            # MAX(datetime) は datetime 単独の index が無く全表スキャンになる。
-            # 実測 (543MB): MAX(datetime)=12,415ms / rowid DESC LIMIT 1=0.1ms
-            row = conn.execute(
-                "SELECT datetime FROM stream_data_raw ORDER BY rowid DESC LIMIT 1"
-            ).fetchone()
-        finally:
-            conn.close()
-        latest = row[0] if row else None
+        _probe = push_db_probe(max_age_sec=1.0)
+        latest = _probe.get("latest_datetime")
+        if _probe.get("elapsed") is not None and float(_probe["elapsed"]) >= 1.0:
+            logger.warning(
+                "[summary.runners] fresh input probe が重い elapsed=%.3fs rowid=%s cached=%s error=%s "
+                "(probe は rowid DESC LIMIT 1 の 1 クエリだけ)",
+                float(_probe["elapsed"]), _probe.get("max_rowid"),
+                _probe.get("cached"), _probe.get("error"),
+            )
         if latest:
             ts = pd.to_datetime(latest, errors="coerce")
             if ts is not None and not pd.isna(ts):
@@ -617,10 +615,36 @@ def _env_bool_rc(name: str, default: bool) -> bool:
 
 
 def _sync_heavy_fallback_allowed() -> bool:
+    """tier1 が MISS したとき、同期で重い再構築まで行ってよいか。
+
+    既定 False の意図は「main.py の tick を待たせない」こと。
+    tier1 / tier2 はどちらも main.py 専用の高速経路で、
+    DB writer プロセスでは必ず空を返す。
+
+    ところがこのゲートがプロセスを問わず効いていたため、
+    summary DB writer では interval=1 のとき
+        tier1 (main 専用) -> 空
+        -> _submit_heavy_rebuild_bg (tier2 = main 専用なので no-op)
+        -> return 空
+    となり、実際に再構築して保存する _job_summary_original_heavy に
+    一度も到達していなかった。
+    3分/5分は interval==1 の分岐に入らないため保存されており、
+    「1分足だけ stock_summary_1min が止まる」状態になっていた
+    (2026-09-01 実測: 1min が 10:42 で停止、3min/5min は増加継続)。
+
+    DB writer は「重い再構築をして保存する」のが役目なので、
+    ここで background の no-op に逃がしてはいけない。
+    main.py 側のレイテンシ最適化は従来どおり維持する。
+    """
     v = os.getenv("SUMMARY_MAIN_SYNC_HEAVY_FALLBACK")
-    if v is None or str(v).strip() == "":
-        return False
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    if v is not None and str(v).strip() != "":
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    try:
+        if _is_database_process():
+            return True
+    except Exception:
+        logger.debug("[summary.runners] database process check failed", exc_info=True)
+    return False
 
 
 def _heavy_bg_min_gap_sec() -> float:
@@ -628,6 +652,24 @@ def _heavy_bg_min_gap_sec() -> float:
         return max(30.0, float(os.getenv("SUMMARY_MAIN_HEAVY_BG_MIN_GAP_SEC", "60")))
     except Exception:
         return 60.0
+
+
+def _tier2_applicable_here() -> bool:
+    """tier2 (light 1m) がこのプロセスで実際に動くか。
+
+    動かない文脈で呼ぶと必ず空の DataFrame が返るため、
+    「再構築した」と記録してはいけない。
+    """
+    try:
+        from .light_tick_1m import _is_entry_only_context, _env_bool
+
+        return bool(
+            _is_entry_only_context()
+            and _env_bool("SUMMARY_MAIN_EARLY_RETURN_AFTER_AI_SUBMIT", True)
+        )
+    except Exception:
+        logger.debug("[summary.runners] tier2 applicability check failed", exc_info=True)
+        return False
 
 
 def _submit_heavy_rebuild_bg(interval_i: int, now_i, display: bool, run_entry: bool, kwargs: dict) -> bool:
@@ -655,23 +697,50 @@ def _submit_heavy_rebuild_bg(interval_i: int, now_i, display: bool, run_entry: b
     def _task() -> None:
         global _HEAVY_BG_RUNNING
         t0 = time.perf_counter()
+        rows = -1
+        applicable = _tier2_applicable_here()
         try:
+            if not applicable:
+                # tier2 (light 1m) は main.py / entry-only 文脈でしか動かない。
+                # DB writer プロセスでは必ず空を返すので、これを "done" と
+                # 記録すると「再構築が終わった」という誤った記録になる。
+                # 2026-09-01 実測: summary_database_runner で
+                #   heavy rebuild bg done interval=1 elapsed=0.002s
+                #   job done ... rows=0 latest_dt=None
+                # が毎分続き、stock_summary_1min が 10:42 で止まっていた。
+                logger.error(
+                    "[summary.runners] heavy rebuild bg NOT APPLICABLE interval=%s now=%s "
+                    "reason=tier2_entry_only_context_required "
+                    "(このプロセスでは tier2 が動かないので再構築は行われていない。"
+                    "1分足 summary の更新元を確認すること)",
+                    interval_i, now_i,
+                )
+                return
             logger.warning(
                 "[summary.runners] heavy rebuild bg start interval=%s now=%s "
                 "(main tick は待たない)", interval_i, now_i,
             )
-            _job_summary_tier2_light_runner(
+            out = _job_summary_tier2_light_runner(
                 interval_i, now_i, display=display, run_entry=run_entry, **kwargs
             )
+            try:
+                rows = 0 if out is None else len(out)
+            except Exception:
+                rows = -1
         except BaseException:
             logger.exception("[summary.runners] heavy rebuild bg failed interval=%s", interval_i)
         finally:
             with _HEAVY_BG_LOCK:
                 _HEAVY_BG_RUNNING = False
-            logger.warning(
-                "[summary.runners] heavy rebuild bg done interval=%s elapsed=%.3fs",
-                interval_i, time.perf_counter() - t0,
-            )
+            if applicable:
+                # 実際に何行できたのかを必ず残す。
+                # rows=0 を "done" とだけ書くと、動いたのか空だったのか判別できない。
+                log = logger.warning if rows > 0 else logger.error
+                log(
+                    "[summary.runners] heavy rebuild bg done interval=%s elapsed=%.3fs rows=%s%s",
+                    interval_i, time.perf_counter() - t0, rows,
+                    "" if rows > 0 else "  <- 再構築が 0 行。1分足 summary は更新されていない",
+                )
 
     threading.Thread(target=_task, name="summary-heavy-rebuild-bg", daemon=True).start()
     return True

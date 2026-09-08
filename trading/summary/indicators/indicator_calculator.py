@@ -41,6 +41,9 @@ import logging
 import os
 import re
 import sqlite3
+import threading
+import time
+import time as _ind_perf
 import warnings
 from functools import lru_cache
 from pathlib import Path
@@ -725,6 +728,15 @@ def _table_for_interval(interval: Any) -> str:
     return "stock_summary_1min"
 
 
+# summaryYYYYMMDD.db の実体は <root>/raw_data/kabu_station/summary/ に置かれる。
+# 旧実装は base 直下しか glob しておらず、prevday warmup が一度も
+# DB を見つけられていなかった (2026-08-31: [IND PREVDAY WARMUP] のログが皆無)。
+_SUMMARY_DB_SUBDIRS = (
+    ("raw_data", "kabu_station", "summary"),
+    (),
+)
+
+
 def _summary_base_dirs() -> list[Path]:
     vals = [
         os.getenv("SUMMARY_DB_DIR"),
@@ -738,14 +750,15 @@ def _summary_base_dirs() -> list[Path]:
     for v in vals:
         if not v:
             continue
-        try:
-            p = Path(str(v))
-            key = str(p).lower()
-            if key not in seen:
-                out.append(p)
-                seen.add(key)
-        except Exception:
-            pass
+        for sub in _SUMMARY_DB_SUBDIRS:
+            try:
+                p = Path(str(v)).joinpath(*sub) if sub else Path(str(v))
+                key = str(p).lower()
+                if key not in seen:
+                    out.append(p)
+                    seen.add(key)
+            except Exception:
+                pass
     return out
 
 
@@ -852,14 +865,43 @@ def _load_prevday_warmup_cached(db_path: str, table: str, symbols: tuple[str, ..
             if not sym_col or not dt_col:
                 return pd.DataFrame()
 
+            # ------------------------------------------------------------
+            # 必要列だけ読む (2026-09-03)
+            # ------------------------------------------------------------
+            # summary テーブルは 166 列ある。SELECT * だと index で行を
+            # 引き当てるたびに行本体を取りに行き、SMB では 1 行 1 往復になる。
+            # 実測 241.344s / 32,458 行 = 7.4 ms/row。
+            # warm 行は指標計算後に _drop_prevday_warmup_rows で捨てられるので、
+            # OHLCV + symbol + datetime だけあればよい。
+            # 必要列だけにすると warmup 用 covering index が効き、
+            # EXPLAIN が SEARCH ... USING COVERING INDEX になって行フェッチが消える。
+            # INTRADAY_INDICATOR_WARMUP_SELECT_ALL=1 で従来動作。
+            _want_all = str(
+                os.environ.get("INTRADAY_INDICATOR_WARMUP_SELECT_ALL", "")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+
+            _need = [sym_col, dt_col]
+            for _c in ("open", "high", "low", "close", "volume",
+                       "open_price", "high_price", "low_price", "close_price",
+                       "date", "time", "interval"):
+                if _c in cols and _c not in _need:
+                    _need.append(_c)
+            if _want_all or len(_need) < 4:
+                _sel = "*"
+            else:
+                _sel = ", ".join('"%s"' % c for c in _need)
+
             for part in _prevday_chunks(symbols, 300):
                 placeholders = ",".join(["?"] * len(part))
                 params: list[Any] = list(part) + [int(rows_per_symbol)]
+                # CAST を外す: CAST("symbol" AS TEXT) だと index が使えない。
+                # symbol 列は TEXT affinity なので、そのまま比較しても
+                # 数値で入っている値は型親和性で正しく突き合わされる。
                 sql = f'''
-                    SELECT * FROM (
-                        SELECT *, ROW_NUMBER() OVER(PARTITION BY "{sym_col}" ORDER BY "{dt_col}" DESC) AS __rn
+                    SELECT {_sel} FROM (
+                        SELECT {_sel}, ROW_NUMBER() OVER(PARTITION BY "{sym_col}" ORDER BY "{dt_col}" DESC) AS __rn
                         FROM "{table}"
-                        WHERE CAST("{sym_col}" AS TEXT) IN ({placeholders})
+                        WHERE "{sym_col}" IN ({placeholders})
                     )
                     WHERE __rn <= ?
                     ORDER BY "{sym_col}", "{dt_col}"
@@ -896,6 +938,276 @@ def _load_prevday_warmup_cached(db_path: str, table: str, symbols: tuple[str, ..
         return out
     except Exception:
         return pd.DataFrame()
+
+
+# ============================================================
+# 当日イントラデイの warmup history
+# ------------------------------------------------------------
+# 3分/5分の指標入力は「最新足だけ」で渡ってくる経路がある
+# (実測 2026-08-31: [IND] interval=5min hist_max=1〜6)。
+# その本数では slope>=3 / RSI>=5 / MACD>=8 を満たせず、
+# slope_nonnull=0 / macd_nonnull=0 / technical_ready=0 になり、
+# 後段の IND SHORT PATCH が全部を埋めることになっていた。
+#
+# ここで当日の summary DB (stock_summary_3min / _5min / _1min) から
+# 同 interval の過去足を読み、warmup 行として連結する。
+# 連結行は計算後に必ず落とすので、保存・表示・ENTRY へは渡らない。
+# 未来足は読まない (入力の最大 datetime 以前だけ)。
+# ============================================================
+
+_INTRADAY_WARMUP_CACHE: dict[tuple, tuple[float, "pd.DataFrame"]] = {}
+_INTRADAY_WARMUP_LOCK = threading.Lock()
+
+
+def _intraday_required_bars(interval: Any) -> int:
+    """この interval で指標計算に欲しい最低本数。"""
+    min_slope, min_rsi, min_macd = _min_history_requirements(interval)
+    need = max(int(min_slope), int(min_rsi), int(min_macd))
+    # MA25/MA75 もシステムが使うので既定は 75 本以上を確保する。
+    default_bars = max(need, _prevday_env_int("INTRADAY_INDICATOR_WARMUP_BARS", 90))
+    return max(0, int(default_bars))
+
+
+def _find_today_summary_db(target_yyyymmdd: str) -> str:
+    try:
+        explicit = os.getenv("INTRADAY_INDICATOR_WARMUP_DB_PATH", "").strip()
+        if explicit and Path(explicit).exists():
+            return explicit
+    except Exception:
+        pass
+    for base in _summary_base_dirs():
+        try:
+            p = base / f"summary{target_yyyymmdd}.db"
+            if p.exists():
+                return str(p)
+        except Exception:
+            continue
+    try:
+        from trading.yahoo.pipeline.complement.db import get_summary_db_path
+
+        p = get_summary_db_path(date_yyyymmdd=target_yyyymmdd)
+        if p and Path(p).exists():
+            return str(p)
+    except Exception:
+        logger.debug("[IND INTRADAY WARMUP] get_summary_db_path failed", exc_info=True)
+    return ""
+
+
+def _load_intraday_warmup(db_path: str, table: str, symbols: tuple[str, ...], rows_per_symbol: int) -> pd.DataFrame:
+    """当日DBからsymbolごと直近N本。TTLキャッシュ付き (DBは増え続けるのでlru_cache不可)。"""
+    if not db_path or not symbols or rows_per_symbol <= 0:
+        return pd.DataFrame()
+
+    # ------------------------------------------------------------
+    # warmup キャッシュ (2026-09-03 実測で TTL を延長)
+    # ------------------------------------------------------------
+    # [IND STAGE] の実測:
+    #     interval=1 intraday_warmup=78.030s compute=9.164s total=87.368s
+    #     interval=3 intraday_warmup=14.328s compute=8.301s total=22.702s
+    #     interval=5 intraday_warmup= 7.851s compute=6.905s total=14.824s
+    # technical 段のコストはほぼ全部この DB 読みで、指標計算自体は 6〜9 秒。
+    #
+    # 旧 TTL は 20 秒。ranking summary は interval ごとに約 60 秒周期なので
+    # 毎回ミスしていた。warmup 行は「確定した過去足」で不変なうえ、
+    # _with_intraday_warmup 側が
+    #     warm = warm[warm.datetime <= cur_max]                (未来足を混ぜない)
+    #     concat(warm, cur).drop_duplicates(keep="last")        (入力行が後勝ち)
+    # としているので、warm が多少古くても欠けるのは新しい足だけで、
+    # それは cur が供給する。したがって TTL を延ばしても計算結果は変わらない。
+    #
+    # キーは symbols の完全一致だったため、ランキング銘柄が 1 つ入れ替わるだけで
+    # ミスしていた。順序非依存にして取りこぼしを減らす。
+    # INTRADAY_INDICATOR_WARMUP_CACHE_SEC で従来値(20)へ戻せる。
+    ttl = max(1.0, float(_prevday_env_int("INTRADAY_INDICATOR_WARMUP_CACHE_SEC", 180)))
+    key = (db_path, table, tuple(sorted(symbols)), int(rows_per_symbol))
+    now_ts = time.monotonic()
+    with _INTRADAY_WARMUP_LOCK:
+        hit = _INTRADAY_WARMUP_CACHE.get(key)
+        if hit and (now_ts - hit[0]) < ttl:
+            logger.info(
+                "[IND INTRADAY WARMUP] cache hit table=%s symbols=%s age=%.1fs ttl=%.0fs rows=%s",
+                table, len(symbols), now_ts - hit[0], ttl, len(hit[1]),
+            )
+            return hit[1]
+
+    # 読み出し自体は prevday と同じ SQL 構造を使う。
+    _t0 = time.perf_counter()
+    out = _read_summary_tail(db_path, table, symbols, rows_per_symbol)
+    _el = time.perf_counter() - _t0
+    if _el >= 3.0:
+        logger.warning(
+            "[IND INTRADAY WARMUP] cache miss -> DB read %.3fs table=%s symbols=%s rows=%s ttl=%.0fs",
+            _el, table, len(symbols), len(out), ttl,
+        )
+
+    with _INTRADAY_WARMUP_LOCK:
+        if len(_INTRADAY_WARMUP_CACHE) > 32:
+            _INTRADAY_WARMUP_CACHE.clear()
+        _INTRADAY_WARMUP_CACHE[key] = (now_ts, out)
+    return out
+
+
+def _read_summary_tail(db_path: str, table: str, symbols: tuple[str, ...], rows_per_symbol: int) -> pd.DataFrame:
+    """symbolごとに datetime 降順の直近 rows_per_symbol 本を読む。"""
+    if not db_path or not symbols or rows_per_symbol <= 0:
+        return pd.DataFrame()
+    try:
+        if not Path(db_path).exists():
+            return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    try:
+        with committing_connect(str(db_path), timeout=2.0) as conn:
+            conn.execute("PRAGMA busy_timeout=2000;")
+            try:
+                cols = [str(r[1]) for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+            except Exception:
+                cols = []
+            if not cols:
+                return pd.DataFrame()
+            sym_col = "symbol" if "symbol" in cols else ("Symbol" if "Symbol" in cols else None)
+            dt_col = "datetime" if "datetime" in cols else ("time" if "time" in cols else None)
+            if not sym_col or not dt_col:
+                return pd.DataFrame()
+
+            for part in _prevday_chunks(symbols, 300):
+                placeholders = ",".join(["?"] * len(part))
+                params: list[Any] = list(part) + [int(rows_per_symbol)]
+                sql = f'''
+                    SELECT * FROM (
+                        SELECT *, ROW_NUMBER() OVER(PARTITION BY "{sym_col}" ORDER BY "{dt_col}" DESC) AS __rn
+                        FROM "{table}"
+                        WHERE CAST("{sym_col}" AS TEXT) IN ({placeholders})
+                    )
+                    WHERE __rn <= ?
+                    ORDER BY "{sym_col}", "{dt_col}"
+                '''
+                try:
+                    d = pd.read_sql_query(sql, conn, params=params)
+                except Exception:
+                    logger.debug("[IND INTRADAY WARMUP] window query failed table=%s", table, exc_info=True)
+                    continue
+                if d is not None and not d.empty:
+                    frames.append(d)
+    except Exception:
+        logger.debug("[IND INTRADAY WARMUP] DB read failed db=%s table=%s", db_path, table, exc_info=True)
+        return pd.DataFrame()
+
+    if not frames:
+        return pd.DataFrame()
+    try:
+        out = pd.concat(frames, ignore_index=True, sort=False)
+        out = out.loc[:, ~pd.Index(out.columns).duplicated()].copy()
+        return out.drop(columns=["__rn"], errors="ignore")
+    except Exception:
+        return pd.DataFrame()
+
+
+def _hist_len_per_symbol(df: pd.DataFrame) -> pd.Series:
+    try:
+        d = df.assign(__dt=pd.to_datetime(df["datetime"], errors="coerce")).dropna(subset=["__dt"])
+        if d.empty:
+            return pd.Series(dtype="int64")
+        return d.groupby(d["symbol"].astype(str))["__dt"].nunique()
+    except Exception:
+        return pd.Series(dtype="int64")
+
+
+def _with_intraday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
+    """当日DBの同 interval 過去足を warmup として連結する。"""
+    if not _prevday_env_bool("INTRADAY_INDICATOR_WARMUP_ENABLED", True):
+        return df
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    if _PREVDAY_WARMUP_COL in df.columns:
+        return df
+    if "datetime" not in df.columns or "symbol" not in df.columns:
+        return df
+
+    need_bars = _intraday_required_bars(interval)
+    if need_bars <= 0:
+        return df
+
+    counts = _hist_len_per_symbol(df)
+    min_slope, min_rsi, min_macd = _min_history_requirements(interval)
+    required_min = max(int(min_slope), int(min_rsi), int(min_macd))
+    if not counts.empty and int(counts.min()) >= required_min:
+        # 既に全銘柄が必要本数を満たしている。DBを読まない。
+        return df
+
+    symbols = _symbols_from_df(df)
+    if not symbols:
+        return df
+
+    target_ymd = _prevday_target_date_yyyymmdd(df)
+    db_path = _find_today_summary_db(target_ymd)
+    if not db_path:
+        logger.warning(
+            "[IND INTRADAY WARMUP] today summary db not found date=%s interval=%s -> warmup skipped",
+            target_ymd, _normalize_interval_name(interval),
+        )
+        return df
+
+    table = _table_for_interval(interval)
+    warm = _load_intraday_warmup(db_path, table, symbols, need_bars)
+    if warm is None or warm.empty:
+        logger.warning(
+            "[IND INTRADAY WARMUP] no rows from today db interval=%s table=%s symbols=%s",
+            _normalize_interval_name(interval), table, len(symbols),
+        )
+        return df
+
+    try:
+        cur = df.copy()
+        cur["datetime"] = pd.to_datetime(cur["datetime"], errors="coerce")
+        cur = cur.dropna(subset=["datetime"])
+        if cur.empty:
+            return df
+
+        warm = warm.copy()
+        warm["datetime"] = pd.to_datetime(warm["datetime"], errors="coerce")
+        warm = warm.dropna(subset=["datetime"])
+        if warm.empty:
+            return df
+
+        # 未来足を混ぜない: 入力の最新時刻より後の行は捨てる。
+        cur_max = cur["datetime"].max()
+        warm = warm.loc[warm["datetime"] <= cur_max].copy()
+        if warm.empty:
+            return df
+
+        warm[_PREVDAY_WARMUP_COL] = True
+        cur[_PREVDAY_WARMUP_COL] = False
+
+        out = pd.concat([warm, cur], ignore_index=True, sort=False)
+        out["symbol"] = out["symbol"].astype(str).str.strip()
+        # 同 symbol+datetime は入力行 (後勝ち) を採用する。
+        out = out.drop_duplicates(subset=["symbol", "datetime"], keep="last")
+        out = out.sort_values(["symbol", "datetime"], kind="stable").reset_index(drop=True)
+
+        after = _hist_len_per_symbol(out)
+        logger.warning(
+            "[IND INTRADAY WARMUP] applied interval=%s table=%s db=%s symbols=%s warm_rows=%s current_rows=%s "
+            "hist_before=(min=%s,max=%s) hist_after=(min=%s,max=%s) need=%s bars=%s save=0",
+            _normalize_interval_name(interval),
+            table,
+            db_path,
+            len(symbols),
+            len(warm),
+            len(cur),
+            int(counts.min()) if not counts.empty else "-",
+            int(counts.max()) if not counts.empty else "-",
+            int(after.min()) if not after.empty else "-",
+            int(after.max()) if not after.empty else "-",
+            required_min,
+            need_bars,
+        )
+        return out
+    except Exception:
+        logger.exception("[IND INTRADAY WARMUP] concat failed interval=%s", interval)
+        return df
 
 
 def _with_prevday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
@@ -1023,13 +1335,53 @@ def _add_ma12_features(out: Any) -> Any:
 # MAIN
 # ============================================================
 
+# ============================================================
+# profiling ヘルパ (2026-09-03)
+# ============================================================
+def _ind_safe_len(df) -> int:
+    try:
+        return int(len(df))
+    except Exception:
+        return -1
+
+
+def _ind_safe_nunique(df, col: str) -> int:
+    try:
+        return int(df[col].nunique())
+    except Exception:
+        return -1
+
+
+def _ind_mem_mb(df) -> float:
+    """DataFrame の概算メモリ (MB)。deep=True は object 列があると重いので使わない。"""
+    try:
+        return float(df.memory_usage(index=True).sum()) / 1024.0 / 1024.0
+    except Exception:
+        return -1.0
+
+
 def add_all_indicators(
     df: pd.DataFrame,
     *,
     interval="1min",
 ):
-    """Prevday-warmup で計算精度を確保し、計算後にwarmup行を落としてma12を付与する。"""
+    """warmup (当日イントラデイ + 前営業日) で計算精度を確保し、計算後にwarmup行を落としてma12を付与する。"""
+    # ------------------------------------------------------------
+    # 区間 profiling (2026-09-03)
+    #   [RANKING TECH STAGE] external_indicators=28.923s の内訳を出す。
+    #   どこが遅いのかログだけで確定できるようにする。
+    # ------------------------------------------------------------
+    _p0 = _ind_perf.perf_counter()
+    _rows_in = _ind_safe_len(df)
+    _syms_in = _ind_safe_nunique(df, "symbol")
+
+    df = _with_intraday_warmup(df, interval=interval)
+    _p1 = _ind_perf.perf_counter()
+    _rows_intraday = _ind_safe_len(df)
+
     df = _with_prevday_warmup(df, interval=interval)
+    _p2 = _ind_perf.perf_counter()
+    _rows_prevday = _ind_safe_len(df)
 
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -1038,9 +1390,29 @@ def add_all_indicators(
             message=".*DataFrame is highly fragmented.*",
         )
         out = _compute_all_indicators(df, interval=interval)
+    _p3 = _ind_perf.perf_counter()
 
     out = _drop_prevday_warmup_rows(out)
     out = _add_ma12_features(out)
+    _p4 = _ind_perf.perf_counter()
+
+    try:
+        _total = _p4 - _p0
+        _log = logger.warning if _total >= 3.0 else logger.info
+        _log(
+            "[IND STAGE] interval=%s rows_in=%s symbols_in=%s "
+            "intraday_warmup=%.3fs(rows=%s) prevday_warmup=%.3fs(rows=%s) "
+            "compute=%.3fs drop_warmup_and_ma12=%.3fs total=%.3fs "
+            "rows_out=%s mem_in=%.1fMB mem_out=%.1fMB",
+            interval, _rows_in, _syms_in,
+            _p1 - _p0, _rows_intraday,
+            _p2 - _p1, _rows_prevday,
+            _p3 - _p2, _p4 - _p3, _total,
+            _ind_safe_len(out), _ind_mem_mb(df), _ind_mem_mb(out),
+        )
+    except Exception:
+        logger.debug("[IND STAGE] ログに失敗", exc_info=True)
+
     return out
 
 
@@ -1118,17 +1490,48 @@ def _compute_all_indicators(
 
     out = []
 
+    # ------------------------------------------------------------
+    # ここが external_indicators の主コスト (2026-09-03 実測)。
+    # 817 銘柄の Python ループ + 817 フレームの concat で 28.6 秒。
+    # 1 銘柄あたり約 35ms。銘柄数に完全に比例する。
+    # ------------------------------------------------------------
+    _loop_t0 = _ind_perf.perf_counter()
+    _loop_n = 0
+    _loop_slowest = (0.0, "")
     for symbol, g in df.groupby("symbol", sort=False):
+        _sym_t0 = _ind_perf.perf_counter()
         built = _build_symbol_indicators(g, str(symbol))
+        _sym_dt = _ind_perf.perf_counter() - _sym_t0
+        if _sym_dt > _loop_slowest[0]:
+            _loop_slowest = (_sym_dt, str(symbol))
+        _loop_n += 1
         if built is not None and not built.empty:
             out.append(built)
+    _loop_t1 = _ind_perf.perf_counter()
 
     if not out:
         logger.warning("[IND] no symbol outputs built")
         return df
 
     df_out = pd.concat(out, ignore_index=True)
+    _loop_t2 = _ind_perf.perf_counter()
     df_out = _sanitize_numeric(df_out)
+    _loop_t3 = _ind_perf.perf_counter()
+
+    try:
+        _loop_total = _loop_t1 - _loop_t0
+        _log = logger.warning if (_loop_t3 - _loop_t0) >= 3.0 else logger.info
+        _log(
+            "[IND COMPUTE] interval=%s symbols=%s rows=%s "
+            "symbol_loop=%.3fs (avg=%.1fms slowest=%s@%.0fms) concat=%.3fs sanitize=%.3fs",
+            interval_name, _loop_n, len(df),
+            _loop_total,
+            (_loop_total / _loop_n * 1000.0) if _loop_n else 0.0,
+            _loop_slowest[1], _loop_slowest[0] * 1000.0,
+            _loop_t2 - _loop_t1, _loop_t3 - _loop_t2,
+        )
+    except Exception:
+        logger.debug("[IND COMPUTE] ログに失敗", exc_info=True)
 
     # ====================================================
     # symbol history
@@ -1207,6 +1610,14 @@ def _compute_all_indicators(
         )
     ).fillna(False).astype(bool)
 
+    # 実履歴から計算できた行に印を付ける。
+    # 後段の IND SHORT PATCH が埋めた行と区別して依存度を測るため。
+    df_out["technical_source"] = np.where(
+        df_out["technical_ready"].to_numpy(dtype=bool),
+        "NATIVE_HISTORY",
+        "NONE",
+    )
+
     # ====================================================
     # sanitize / final
     # ====================================================
@@ -1267,6 +1678,18 @@ def _compute_all_indicators(
         )
     except Exception:
         logger.exception("[IND] final profile log failed")
+
+    try:
+        native = int((df_out.get("technical_source") == "NATIVE_HISTORY").sum()) if "technical_source" in df_out.columns else 0
+        logger.info(
+            "[IND][TECHNICAL SOURCE] interval=%s rows=%d technical_source=NATIVE_HISTORY count=%d none=%d",
+            interval_name,
+            len(df_out),
+            native,
+            len(df_out) - native,
+        )
+    except Exception:
+        logger.debug("[IND] technical source log failed", exc_info=True)
 
     try:
         rsi_series = pd.to_numeric(df_out["rsi"], errors="coerce") if "rsi" in df_out.columns else pd.Series(dtype="float64")

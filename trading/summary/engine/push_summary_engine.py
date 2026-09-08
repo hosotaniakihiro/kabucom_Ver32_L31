@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import sqlite3
+import time as _pse_time
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -147,6 +148,22 @@ def _push_db_effective_lookback_min(default_min: int, *, warm_env: str, cold_min
 
     return int(default_min)
 
+def _push_summary_should_stop(label: str) -> bool:
+    """協調キャンセルの降り場所。
+
+    scheduler_jobs.summary.stage_tracker.should_stop() は
+    「cancel 要求済み」または「時間予算を使い切った」ときに True を返す。
+    worker context の外 (単体呼び出し) では常に False なので、
+    通常経路の挙動は変わらない。
+    """
+    try:
+        from scheduler_jobs.summary.stage_tracker import should_stop
+
+        return bool(should_stop(label))
+    except Exception:
+        return False
+
+
 def _push_summary_db_source_read_recent_rows() -> pd.DataFrame:
     """summary_database_runner.py 専用: メモリ上のPUSH DFが空/古い場合に
     pushYYYYMMDD.dbの直近コミット済み行を読み直す (旧 push_summary_db_source_patch)。
@@ -156,6 +173,12 @@ def _push_summary_db_source_read_recent_rows() -> pd.DataFrame:
     PUSH_SUMMARY_DB_SOURCE_FALLBACK=1 が設定されているプロセス
     (summary_database_runner.py) でのみ有効。
     """
+    # cancel 済み / 予算切れの worker は、そもそも重い read に入らない。
+    # ここを通り過ぎると pandas.read_sql_query -> cursor.execute の
+    # キャンセル不能区間に入ってしまう。
+    if _push_summary_should_stop("push_summary_db_read.before"):
+        return pd.DataFrame()
+
     db_path = _push_summary_db_source_resolve_db_path()
     if db_path is None:
         return pd.DataFrame()
@@ -184,12 +207,36 @@ def _push_summary_db_source_read_recent_rows() -> pd.DataFrame:
         cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table_name})").fetchall()]
         colset = set(cols)
 
+        # ------------------------------------------------------------
+        # raw_json は SELECT しない (2026-09-03)
+        # ------------------------------------------------------------
+        # raw_json は PUSH メッセージ全文で、このテーブルで最も大きい列。
+        # この関数より下流で一度も参照されていない (grep で
+        # push_summary_engine.py 内の出現はこの列リスト 1 箇所だけ)。
+        # 30,000 行分を NAS(SMB) 越しに引いてそのまま捨てていた。
+        #
+        # 実測 (2026-09-03 13:37 のゾンビ worker のスタック):
+        #     push_summary_engine.py:241  pd.read_sql_query(...)
+        #     pandas/io/sql.py:2768       result = cur.fetchall()   <- ここで固着
+        # 詰まっていたのは execute() ではなく fetchall()、つまり
+        # クエリプランではなく **転送量** が原因だった
+        # (プラン自体は idx_stream_data_raw_datetime で解決済み)。
+        #
+        # cursor.fetchall() の内側は Python からキャンセルできないので、
+        # cancel SLA を守るには転送量そのものを削るしかない。
+        #
+        # PUSH_SUMMARY_DB_SOURCE_SELECT_RAW_JSON=1 で従来動作に戻せる。
+        _want_raw_json = _push_summary_db_source_env_true(
+            "PUSH_SUMMARY_DB_SOURCE_SELECT_RAW_JSON", False
+        )
         select_cols: list[str] = []
         for c in (
             "symbol", "symbolname", "datetime", "date", "time", "price", "volume",
             "trading_value", "vwap", "previousclose", "opening_price", "high_price", "low_price",
             "raw_json", "received_at",
         ):
+            if c == "raw_json" and not _want_raw_json:
+                continue
             if c in colset:
                 select_cols.append(c)
 
@@ -214,7 +261,26 @@ def _push_summary_db_source_read_recent_rows() -> pd.DataFrame:
         )
         params.append(max_rows)
 
+        _read_t0 = _pse_time.perf_counter()
         df = pd.read_sql_query(sql, conn, params=params)
+        _read_dt = _pse_time.perf_counter() - _read_t0
+        if _read_dt >= 3.0:
+            logger.warning(
+                "[PUSH SUMMARY DB SOURCE] slow read %.3fs table=%s cutoff=%s rows=%s db=%s "
+                "(datetime index が無いとフルスキャンになる)",
+                _read_dt, table_name, cutoff, len(df), db_path,
+            )
+
+        # read 中に cancel された場合、結果は捨てる。
+        # 古い generation の結果を publish/cache させない。
+        if _push_summary_should_stop("push_summary_db_read.after"):
+            logger.warning(
+                "[PUSH SUMMARY DB SOURCE] cancelled during read -> 結果を破棄する "
+                "read=%.3fs rows=%s table=%s",
+                _read_dt, len(df), table_name,
+            )
+            return pd.DataFrame()
+
         if df.empty:
             logger.warning(
                 "[PUSH SUMMARY DB SOURCE] recent rows empty table=%s cutoff=%s lookback_min=%s db=%s",
@@ -245,8 +311,9 @@ def _push_summary_db_source_read_recent_rows() -> pd.DataFrame:
 
         latest = _push_summary_db_source_safe_latest_dt(df)
         logger.warning(
-            "[PUSH SUMMARY DB SOURCE] loaded table=%s rows=%s symbols=%s latest_dt=%s cutoff=%s db=%s",
+            "[PUSH SUMMARY DB SOURCE] loaded table=%s cols=%s rows=%s symbols=%s latest_dt=%s cutoff=%s db=%s",
             table_name,
+            len(select_cols),
             len(df),
             _push_summary_db_source_safe_symbol_count(df),
             latest,

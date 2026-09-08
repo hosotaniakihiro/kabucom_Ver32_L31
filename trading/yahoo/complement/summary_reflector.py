@@ -24,7 +24,28 @@ def run_summary_pipeline(df: pd.DataFrame, *, label: str) -> dict:
         log_step(f"{label}:summary_pipeline_done", ts); return result_map
     except Exception: logger.exception("❌ Yahoo MTF summary pipeline failed（%s）", label); return {}
 
+def _yahoo_generation_should_stop(label: str) -> bool:
+    """旧世代の Yahoo worker かどうか (worker 外では常に False)。
+
+    タイムアウト超過で detach された worker はスレッドとしては走り続けるので、
+    summary DB へ書く手前でここで降りる。
+    NAS I/O を PUSH/Summary と奪い合わせない。
+    """
+    try:
+        from core.yahoo_tasks import yahoo_worker_should_stop
+
+        return bool(yahoo_worker_should_stop(label))
+    except Exception:
+        return False
+
+
 def reflect_saved_yahoo_to_summary_db(*, target_date: dt.date, symbols: Iterable[object] | None, label: str) -> dict:
+    if _yahoo_generation_should_stop("%s:reflect_saved_yahoo_to_summary_db" % label):
+        logger.warning(
+            "[YAHOO COMPLEMENT] %s reflect_saved_yahoo_to_summary skipped: 旧世代 worker のため summary DB へ書かない",
+            label,
+        )
+        return {}
     ts = time.time(); reflect_end_dt = resolve_yahoo_reflect_end_dt(target_date=target_date, delay_minutes=YAHOO_REFLECT_DELAY_MINUTES)
     logger.info("[YAHOO COMPLEMENT] %s reflect_saved_yahoo_to_summary start target_date=%s reflect_end_dt=%s", label, target_date, reflect_end_dt)
     df_saved = load_saved_yahoo_1min_for_summary(target_date=target_date, symbols=symbols, end_dt=reflect_end_dt, reason=label)

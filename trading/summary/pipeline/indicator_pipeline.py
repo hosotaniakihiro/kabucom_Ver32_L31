@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import numpy as np
@@ -337,6 +338,72 @@ def _ensure_base_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# 再計算で「履歴不足 -> NaN」になったとき、直前まで持っていた値を残す列。
+# 価格そのもの (close/high/low) は入れない。あくまで指標だけ。
+_PRESERVE_ON_SHORT_HISTORY_COLS = (
+    "macd", "signal", "hist", "ema12", "ema26",
+    "rsi", "slope", "slope_atr_scaled", "atr", "ma5", "ma25", "ma75",
+)
+
+
+def _preserve_prior_indicator_values(
+    before: pd.DataFrame, after: pd.DataFrame, interval: Optional[int]
+) -> pd.DataFrame:
+    """再計算が NaN にした指標を、入力に入っていた値で埋め戻す。
+
+    【なぜ必要か】 2026-09-01 12:54:05 の実測:
+        input      interval=1 col=macd   non_null=50 nonzero=46
+        after-main interval=1 col=macd   non_null=0
+        [IND] interval=1min hist_median=12.0 min_macd=26
+    1 分足の履歴が 12〜14 本しか渡っておらず、MACD の必要本数 26 に届かない。
+    indicator_calculator は仕様どおり未成熟を NaN にするが、その NaN が
+    **すでに計算済みだった macd / signal / rsi / slope を上書き**していた。
+    その後 indicator_short_history が NaN を 0 で埋めるため、
+    最終的に「macd=0 signal=0」が並び、technical_ready も 0 になっていた。
+
+    ここでは「新しい値が NaN で、古い値があるときだけ」古い値を残す。
+    新しく計算できた値は必ず優先する (古い値で上書きしない)。
+    埋め戻した行は *_carried_over フラグで区別できるようにする。
+
+    IND_PRESERVE_PRIOR_ON_SHORT_HISTORY=0 で従来動作へ戻せる。
+    """
+    if str(os.getenv("IND_PRESERVE_PRIOR_ON_SHORT_HISTORY", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        return after
+    if not isinstance(before, pd.DataFrame) or not isinstance(after, pd.DataFrame):
+        return after
+    if before.empty or after.empty:
+        return after
+    if not before.index.equals(after.index):
+        # 行が入れ替わっているときは対応が取れないので何もしない。
+        return after
+
+    restored: dict[str, int] = {}
+    for col in _PRESERVE_ON_SHORT_HISTORY_COLS:
+        if col not in before.columns or col not in after.columns:
+            continue
+        try:
+            old = pd.to_numeric(before[col], errors="coerce")
+            new = pd.to_numeric(after[col], errors="coerce")
+            mask = new.isna() & old.notna()
+            n = int(mask.sum())
+            if n <= 0:
+                continue
+            after[col] = new.where(~mask, old)
+            after.loc[mask, "%s_carried_over" % col] = True
+            restored[col] = n
+        except Exception:
+            logger.debug("[indicator_pipeline] preserve failed col=%s", col, exc_info=True)
+
+    if restored:
+        logger.warning(
+            "[indicator_pipeline] 履歴不足で NaN になった指標を直前値で復元 interval=%s rows=%s restored=%s "
+            "(再計算できた値は上書きしていない。0 埋めではなく前回値。"
+            "IND_PRESERVE_PRIOR_ON_SHORT_HISTORY=0 で無効化できる)",
+            interval, len(after), restored,
+        )
+    return after
+
+
 def _apply_indicator_calculation(df: pd.DataFrame, interval: Optional[int]) -> pd.DataFrame:
     if calculate_indicators is None:
         logger.warning("[indicator_pipeline] calculate_indicators import unavailable -> skipped")
@@ -345,14 +412,14 @@ def _apply_indicator_calculation(df: pd.DataFrame, interval: Optional[int]) -> p
     try:
         out = calculate_indicators(df, interval=interval)
         if isinstance(out, pd.DataFrame):
-            return out
+            return _preserve_prior_indicator_values(df, out, interval)
         logger.warning("[indicator_pipeline] calculate_indicators returned non-DataFrame -> input kept")
         return df
     except TypeError:
         try:
             out = calculate_indicators(df)
             if isinstance(out, pd.DataFrame):
-                return out
+                return _preserve_prior_indicator_values(df, out, interval)
         except Exception:
             logger.exception("[indicator_pipeline] calculate_indicators failed (legacy signature)")
         return df

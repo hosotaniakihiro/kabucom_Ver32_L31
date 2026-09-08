@@ -526,23 +526,26 @@ def _rmt_relax_technical_ready(df: pd.DataFrame, *, context: str) -> pd.DataFram
             rsi_ok = rsi.notna() & rsi.ne(50)
 
         ready = (symbol_ok & close_ok & (macd_ok | slope_ok | mtf_ok | rsi_ok)).fillna(False)
-        before = _rmt_bool_count(out, "technical_ready")
-        old = pd.Series(out["technical_ready"]).fillna(False).astype(bool)
-        out["technical_ready"] = (old | ready).fillna(False).astype(bool)
+        strict_n = _rmt_bool_count(out, "technical_ready")
 
-        if "symbol_hist_len" not in out.columns:
-            out["symbol_hist_len"] = pd.NA
-        hist = pd.to_numeric(out["symbol_hist_len"], errors="coerce")
-        fix_mask = out["technical_ready"].fillna(False).astype(bool) & (hist.fillna(0) < 3)
-        out.loc[fix_mask, "symbol_hist_len"] = 3
+        # technical_ready は strict のまま。ここで緩めない。
+        # 併せて symbol_hist_len の捏造 (<3 を 3 に書き換え) も行わない。
+        # 履歴本数は strict 判定の根拠そのものなので、偽装すると
+        # 後段の厳格チェックが全て無意味になる (2026-09-02)。
+        out["soft_technical_ready"] = (
+            pd.Series(out.get("soft_technical_ready", False), index=idx).fillna(False).astype(bool)
+            | ready.astype(bool)
+        )
 
-        after = _rmt_bool_count(out, "technical_ready")
+        after = strict_n
         logger.warning(
-            "[SUMMARY CONTROLLER READY MTF PATCH] ready context=%s rows=%s ready %s->%s macd=%s signal=%s slope=%s mtf=%s score_mtf=%s rsi_non50=%s",
+            "[SUMMARY CONTROLLER READY MTF PATCH] ready context=%s rows=%s ready %s->%s "
+            "(strict 維持。soft_technical_ready=%s へ退避) macd=%s signal=%s slope=%s mtf=%s score_mtf=%s rsi_non50=%s",
             context,
             len(out),
-            before,
+            strict_n,
             after,
+            int(pd.Series(out["soft_technical_ready"]).fillna(False).astype(bool).sum()),
             _rmt_nonzero_count(out, "macd"),
             _rmt_nonzero_count(out, "signal"),
             _rmt_nonzero_count(out, "slope"),

@@ -270,9 +270,17 @@ def _candidate_push_frames() -> list[tuple[str, pd.DataFrame]]:
                     # 単調ガード (global_state.push_df setter) があるので
                     # 古いフレームで潰されることはない。
                     try:
-                        from global_state import global_data
+                        if not _worker_generation_is_current():
+                            logger.warning(
+                                "[SUMMARY FORCE DIRECT 1M][STALE WRITEBACK BLOCKED] "
+                                "古い世代の worker からの global_data.push_df 書き戻しを止めた "
+                                "rows=%s db_latest=%s",
+                                len(db_df), db_latest,
+                            )
+                        else:
+                            from global_state import global_data
 
-                        global_data.push_df = db_df
+                            global_data.push_df = db_df
                     except Exception:
                         logger.debug("[SUMMARY FORCE DIRECT 1M] push_df writeback failed",
                                      exc_info=True)
@@ -562,6 +570,206 @@ def _fresh_summary_fast_path(now: dt.datetime) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# ============================================================
+# 2026-09-02 P0: force-direct worker の世代管理
+# ------------------------------------------------------------
+# 旧実装:
+#     th = threading.Thread(target=_target, name="summary-force-direct-build")
+#     th.start(); th.join(timeout)
+#     if th.is_alive(): return pd.DataFrame()      # <-- スレッドを放置
+#
+# 放置された daemon スレッドは _read_push_db_recent() の
+# pd.read_sql_query の中で NAS SQLite を掴んだまま生き続ける。
+# 本番実測 (2026-09-02):
+#     [PUSH DB STAGE] query_fetch=880.344s
+#     threads_top={'summary-force-direct': 10, ...}
+# 毎分 2 本ずつ増え、10 本が同時に読み取りトランザクションを開いたままになる。
+# その結果 wal_checkpoint(PASSIVE) が 1 フレームも進めず
+# (log_frames=41055 checkpointed=0)、WAL が 196MB まで膨らみ、
+# 読み書き双方が更に遅くなるという正のフィードバックになっていた。
+# しかも古い worker は完走時に global_data.push_df を書き戻していた。
+#
+# 対策 (timeout 値は伸ばさない):
+#   - 種類ごとに worker は最大 1 本。走っている間は新規を作らない。
+#   - worker には generation を持たせ、世代が変わった結果は必ず捨てる。
+#   - timeout 時は cancel event を立て、SQLite 実行中でも中断させる
+#     (memory_latest_1m.push_db_set_cancel -> set_progress_handler)。
+#   - 古い世代からの global_data 書き戻しを禁止する。
+# ============================================================
+
+_WORKER_CTX = threading.local()
+
+
+class _SingleFlightWorker:
+    """同じ種類の force-direct worker を 1 本に制限する。"""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self._lock = threading.Lock()
+        self.thread = None
+        self.generation = 0
+        self.started_at = 0.0
+        self.owner = ""
+        self.cancel = None
+
+    # -- 診断用 --------------------------------------------------
+    def snapshot(self) -> dict:
+        th = self.thread
+        alive = bool(th is not None and th.is_alive())
+        return {
+            "kind": self.kind,
+            "generation": self.generation,
+            "alive": alive,
+            "age": round(time.perf_counter() - self.started_at, 1) if (alive and self.started_at) else 0.0,
+            "owner": self.owner,
+            "name": getattr(th, "name", None) if th is not None else None,
+        }
+
+    def is_busy(self) -> bool:
+        th = self.thread
+        return bool(th is not None and th.is_alive())
+
+    def run(self, fn, timeout: float, owner: str):
+        """fn() を worker で実行する。
+
+        戻り値: (結果 or None, status)
+          status: "done" / "timeout" / "busy"
+        """
+        with self._lock:
+            if self.is_busy():
+                snap = self.snapshot()
+                logger.error(
+                    "[SUMMARY FORCE DIRECT 1M][WORKER BUSY] kind=%s 前世代の worker がまだ生きている "
+                    "generation=%s age=%.1fs owner=%s thread=%s owner_now=%s "
+                    "-> 新しい worker を作らない (同種 worker は最大 1 本)。"
+                    "空を返すので Entry は fresh 無しで fail-closed のまま。",
+                    self.kind, snap["generation"], snap["age"], snap["owner"],
+                    snap["name"], owner, VERSION,
+                )
+                # 前世代へ中断要求を出しておく (SQLite 実行中でも効く)。
+                try:
+                    if self.cancel is not None:
+                        self.cancel.set()
+                except Exception:
+                    pass
+                return None, "busy"
+
+            self.generation += 1
+            gen = self.generation
+            self.owner = owner
+            self.started_at = time.perf_counter()
+            cancel = threading.Event()
+            self.cancel = cancel
+            box = {"v": None, "err": None}
+
+            def _target() -> None:
+                _WORKER_CTX.registry = self
+                _WORKER_CTX.generation = gen
+                try:
+                    from scheduler_jobs.summary.memory_latest_1m import (
+                        push_db_set_cancel, push_db_clear_cancel,
+                    )
+                except Exception:
+                    push_db_set_cancel = None
+                    push_db_clear_cancel = None
+                try:
+                    if push_db_set_cancel is not None:
+                        push_db_set_cancel(cancel, deadline_sec=timeout)
+                    box["v"] = fn()
+                except Exception as exc:
+                    box["err"] = exc
+                    logger.exception(
+                        "[SUMMARY FORCE DIRECT 1M] worker failed kind=%s generation=%s",
+                        self.kind, gen,
+                    )
+                finally:
+                    if push_db_clear_cancel is not None:
+                        try:
+                            push_db_clear_cancel()
+                        except Exception:
+                            pass
+                    _WORKER_CTX.registry = None
+                    _WORKER_CTX.generation = 0
+                    if gen != self.generation:
+                        logger.warning(
+                            "[SUMMARY FORCE DIRECT 1M][STALE WORKER DONE] kind=%s generation=%s "
+                            "current=%s elapsed=%.1fs -> 結果を破棄した "
+                            "(世代を跨いだ結果は使わない)",
+                            self.kind, gen, self.generation,
+                            time.perf_counter() - self.started_at,
+                        )
+                        box["v"] = None
+                    else:
+                        logger.info(
+                            "[SUMMARY FORCE DIRECT 1M][WORKER DONE] kind=%s generation=%s elapsed=%.1fs",
+                            self.kind, gen, time.perf_counter() - self.started_at,
+                        )
+
+            th = threading.Thread(
+                target=_target,
+                name="summary-force-direct-%s-g%d" % (self.kind, gen),
+                daemon=True,
+            )
+            self.thread = th
+            logger.info(
+                "[SUMMARY FORCE DIRECT 1M][WORKER START] kind=%s generation=%s owner=%s "
+                "timeout=%.3fs thread=%s",
+                self.kind, gen, owner, timeout, th.name,
+            )
+            th.start()
+
+        th.join(timeout)
+        if th.is_alive():
+            # 世代を進めて結果を無効化し、SQLite 実行中でも中断させる。
+            with self._lock:
+                if self.generation == gen:
+                    self.generation += 1
+            try:
+                cancel.set()
+            except Exception:
+                pass
+            logger.error(
+                "[SUMMARY FORCE DIRECT 1M][WORKER TIMEOUT] kind=%s generation=%s owner=%s "
+                "timeout=%.3fs -> cancel 要求済み。結果は破棄する。"
+                "timeout は伸ばさない。次 tick は worker が終わるまで新規を作らない。",
+                self.kind, gen, owner, timeout,
+            )
+            return None, "timeout"
+
+        if box["err"] is not None:
+            return None, "done"
+        return box["v"], "done"
+
+
+_FORCE_DIRECT_WORKERS: dict = {
+    "build": _SingleFlightWorker("build"),
+    "fallback": _SingleFlightWorker("fallback"),
+}
+
+
+def force_direct_worker_stats() -> list:
+    """診断用。E2E 1 行ログが読む。"""
+    try:
+        return [w.snapshot() for w in _FORCE_DIRECT_WORKERS.values()]
+    except Exception:
+        return []
+
+
+def _worker_generation_is_current() -> bool:
+    """今のスレッドが「現行世代の worker」か。
+
+    worker 以外 (通常の同期経路) から呼ばれた場合は True。
+    古い世代の worker からの global_data 書き戻しを止めるために使う。
+    """
+    try:
+        reg = getattr(_WORKER_CTX, "registry", None)
+        if reg is None:
+            return True
+        return int(getattr(_WORKER_CTX, "generation", 0)) == int(reg.generation)
+    except Exception:
+        return True
+
+
 def _build_direct(now: dt.datetime) -> pd.DataFrame:
     t0 = time.perf_counter()
 
@@ -575,22 +783,19 @@ def _build_direct(now: dt.datetime) -> pd.DataFrame:
     if timeout <= 0:
         df = _build_direct_inner(now)
     else:
-        box: dict[str, Any] = {"df": pd.DataFrame()}
-
-        def _target() -> None:
-            box["df"] = _build_direct_inner(now)
-
-        th = threading.Thread(target=_target, name="summary-force-direct-build", daemon=True)
-        th.start()
-        th.join(timeout)
-        if th.is_alive():
-            logger.error(
-                "[SUMMARY FORCE DIRECT 1M] build timeout timeout=%.3fs elapsed=%.3fs now=%s version=%s note=skip_raw_count_and_try_fresh_raw_push_memory",
-                timeout, time.perf_counter() - t0, now, VERSION,
-            )
+        res, status = _FORCE_DIRECT_WORKERS["build"].run(
+            lambda: _build_direct_inner(now), timeout, owner="_build_direct"
+        )
+        if status != "done" or not isinstance(res, pd.DataFrame):
+            if status == "timeout":
+                logger.error(
+                    "[SUMMARY FORCE DIRECT 1M] build timeout timeout=%.3fs elapsed=%.3fs now=%s version=%s "
+                    "note=worker_cancelled_and_discarded",
+                    timeout, time.perf_counter() - t0, now, VERSION,
+                )
             df = pd.DataFrame()
         else:
-            df = box.get("df")
+            df = res
     if isinstance(df, pd.DataFrame) and not df.empty and not _is_fresh_df(df, now, label="robust_builder"):
         df = pd.DataFrame()
     if not isinstance(df, pd.DataFrame) or df.empty:
@@ -627,30 +832,20 @@ def _build_direct(now: dt.datetime) -> pd.DataFrame:
             )
             return pd.DataFrame()
 
-        box2: dict[str, Any] = {"df": pd.DataFrame()}
-
-        def _target2() -> None:
-            try:
-                box2["df"] = _build_from_process_memory(now)
-            except Exception:
-                logger.exception("[SUMMARY FORCE DIRECT 1M] process memory fallback failed")
-                box2["df"] = pd.DataFrame()
-
-        th2 = threading.Thread(
-            target=_target2, name="summary-force-direct-fallback", daemon=True
+        res2, status2 = _FORCE_DIRECT_WORKERS["fallback"].run(
+            lambda: _build_from_process_memory(now), remain, owner="_build_direct.fallback"
         )
-        th2.start()
-        th2.join(remain)
-        if th2.is_alive():
-            logger.error(
-                "[SUMMARY FORCE DIRECT 1M] fallback timeout budget=%.3fs remain=%.3fs "
-                "elapsed=%.3fs now=%s version=%s "
-                "(process memory / PUSH DB fallback を打ち切った。"
-                "timeout は伸ばさない。次 tick で再試行する)",
-                total_budget, remain, time.perf_counter() - t0, now, VERSION,
-            )
+        if status2 != "done" or not isinstance(res2, pd.DataFrame):
+            if status2 == "timeout":
+                logger.error(
+                    "[SUMMARY FORCE DIRECT 1M] fallback timeout budget=%.3fs remain=%.3fs "
+                    "elapsed=%.3fs now=%s version=%s "
+                    "(process memory / PUSH DB fallback を打ち切り、worker を cancel した。"
+                    "timeout は伸ばさない。次 tick で再試行する)",
+                    total_budget, remain, time.perf_counter() - t0, now, VERSION,
+                )
             return pd.DataFrame()
-        df = box2.get("df")
+        df = res2
     if isinstance(df, pd.DataFrame) and not df.empty:
         logger.warning(
             "[SUMMARY FORCE DIRECT 1M] built via fresh robust/process memory rows=%s symbols=%s latest_dt=%s elapsed=%.3fs timeout=%.3fs version=%s",

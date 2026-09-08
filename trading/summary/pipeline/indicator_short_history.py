@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -259,12 +260,29 @@ def _suppress_neutral_default_scores(out: pd.DataFrame) -> tuple[pd.DataFrame, i
         return out, 0
 
 
+def _is_market_hours_now() -> bool:
+    """東証の通常立会時間帯か (SHORT_PATCH 依存の WARNING 判定用)。"""
+    try:
+        import datetime as _dt
+
+        now = _dt.datetime.now()
+        if now.weekday() >= 5:
+            return False
+        hhmm = now.hour * 100 + now.minute
+        return (900 <= hhmm <= 1130) or (1230 <= hhmm <= 1530)
+    except Exception:
+        return False
+
+
 def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
         return df
 
     out = _ensure_sorted(df)
     before = _profile(out)
+    _ready_before_patch = _safe_bool_series(
+        out.get("technical_ready", pd.Series(False, index=out.index)), out.index
+    )
 
     close = _first_price(out, ("close", "close_price", "price", "current_price", "last_price"))
     high = _first_price(out, ("high", "high_price")).combine_first(close)
@@ -365,12 +383,43 @@ def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> p
         )
         usable = close.notna() & score_any & (slope_any | indicator_any)
         old_ready = _safe_bool_series(out.get("technical_ready", pd.Series(False, index=out.index)), out.index)
-        new_ready = old_ready | usable.fillna(False)
+        # SHORT PATCH は補完値なので technical_ready(strict) を True にしない。
+        # ENTRY 可否は実履歴から計算できた行だけで判断する (2026-09-02)。
         out["usable_technical_ready"] = na_false_bool(usable)
-        out["technical_ready"] = na_false_bool(new_ready)
+        out["soft_technical_ready"] = na_false_bool(usable)
+        out["technical_ready"] = na_false_bool(old_ready)
         out["display_ready"] = pd.Series(out.get("display_ready", True), index=out.index).fillna(True).astype(bool)
     except Exception:
         out["usable_technical_ready"] = False
+
+    # technical_source: native で ready だった行はそのまま、
+    # このパッチで初めて ready になった行だけ SHORT_PATCH にする。
+    try:
+        ready_after = _safe_bool_series(out.get("technical_ready", pd.Series(False, index=out.index)), out.index)
+        source = pd.Series(out.get("technical_source", "NONE"), index=out.index).astype(str)
+        source = source.where(source.isin(["NATIVE_HISTORY", "SHORT_PATCH"]), "NONE")
+        patched = ready_after & (~_ready_before_patch)
+        source = source.mask(patched, "SHORT_PATCH")
+        out["technical_source"] = source
+
+        native_n = int((source == "NATIVE_HISTORY").sum())
+        patch_n = int((source == "SHORT_PATCH").sum())
+        total_ready = native_n + patch_n
+        ratio = (patch_n / total_ready) if total_ready else 0.0
+        msg = (
+            "[IND SHORT PATCH][TECHNICAL SOURCE] interval=%s rows=%s "
+            "NATIVE_HISTORY=%s SHORT_PATCH=%s short_patch_ratio=%.2f"
+        )
+        warn_ratio = float(os.getenv("IND_SHORT_PATCH_WARN_RATIO", "0.30") or 0.30)
+        if total_ready and ratio >= warn_ratio and _is_market_hours_now():
+            logger.warning(
+                msg + " (通常市場時間に SHORT_PATCH 依存が高い。warmup history の供給を確認する)",
+                interval, len(out), native_n, patch_n, ratio,
+            )
+        else:
+            logger.info(msg, interval, len(out), native_n, patch_n, ratio)
+    except Exception:
+        logger.debug("[IND SHORT PATCH] technical source tagging failed", exc_info=True)
 
     after = _profile(out)
     logger.warning(

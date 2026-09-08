@@ -99,6 +99,20 @@ class PushIncrementalMA75Result:
 # path / sqlite helpers
 # ============================================================
 
+def _ma75_mmap_size(database) -> int:
+    """NAS 上の DB では mmap を無効化する (0)。
+
+    2026-09-02: SMB 上の SQLite を mmap すると、ページフォルト時に
+    EXCEPTION_IN_PAGE_ERROR が出て Python では捕捉できずプロセスが落ちる。
+    """
+    try:
+        from core.startup.sqlite_memory_pragmas import resolve_mmap_size_bytes
+
+        return int(resolve_mmap_size_bytes(database, 536870912))
+    except Exception:
+        return 0
+
+
 def _trade_date_str(trade_date: dt.date | str | None = None) -> str:
     if trade_date is None:
         return dt.datetime.now().strftime("%Y%m%d")
@@ -482,7 +496,8 @@ def _read_tail_bulk(
                 conn.execute("PRAGMA busy_timeout=60000")
                 conn.execute("PRAGMA query_only=ON")
                 conn.execute("PRAGMA cache_size=-131072")
-                conn.execute("PRAGMA mmap_size=536870912")
+                # 2026-09-02 P0: NAS 上では mmap を使わない (SMB の page error でプロセスが落ちる)
+                conn.execute("PRAGMA mmap_size=%d" % _ma75_mmap_size(summary_db))
             except Exception:
                 pass
             for i in range(0, len(symbols), SYMBOL_CHUNK):
@@ -543,7 +558,8 @@ def _read_tail_per_symbol(
                 conn.execute("PRAGMA busy_timeout=60000")
                 conn.execute("PRAGMA query_only=ON")
                 conn.execute("PRAGMA cache_size=-131072")
-                conn.execute("PRAGMA mmap_size=536870912")
+                # 2026-09-02 P0: NAS 上では mmap を使わない (SMB の page error でプロセスが落ちる)
+                conn.execute("PRAGMA mmap_size=%d" % _ma75_mmap_size(summary_db))
             except Exception:
                 pass
             for sym in symbols:
@@ -844,12 +860,71 @@ def _resolve_push_table(push_db: str) -> Optional[str]:
     return tables[0] if tables else None
 
 
+# _normalize_push_ticks() が実際に見る列の候補。
+# ここに無い列 (raw_json / Sell1..10Price / Buy1..10Qty / Greeks 等) は
+# 読み込んでも捨てられるだけなので SELECT しない。
+_PUSH_NEEDED_COL_CANDIDATES = (
+    # symbol
+    "symbol", "Symbol", "code", "symbol_code", "銘柄コード",
+    # datetime
+    "datetime", "time", "timestamp", "CurrentPriceTime", "current_price_time",
+    "received_at", "inserted_at",
+    # price
+    "current_price", "CurrentPrice", "price", "Price", "close", "Close",
+    "last_price", "LastPrice", "現在値",
+    # volume
+    "volume", "TradingVolume", "trading_volume", "Volume", "出来高",
+    # name
+    "symbolname", "symbol_name", "name", "銘柄名", "SymbolName",
+)
+
+
+def _push_select_columns(push_db: str, table: str) -> Optional[list[str]]:
+    """この table に実在する「必要列」だけを返す。判定できなければ None。"""
+    if str(os.environ.get("PUSH_INCREMENTAL_MA75_SELECT_ALL_COLUMNS", "")).strip() in {"1", "true", "yes", "on"}:
+        return None
+    try:
+        cols = _table_columns(push_db, table)
+    except Exception:
+        return None
+    if not cols:
+        return None
+    colset = {str(c) for c in cols}
+    picked = [c for c in _PUSH_NEEDED_COL_CANDIDATES if c in colset]
+    # symbol 相当と時刻相当が 1 つも無いなら列を絞らない (安全側)。
+    if not picked:
+        return None
+    return picked
+
+
 def _load_recent_push_rows(push_db: str) -> pd.DataFrame:
     table = _resolve_push_table(push_db)
     if not table:
         return pd.DataFrame()
+
+    # ------------------------------------------------------------
+    # SELECT * をやめて必要列だけにする (2026-09-03)
+    # ------------------------------------------------------------
+    # 実測: SELECT * だと 50,000 行 x 65 列 (raw_json + 10段板込み) を
+    # NAS 越しに引いて elapsed=377.230s。summary_database の起動を
+    # 6 分間占有し、push_receiver の WebSocket 起動まで巻き添えで遅れていた。
+    # 行数・並び順・後段の pandas 処理は変えない。列だけを減らす。
+    picked = _push_select_columns(push_db, table)
+    if picked:
+        col_sql = ", ".join('"%s"' % c for c in picked)
+        logger.info(
+            "[PUSH INCR MA75] push read columns narrowed table=%s selected=%d/%d cols=%s",
+            table, len(picked), len(_table_columns(push_db, table)), picked,
+        )
+    else:
+        col_sql = "*"
+        logger.warning(
+            "[PUSH INCR MA75] push read columns could not be narrowed table=%s -> SELECT * (従来動作)",
+            table,
+        )
+
     sql = f"""
-        SELECT *
+        SELECT {col_sql}
         FROM "{table}"
         ORDER BY rowid DESC
         LIMIT ?

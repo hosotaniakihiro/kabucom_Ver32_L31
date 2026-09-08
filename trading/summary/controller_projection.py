@@ -657,18 +657,25 @@ def _apply_soft_technical_ready(out: pd.DataFrame) -> pd.DataFrame:
     try:
         if "technical_ready" not in out.columns:
             out["technical_ready"] = False
-        before = int(pd.Series(out["technical_ready"]).fillna(False).astype(bool).sum())
+        strict = pd.Series(out["technical_ready"]).fillna(False).astype(bool)
+        strict_n = int(strict.sum())
         soft = _build_soft_technical_ready_mask(out)
-        old = pd.Series(out["technical_ready"]).fillna(False).astype(bool)
-        out["technical_ready"] = (old | soft).fillna(False).astype(bool)
-        after = int(pd.Series(out["technical_ready"]).fillna(False).astype(bool).sum())
+
+        # technical_ready は「ENTRY に必要な実テクニカルが揃っている」の
+        # strict な意味に統一する。soft 判定でこれを True へ引き上げない。
+        # (2026-09-02: rebuild_technical_ready ready=24 の直後に
+        #  SOFT TECH READY が 82/82 へ戻していた)
+        out["technical_ready"] = strict
+        out["soft_technical_ready"] = soft.fillna(False).astype(bool)
         if "usable_technical_ready" not in out.columns:
             out["usable_technical_ready"] = soft.fillna(False).astype(bool)
         else:
             out["usable_technical_ready"] = (_soft_ready_bool(out, "usable_technical_ready", False) | soft).fillna(False).astype(bool)
         logger.warning(
-            "[SUMMARY SOFT TECH READY] applied rows=%s technical_ready %s->%s soft_ready=%s",
-            len(out), before, after, int(soft.sum())
+            "[SUMMARY SOFT TECH READY] rows=%s technical_ready(strict)=%s soft_ready=%s "
+            "usable_technical_ready=%s (soft は technical_ready を上書きしない。ENTRY は strict のみ使用)",
+            len(out), strict_n, int(soft.sum()),
+            int(pd.Series(out["usable_technical_ready"]).fillna(False).astype(bool).sum()),
         )
     except Exception:
         logger.exception("[SUMMARY SOFT TECH READY] apply failed")

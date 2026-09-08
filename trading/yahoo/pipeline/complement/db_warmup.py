@@ -187,7 +187,8 @@ def _fetch_db_warmup(raw: pd.DataFrame, *, base_dir: Optional[str], summary_db_p
         if min_ts is None or max_ts is None:
             return pd.DataFrame()
 
-        min_bars = max(20, _env_int("YAHOO_COMPLEMENT_DB_WARMUP_MIN_BARS", 75))
+        # 5分足で MACD(>=8本) / MA25 を満たすには 1分足で 125 本以上必要。
+        min_bars = max(20, _env_int("YAHOO_COMPLEMENT_DB_WARMUP_MIN_BARS", 200))
         lookback_days = max(1, _env_int("YAHOO_COMPLEMENT_DB_WARMUP_LOOKBACK_DAYS", 7))
         # 1分足換算で十分な余裕を持って前日DBまで拾う。
         start_ts = min_ts - pd.Timedelta(days=lookback_days)
@@ -262,24 +263,21 @@ def _merge_db_warmup(df_yahoo: pd.DataFrame, *, base_dir: Optional[str], summary
 
 import sys  # noqa: E402
 
-_WARMUP_DB_PROCESS_NAMES = (
-    "main_database.py",
-    "data_collectors_runner.py",
-    "db_prepare_runner.py",
-    "push_receiver_runner.py",
-    "yahoo_complement_runner.py",
-    "summary_database_runner.py",
-    "ranking_collector_runner.py",
-)
+# 旧実装はこの一覧に該当するプロセスで warmup を「無効」にしていた。
+# ところが Yahoo 補完を実際に回すのは yahoo_complement_runner.py なので、
+# warmup が必要な唯一のプロセスでだけ warmup が効かず、
+# 3分/5分の hist_max が 2〜7 本にとどまって MACD が計算できていなかった
+# (2026-08-31 実測: interval=5 hist_max=7 ge_macd=0)。
+# warmup は「Yahoo 補完を回すプロセス」で必要なので、既定で全プロセス有効にする。
+_WARMUP_DB_PROCESS_NAMES: tuple[str, ...] = ()
 
 
 def warmup_scope_enabled() -> bool:
     """このプロセスで DB warmup を適用するか。
 
-    旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由でのみ install
-    されており main.py 専用だった。
-    YAHOO_COMPLEMENT_DB_WARMUP_SCOPE_ENABLED=1/0 で明示的に上書きできる。
-    CORE_STARTUP_FORCE_FULL_INIT_PATCHES=1 のときは DB プロセスでも適用する。
+    Yahoo 補完を回すプロセス (yahoo_complement_runner.py / main_database.py 等)
+    でこそ warmup が必要なので、既定は全プロセス有効。
+    YAHOO_COMPLEMENT_DB_WARMUP_SCOPE_ENABLED=0 で明示的に無効化できる。
     """
     try:
         raw = os.getenv("YAHOO_COMPLEMENT_DB_WARMUP_SCOPE_ENABLED")

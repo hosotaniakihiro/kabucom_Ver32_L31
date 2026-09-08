@@ -88,6 +88,52 @@ _yahoo_run_count = 0
 _yahoo_skip_count = 0
 _yahoo_stuck_detach_count = 0
 
+# ------------------------------------------------------------
+# generation guard (2026-09-03)
+# ------------------------------------------------------------
+# detach された旧 worker はスレッドとしては走り続ける。
+# 「自分はもう旧世代か」を worker 自身が判定できるようにして、
+# summary DB 書き込みなどの重い副作用の手前で降りられるようにする。
+_yahoo_worker_local = threading.local()
+
+
+def current_yahoo_worker_id() -> int:
+    """このスレッドが担当している Yahoo worker の世代番号 (worker 外なら 0)。"""
+    return int(getattr(_yahoo_worker_local, "worker_id", 0) or 0)
+
+
+def yahoo_worker_should_stop(label: str = "") -> bool:
+    """このスレッドの Yahoo worker が既に旧世代 (detached) かどうか。
+
+    True を返したら、呼び出し側は DB 書き込み等の副作用を行わずに降りること。
+    Yahoo worker スレッドの外 (worker_id=0) では常に False を返すので、
+    単体実行・起動時 1 回実行の経路には影響しない。
+
+    YAHOO_TASK_GENERATION_GUARD=0 で無効化できる。
+    """
+    v = os.environ.get("YAHOO_TASK_GENERATION_GUARD")
+    if v is not None and str(v).strip().lower() in {"0", "false", "no", "off"}:
+        return False
+
+    wid = current_yahoo_worker_id()
+    if wid <= 0:
+        return False
+
+    with _yahoo_lock:
+        detached = wid in _yahoo_detached_worker_ids
+        superseded = (_yahoo_active_worker_id != 0 and wid != _yahoo_active_worker_id)
+        active = _yahoo_active_worker_id
+
+    if not (detached or superseded):
+        return False
+
+    logger.warning(
+        "[YAHOO TASK][GENERATION GUARD] 旧世代 worker なので中断する "
+        "label=%s worker_id=%s active_worker_id=%s detached=%s superseded=%s",
+        label or "-", wid, active, detached, superseded,
+    )
+    return True
+
 
 def _is_before_start_time(now: dt.datetime) -> bool:
     return now.time() < YAHOO_START_TIME
@@ -199,6 +245,10 @@ def _run_yahoo_job_body(started_at: dt.datetime, worker_id: int) -> None:
 
     _yahoo_last_error = ""
     _yahoo_last_started_at_text = started_at.strftime("%Y-%m-%d %H:%M:%S")
+
+    # このスレッドの世代番号を残す。detach された後に
+    # yahoo_worker_should_stop() が True を返せるようにするため。
+    _yahoo_worker_local.worker_id = int(worker_id)
 
     try:
         logger.info("[YAHOO TASK] worker start at=%s worker_id=%s purpose=download_1m_calc_technicals_save_summary_db intervals=1,3,5", _yahoo_last_started_at_text, worker_id)
