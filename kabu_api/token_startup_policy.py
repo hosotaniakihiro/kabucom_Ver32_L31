@@ -338,6 +338,107 @@ def bootstrap_startup_token(orig) -> str:
     return _startup_bootstrap_token(orig)
 
 
+PIN_HEADER = "X-Autostock-Token-Pin"
+
+# [TOKEN REQUEST HEADER] は毎リクエスト出すとログが膨らむので、
+# endpoint ごとに「初回」と「token が変わったとき」と「401 のとき」だけ出す。
+_HEADER_LOG_SEEN: dict = {}
+
+
+def _endpoint_of(url: Any) -> str:
+    try:
+        s = str(url or "")
+        i = s.find("/kabusapi")
+        return s[i:] if i >= 0 else s
+    except Exception:
+        return str(url or "")
+
+
+def _log_request_header(url: Any, headers: Any, token_source: str, *, force: bool = False) -> None:
+    """実際に送る X-API-KEY を追跡する。token 本体は出さず tail だけ。"""
+    try:
+        tok = ""
+        if isinstance(headers, dict):
+            tok = str(headers.get("X-API-KEY") or "").strip()
+        tail = tok[-4:] if len(tok) >= 4 else ("-" if not tok else tok)
+        endpoint = _endpoint_of(url)
+        key = (endpoint, token_source)
+        prev = _HEADER_LOG_SEEN.get(key)
+        if not force and prev == tail:
+            return
+        _HEADER_LOG_SEEN[key] = tail
+        logger.warning(
+            "[TOKEN REQUEST HEADER] pid=%s endpoint=%s token_tail=%s token_source=%s",
+            os.getpid(), endpoint, tail, token_source,
+        )
+    except Exception:
+        pass
+
+
+def _reload_token_from_settings_ini() -> str:
+    """settings.ini から token を読み直す (env / モジュールキャッシュを見ない)。"""
+    try:
+        import token_manager  # type: ignore
+
+        fn = getattr(token_manager, "read_settings_token", None)
+        if callable(fn):
+            return str(fn() or "").strip()
+    except Exception:
+        logger.debug("[TOKEN STARTUP ONCE] settings.ini token reload failed", exc_info=True)
+    return ""
+
+
+def _retry_once_with_settings_ini_token(base, session, method, url, kwargs):
+    """401 のとき settings.ini の最新 token で 1 回だけ再送する。
+
+    POST /token は叩かない (runtime refresh は従来どおり禁止)。
+    別プロセスが /token を再発行して settings.ini を更新すると、
+    先に起動していたプロセスが持つ token は失効し 401 になる。
+    その場合に必要なのは「新しい token を発行し直すこと」ではなく
+    「共有された正規 token を読み直すこと」なので、ここではそれだけ行う。
+    """
+    if not _env_bool("KABU_TOKEN_RELOAD_SETTINGS_ON_401", True):
+        return None
+
+    try:
+        used = ""
+        headers = kwargs.get("headers") or {}
+        try:
+            used = str(headers.get("X-API-KEY") or "").strip()
+        except Exception:
+            used = ""
+
+        fresh = _reload_token_from_settings_ini()
+        if not fresh or fresh == used:
+            return None
+
+        _publish_env_token(fresh)
+        try:
+            import token_manager  # type: ignore
+
+            publish = getattr(token_manager, "_publish_token_all_layers", None)
+            if callable(publish):
+                publish(fresh, "token_startup_policy_401_reload")
+        except Exception:
+            logger.debug("[TOKEN STARTUP ONCE] token publish after reload failed", exc_info=True)
+
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["headers"] = _merge_api_key(kwargs.get("headers"), fresh)
+        resp = base(session, method, url, **retry_kwargs)
+        logger.warning(
+            "[TOKEN STARTUP ONCE] 401 -> settings.ini の token を読み直して再送した "
+            "url=%s used_tail=%s fresh_tail=%s status=%s (POST /token は叩いていない)",
+            url,
+            used[-4:] if used else "-",
+            fresh[-4:],
+            getattr(resp, "status_code", None),
+        )
+        return resp
+    except Exception:
+        logger.exception("[TOKEN STARTUP ONCE] settings.ini token retry failed url=%s", url)
+        return None
+
+
 def _patch_requests_no_401_refresh() -> bool:
     global _ORIG_REQUEST
     try:
@@ -354,15 +455,40 @@ def _patch_requests_no_401_refresh() -> bool:
         _ORIG_REQUEST = base
 
         def request_no_401_refresh(self, method, url, **kwargs):
+            pinned = False
             if _is_kabu_api_url(url):
                 try:
-                    token = _read_settings_token()
-                    if token:
-                        kwargs["headers"] = _merge_api_key(kwargs.get("headers"), token)
+                    hdrs = kwargs.get("headers") or {}
+                    pinned = bool(hdrs.get(PIN_HEADER))
                 except Exception:
-                    pass
+                    pinned = False
+                if pinned:
+                    # preflight など「この token で通るかを確かめたい」呼び出し。
+                    # ここで settings.ini の token に差し替えると、検証したい
+                    # token と実際に送る token が食い違い、原因を取り違える。
+                    _log_request_header(url, kwargs.get("headers"), "pinned")
+                else:
+                    try:
+                        token = _read_settings_token()
+                        if token:
+                            kwargs["headers"] = _merge_api_key(kwargs.get("headers"), token)
+                            _log_request_header(url, kwargs.get("headers"), "settings_ini")
+                    except Exception:
+                        pass
             resp = base(self, method, url, **kwargs)
             if _is_kabu_api_url(url) and getattr(resp, "status_code", None) == 401:
+                _log_request_header(url, kwargs.get("headers"), "on_401", force=True)
+                if pinned:
+                    # pin された token が弾かれた事実をそのまま返す。
+                    logger.warning(
+                        "[TOKEN STARTUP ONCE] 401 on pinned token url=%s "
+                        "(呼び出し側が検証中の token。ここでは差し替えない)",
+                        url,
+                    )
+                    return resp
+                retried = _retry_once_with_settings_ini_token(base, self, method, url, kwargs)
+                if retried is not None:
+                    return retried
                 logger.warning("[TOKEN STARTUP ONCE] 401 received; runtime refresh disabled url=%s", url)
             return resp
 

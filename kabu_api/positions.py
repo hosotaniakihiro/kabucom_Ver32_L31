@@ -1,7 +1,11 @@
 # ============================================================
-# kabu_api/positions.py（Ver24-FINAL-REV9-STABLE-429-SAFE）
+# kabu_api/positions.py（Ver25-SHARED-POSITIONS-READ-CACHE）
 # ------------------------------------------------------------
-# ✔ /positions API 安定取得（retry + cache + 429ガード）
+# ✔ /positions API 安定取得（共有 singleflight + cache + 429ガード）
+# ✔ 2026-09-01: 実 GET を kabu_api.positions_read_cache へ集約。
+#   旧実装は timeout 10 秒 x 3 回リトライで 1 呼び出し最大 31 秒ブロックし、
+#   同じプロセスの kabu_position_reader (product=2) と二重に /positions を
+#   叩いていた。timeout / TTL / backoff の数値は kabu_api.rest_limits が持つ。
 # ✔ 信用建玉のみ同期（現物除外）
 # ✔ INSERT / UPDATE / CLOSE 完全ミラー
 # ✔ kabuステーション過負荷防止
@@ -66,30 +70,48 @@ def _get_positions_core():
         return _POS_CACHE or []
 
 
-def _get_positions_impl():
+def _classify_positions_error(err: str) -> str:
+    """error 文字列の接頭辞から失敗の種類を 1 箇所で決める。
+
+    "auth" が一度立つと以後の timeout まで auth に見える、といった
+    取り違えを避けるため、毎回 error からだけ決める。
     """
-    kabuステーション /positions を安全に取得する
-    ・5秒キャッシュ
-    ・timeout 10秒
-    ・最大3回 retry（※429はretryしない）
-    ・例外は絶対に投げない
+    e = str(err or "")
+    for kind in ("auth", "rate_limited", "http", "network", "bad_response", "token_missing", "unexpected"):
+        if e.startswith(kind + ":"):
+            return kind
+    if "backoff" in e:
+        # バックオフ中。理由は直前の失敗が握っている。
+        for kind in ("auth", "rate_limited", "http", "network", "bad_response", "token_missing"):
+            if (kind + ":") in e:
+                return kind
+        return "network"
+    return "unexpected"
+
+
+def _get_positions_http_once():
+    """/positions を 1 回だけ GET する。(payload, ok, error) を返す。
+
+    リトライしない。連続失敗時の待ちは kabu_api.positions_read_cache が
+    指数バックオフで行う。
+    旧実装は timeout 10 秒 x 3 回 + sleep で 1 呼び出し最大 31 秒ブロックし、
+    その待ち時間そのものが kabu Station の同時接続を占有していた
+    (2026-09-01 12:53-12:55 のログで実測)。
     """
+    global _POS_FETCH_HEALTHY, _POS_LAST_FAILURE
 
-    global _POS_CACHE, _POS_CACHE_TIME
-    global _POS_FETCH_HEALTHY, _POS_LAST_FAILURE, _POS_LAST_OK_TIME
-
-    now = time.time()
-
-    # --------------------------------------------------------
-    # キャッシュ有効
-    # --------------------------------------------------------
-    if _POS_CACHE is not None and (now - _POS_CACHE_TIME) < _POS_CACHE_TTL:
-        return _POS_CACHE
-
-    token = global_data.token_value
+    # 起動直後は global_data がまだ compat オブジェクトで、
+    # token_value 属性そのものが生えていないことがある
+    # (2026-09-02 09:04:32 実測:
+    #  AttributeError: 'GlobalDataCompat' has no attribute 'token_value')。
+    # これは「トークンがまだ配られていない」だけの一過性なので、
+    # unexpected 扱いにして /positions をバックオフさせない。
+    token = getattr(global_data, "token_value", None)
     if not token:
         logger.warning("⚠ get_positions: token 不在 → skip")
-        return _POS_CACHE or []
+        return None, False, "token_missing:token unavailable"
+
+    from kabu_api import rest_limits
 
     url = f"{API_URL}/positions"
     headers = {
@@ -97,81 +119,108 @@ def _get_positions_impl():
         "X-API-KEY": token,
     }
 
-    for i in range(3):
-        try:
-            res = requests.get(
-                url,
-                headers=headers,
-                timeout=10,
-            )
+    try:
+        res = requests.get(
+            url,
+            headers=headers,
+            timeout=rest_limits.policy("positions").timeout_sec,
+        )
+    except requests.exceptions.ReadTimeout:
+        return None, False, "network:ReadTimeout"
+    except requests.exceptions.ConnectionError:
+        return None, False, "network:ConnectionError"
+    except Exception as e:  # noqa: BLE001
+        logger.error("❌ get_positions unexpected error", exc_info=True)
+        return None, False, f"unexpected:{type(e).__name__}: {e}"
 
-            # ------------------------------------------------
-            # ★ 429 = 正常な抑制信号（即スキップ）
-            # ------------------------------------------------
-            if res.status_code == 429:
-                logger.warning("⚠ /positions rate limited (429) → skip this cycle")
-                time.sleep(0.5)
-                # 429 は正常な抑制信号なので失敗扱いにはしない。
-                # ただしキャッシュが無いときの [] は「建玉ゼロ」ではなく
-                # 「まだ一度も取れていない」なので、そこだけは不健全にする。
-                if _POS_CACHE is None:
-                    _POS_FETCH_HEALTHY = False
-                    _POS_LAST_FAILURE = "rate_limited_no_cache"
-                return _POS_CACHE or []
+    # ------------------------------------------------
+    # ★ 429 = 正常な抑制信号。token は取り直さない。
+    # ------------------------------------------------
+    if res.status_code == 429:
+        logger.warning("⚠ /positions rate limited (429) → backoff (token refresh はしない)")
+        return None, False, "rate_limited:429 Too Many Requests"
 
-            res.raise_for_status()
+    if res.status_code in (401, 403):
+        # 認証失敗。これを一般例外に混ぜて traceback で流すと、
+        # 呼び出し側は「例外が出なかった＝取得成功」と読み、
+        # 建玉ゼロと区別できなくなる。専用の行にして目に見えるようにする。
+        logger.error(
+            "❌ [POSITIONS AUTH FAILED] /positions が %s を返した。"
+            "建玉は取得できていない。戻り値は空であり、建玉ゼロを意味しない。"
+            " 判断に使う側は positions_fetch_healthy() を見ること。",
+            res.status_code,
+        )
+        return None, False, f"auth:{res.status_code}"
 
-            positions = res.json()
-            if not isinstance(positions, list):
-                logger.error(f"❌ /positions 不正レスポンス: {positions}")
-                _POS_FETCH_HEALTHY = False
-                _POS_LAST_FAILURE = "bad_response"
-                return _POS_CACHE or []
+    if res.status_code >= 400:
+        return None, False, f"http:{res.status_code}"
 
-            _POS_CACHE = positions
-            _POS_CACHE_TIME = now
-            _POS_FETCH_HEALTHY = True
-            _POS_LAST_FAILURE = ""
-            _POS_LAST_OK_TIME = now
-            return positions
+    try:
+        positions = res.json()
+    except Exception as e:  # noqa: BLE001
+        return None, False, f"bad_response:json decode failed: {e}"
 
-        except requests.exceptions.ReadTimeout:
-            logger.warning(f"⚠ get_positions timeout retry={i+1}")
-            time.sleep(0.5)
+    if not isinstance(positions, list):
+        logger.error(f"❌ /positions 不正レスポンス: {positions}")
+        return None, False, f"bad_response:type={type(positions).__name__}"
 
-        except requests.exceptions.ConnectionError:
-            logger.warning(f"⚠ get_positions connection error retry={i+1}")
-            time.sleep(0.5)
+    return positions, True, ""
 
-        except requests.exceptions.HTTPError as e:
-            status = getattr(getattr(e, "response", None), "status_code", None)
+
+def _get_positions_impl():
+    """
+    kabuステーション /positions を安全に取得する。
+
+    実 GET は kabu_api.positions_read_cache が 1 本化する
+    (kabu_position_reader / PositionStateService と共有:
+     singleflight + TTL + 失敗時の指数バックオフ)。
+    ・例外は絶対に投げない (契約は従来どおり)
+    ・失敗時は直前キャッシュか空リストを返す。
+      呼び出し側は positions_fetch_healthy() で区別すること。
+    """
+
+    global _POS_CACHE, _POS_CACHE_TIME
+    global _POS_FETCH_HEALTHY, _POS_LAST_FAILURE, _POS_LAST_OK_TIME
+
+    from kabu_api import positions_read_cache
+
+    res = positions_read_cache.get_positions_cached(
+        _get_positions_http_once,
+        key=positions_read_cache.KEY_ALL,
+        caller="kabu_api.positions.get_positions",
+    )
+
+    if res.ok and isinstance(res.payload, list):
+        now = time.time()
+        _POS_CACHE = res.payload
+        _POS_CACHE_TIME = now
+        _POS_FETCH_HEALTHY = True
+        _POS_LAST_FAILURE = ""
+        _POS_LAST_OK_TIME = now
+        return res.payload
+
+    err = str(res.error or "")
+    kind = _classify_positions_error(err)
+
+    if kind == "rate_limited":
+        # 429 は「呼びすぎ」であって障害ではない。キャッシュがあるなら
+        # 古いが本物のデータなので健全のまま。キャッシュが無いときの [] は
+        # 「建玉ゼロ」ではなく「まだ一度も取れていない」なので不健全にする。
+        if _POS_CACHE is None:
             _POS_FETCH_HEALTHY = False
-            if status in (401, 403):
-                # 認証失敗。これを一般例外に混ぜて traceback で流すと、
-                # 呼び出し側は「例外が出なかった＝取得成功」と読み、
-                # 建玉ゼロと区別できなくなる。専用の行にして目に見えるようにする。
-                _POS_LAST_FAILURE = "auth"
-                logger.error(
-                    "❌ [POSITIONS AUTH FAILED] /positions が %s を返した。"
-                    "建玉は取得できていない。戻り値は %s であり、建玉ゼロを意味しない。"
-                    " 判断に使う側は positions_fetch_healthy() を見ること。",
-                    status,
-                    "直前のキャッシュ" if _POS_CACHE else "空リスト",
-                )
-            else:
-                _POS_LAST_FAILURE = "http"
-                logger.error("❌ get_positions HTTP error status=%s", status, exc_info=True)
-            return _POS_CACHE or []
+            _POS_LAST_FAILURE = "rate_limited_no_cache"
+    elif kind == "token_missing":
+        # token 未設定は起動直後に起こる。従来どおり健全性は変えない。
+        pass
+    else:
+        _POS_FETCH_HEALTHY = False
+        _POS_LAST_FAILURE = kind
 
-        except Exception:
-            _POS_FETCH_HEALTHY = False
-            _POS_LAST_FAILURE = "unexpected"
-            logger.error("❌ get_positions unexpected error", exc_info=True)
-            return _POS_CACHE or []
-
-    _POS_FETCH_HEALTHY = False
-    _POS_LAST_FAILURE = "network"
-    logger.warning("⚠ get_positions failed after retries → use cache")
+    logger.warning(
+        "⚠ get_positions failed source=%s kind=%s err=%s → use cache "
+        "(戻り値の [] は「建玉ゼロ」ではない。positions_fetch_healthy() を見ること)",
+        res.source, kind, err[:160],
+    )
     return _POS_CACHE or []
 
 

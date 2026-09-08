@@ -40,17 +40,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 
 import requests
-from configparser import ConfigParser
+from configparser import ConfigParser, ParsingError
 from pathlib import Path
 from typing import Any
 
@@ -249,6 +251,38 @@ def _config_candidates() -> list[Path]:
     return uniq
 
 
+def redact_ini_line(line: Any) -> str:
+    """Keep the shape of a settings.ini line but drop the value.
+
+    settings.ini holds apipassword / token, so a parse error must never be able to
+    echo a value into the log.  Section headers and bare junk have no '=' and are
+    kept as-is, which is exactly what identifies a corrupted header line.
+    """
+    text = str(line or "").rstrip("\r\n")
+    head, sep, _value = text.partition("=")
+    if sep:
+        return head.rstrip() + " = <redacted>"
+    return text
+
+
+def describe_parsing_error(exc: Exception) -> str:
+    """Turn a ConfigParser error into "line N: '...'" without leaking values.
+
+    A corrupted settings.ini used to surface only as "apipassword read failed" /
+    "password_present=False", which points the reader at the API password instead
+    of at the broken line.  This names the line instead.
+    """
+    lineno = getattr(exc, "lineno", None)
+    if lineno is not None:
+        return "line %s: %r" % (lineno, redact_ini_line(getattr(exc, "line", "")))
+
+    errors = getattr(exc, "errors", None) or []
+    if errors:
+        return "; ".join("line %s: %r" % (no, redact_ini_line(text)) for no, text in errors[:3])
+
+    return type(exc).__name__
+
+
 def _get_section(conf: ConfigParser) -> str | None:
     # ConfigParser is case-insensitive by default, so [aukabu] / [AuKabu] are equivalent.
     if conf.has_section("aukabu"):
@@ -281,7 +315,17 @@ def _load_settings() -> ConfigParser:
             if sec:
                 _CONFIG_FILE_PATH = str(path)
                 return conf
+        except ParsingError as e:
+            # 壊れた settings.ini を黙って読み飛ばすと「[aukabu] が無い」という
+            # 別の話に化けるので、壊れた行をそのままログに出す。
+            logger.error(
+                "[TOKEN MANAGER] settings.ini is corrupted and was skipped path=%s detail=%s",
+                path,
+                describe_parsing_error(e),
+            )
+            continue
         except Exception:
+            logger.debug("[TOKEN MANAGER] settings.ini read failed path=%s", path, exc_info=True)
             continue
 
     conf = ConfigParser()
@@ -490,6 +534,189 @@ def _save_token(token) -> bool:
     return True
 
 
+# ============================================================
+# /token 発行のプロセス間直列化
+# ------------------------------------------------------------
+# kabu Station の token は 1 セッション 1 個で、新しく発行すると
+# 直前の token が失効する。main.py と main_database.py を続けて起動すると
+# 双方が起動時 recovery で /token を叩き、後から叩いた方が先の token を
+# 殺してしまう (2026-09-01 08:47-08:48 の実測)。
+#
+# ここで OS ファイルロックを取り、ロック取得の前後で settings.ini の token を
+# 読み直す。待っている間に別プロセスが発行していたら、自分は /token を
+# 叩かずにその token を使う。これで「起動時の /token は実質 1 回」になる。
+# ============================================================
+
+_TOKEN_ISSUE_LOCK = threading.RLock()
+_TOKEN_ISSUE_DEPTH = 0
+
+
+def _token_issue_lock_path() -> str:
+    return os.getenv("KABU_TOKEN_ISSUE_LOCK_PATH") or os.path.join(
+        tempfile.gettempdir(), "autostock_kabustation_token_issue.lock"
+    )
+
+
+def token_meta_path() -> str:
+    """token の発行時刻などを置くサイドカー。settings.ini の隣。"""
+    override = os.getenv("KABU_TOKEN_META_PATH")
+    if override:
+        return override
+    if not _CONFIG_FILE_PATH:
+        # settings.ini の実パスを確定させる。プロセスごとに cwd が違っても
+        # 同じサイドカーを見るようにするため。
+        try:
+            _load_settings()
+        except Exception:
+            logger.debug("[TOKEN MANAGER] settings load for meta path failed", exc_info=True)
+    base = _CONFIG_FILE_PATH or CONFIG_PATH
+    try:
+        return str(Path(base).with_suffix(Path(base).suffix + ".token_meta.json"))
+    except Exception:
+        return str(base) + ".token_meta.json"
+
+
+def read_token_meta() -> dict:
+    try:
+        with open(token_meta_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_token_meta(token: str) -> None:
+    """どのプロセスがいつ発行したかを共有する。token 本体は書かない。"""
+    info = {
+        "token_tail": _token_tail(token),
+        "token_len": len(str(token or "")),
+        "issued_at": time.time(),
+        "issued_at_str": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "pid": os.getpid(),
+        "process": os.path.basename(str(sys.argv[0] or "")),
+    }
+    try:
+        with open(token_meta_path(), "w", encoding="utf-8") as fh:
+            json.dump(info, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.debug("[TOKEN MANAGER] token meta write failed", exc_info=True)
+
+
+def token_age_sec(token: str) -> float | None:
+    """この token が発行されてからの秒数。分からなければ None。"""
+    meta = read_token_meta()
+    if not meta:
+        return None
+    if _token_tail(token) != str(meta.get("token_tail") or ""):
+        return None
+    try:
+        return max(0.0, time.time() - float(meta.get("issued_at") or 0.0))
+    except Exception:
+        return None
+
+
+@contextlib.contextmanager
+def _token_issue_file_lock(reason: str):
+    """/token 発行区間をプロセス間で直列化する。取れなければ素通しする。
+
+    同一プロセス内で入れ子になっても詰まらないよう再入可能にしている
+    (Windows の msvcrt.locking は同じプロセスでも別ハンドルなら弾かれる)。
+    """
+    global _TOKEN_ISSUE_DEPTH
+    timeout = max(1.0, _safe_float_env("KABU_TOKEN_ISSUE_LOCK_TIMEOUT_SEC", 30.0))
+    path = _token_issue_lock_path()
+    fh = None
+    started = time.monotonic()
+    with _TOKEN_ISSUE_LOCK:
+        if _TOKEN_ISSUE_DEPTH > 0:
+            _TOKEN_ISSUE_DEPTH += 1
+            try:
+                yield
+            finally:
+                _TOKEN_ISSUE_DEPTH -= 1
+            return
+        _TOKEN_ISSUE_DEPTH += 1
+        try:
+            fh = open(path, "a+", encoding="utf-8")
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() - started >= timeout:
+                        logger.warning(
+                            "[TOKEN MANAGER] token issue lock timeout reason=%s path=%s -> ロック無しで続行",
+                            reason, path,
+                        )
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+                        fh = None
+                        break
+                    time.sleep(0.2)
+        except Exception:
+            logger.debug("[TOKEN MANAGER] token issue lock open failed", exc_info=True)
+            try:
+                if fh is not None:
+                    fh.close()
+            except Exception:
+                pass
+            fh = None
+
+        waited = time.monotonic() - started
+        if fh is not None and waited > 0.5:
+            logger.warning(
+                "[TOKEN MANAGER] token issue lock acquired after %.1fs wait reason=%s "
+                "(別プロセスが /token 発行中だった)",
+                waited, reason,
+            )
+        try:
+            yield
+        finally:
+            _TOKEN_ISSUE_DEPTH -= 1
+            if fh is not None:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        fh.seek(0)
+                        try:
+                            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                        except Exception:
+                            pass
+                    else:
+                        import fcntl
+
+                        try:
+                            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+
+
+def _safe_float_env(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).strip())
+    except Exception:
+        return float(default)
+
+
 def _publish_token(token: Any) -> str | None:
     global API_TOKEN
     if not token:
@@ -653,42 +880,85 @@ def request_fresh_token(apipassword=None, reason: str = "explicit") -> str:
             f" path={_CONFIG_FILE_PATH} section={sec} api_password_source={pw_source}"
         )
 
-    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_REQUESTED)
-    logger.warning(
-        "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s reason=%s api_password_source=%s",
-        TOKEN_SOURCE_FRESH_TOKEN_API,
-        TOKEN_ACTION_API_REQUESTED,
-        reason,
-        pw_source,
+    before_tail = _token_tail(read_settings_token())
+
+    with _token_issue_file_lock(reason):
+        # ロック待ちの間に別プロセスが発行していないか確認する。
+        # 発行済みならそれを使う (ここで叩くと相手の token を殺してしまう)。
+        current = str(read_settings_token() or "").strip()
+        current_tail = _token_tail(current)
+        if current and current_tail != before_tail:
+            logger.warning(
+                "[TOKEN ISSUE] pid=%s process=%s reason=%s old_tail=%s new_tail=%s "
+                "action=reuse_other_process (別プロセスが発行済みなので /token は叩かない)",
+                os.getpid(), os.path.basename(str(sys.argv[0] or "")), reason,
+                before_tail, current_tail,
+            )
+            _publish_token_all_layers(current)
+            API_PASSWORD = str(api_password)
+            return current
+
+        _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_REQUESTED)
+        logger.warning(
+            "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s reason=%s api_password_source=%s",
+            TOKEN_SOURCE_FRESH_TOKEN_API,
+            TOKEN_ACTION_API_REQUESTED,
+            reason,
+            pw_source,
+        )
+
+        token = _post_token_api(api_password)
+        logger.warning(
+            "[TOKEN ISSUE] pid=%s process=%s reason=%s old_tail=%s new_tail=%s action=api_issued",
+            os.getpid(), os.path.basename(str(sys.argv[0] or "")), reason,
+            before_tail, _token_tail(token),
+        )
+
+        _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_RECEIVED)
+        logger.warning(
+            "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s token_len=%d token_tail=%s",
+            TOKEN_SOURCE_FRESH_TOKEN_API,
+            TOKEN_ACTION_API_RECEIVED,
+            len(token),
+            _token_tail(token),
+        )
+
+        # settings.ini is canonical: verify the save before publishing, otherwise the
+        # requests hook can re-inject the old settings.ini token and 401 again.
+        _save_token(token)
+        _write_token_meta(token)
+        _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_SAVED)
+        logger.warning(
+            "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s path=%s token_len=%d token_tail=%s",
+            TOKEN_SOURCE_FRESH_TOKEN_API,
+            TOKEN_ACTION_SAVED,
+            _CONFIG_FILE_PATH,
+            len(token),
+            _token_tail(token),
+        )
+
+        _publish_token_all_layers(token)
+        API_PASSWORD = str(api_password)
+        return token
+
+
+def log_token_settings_state(context: str = "") -> dict:
+    """[TOKEN SETTINGS] memory と settings.ini の一致を確認する。"""
+    mem = str(API_TOKEN or "").strip()
+    ini = str(read_settings_token() or "").strip()
+    same = bool(mem) and mem == ini
+    info = {
+        "pid": os.getpid(),
+        "memory_tail": _token_tail(mem),
+        "settings_tail": _token_tail(ini),
+        "same": same,
+    }
+    log = logger.warning if same or not mem or not ini else logger.error
+    log(
+        "[TOKEN SETTINGS] pid=%s memory_tail=%s settings_tail=%s same=%s context=%s",
+        info["pid"], info["memory_tail"], info["settings_tail"], same, context or "-",
     )
-
-    token = _post_token_api(api_password)
-
-    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_RECEIVED)
-    logger.warning(
-        "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s token_len=%d token_tail=%s",
-        TOKEN_SOURCE_FRESH_TOKEN_API,
-        TOKEN_ACTION_API_RECEIVED,
-        len(token),
-        _token_tail(token),
-    )
-
-    # settings.ini is canonical: verify the save before publishing, otherwise the
-    # requests hook can re-inject the old settings.ini token and 401 again.
-    _save_token(token)
-    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_SAVED)
-    logger.warning(
-        "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s path=%s token_len=%d token_tail=%s",
-        TOKEN_SOURCE_FRESH_TOKEN_API,
-        TOKEN_ACTION_SAVED,
-        _CONFIG_FILE_PATH,
-        len(token),
-        _token_tail(token),
-    )
-
-    _publish_token_all_layers(token)
-    API_PASSWORD = str(api_password)
-    return token
+    return info
 
 
 def _get_valid_token_core():
@@ -780,24 +1050,49 @@ def _refresh_token_core(apipassword=None):
             f" existing={existing} tried={tried}"
         )
 
-    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_REQUESTED)
-    logger.warning(
-        "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s reason=parent_refresh api_password_source=%s",
-        TOKEN_SOURCE_FRESH_TOKEN_API,
-        TOKEN_ACTION_API_REQUESTED,
-        pw_source,
-    )
+    before_tail = _token_tail(existing_token)
 
-    token = _post_token_api(api_password)
+    with _token_issue_file_lock("parent_refresh"):
+        # ロック待ちの間に別プロセスが発行していたらそれを使う。
+        # kabu Station は新しい token を出すと古い token を即座に失効させるので
+        # (2026-09-01 実測)、ここで二重に叩くと相手を必ず 401 にしてしまう。
+        current = str(read_settings_token() or "").strip()
+        if current and _token_tail(current) != before_tail:
+            logger.warning(
+                "[TOKEN ISSUE] pid=%s process=%s reason=parent_refresh old_tail=%s new_tail=%s "
+                "action=reuse_other_process (別プロセスが発行済みなので /token は叩かない)",
+                os.getpid(), os.path.basename(str(sys.argv[0] or "")),
+                before_tail, _token_tail(current),
+            )
+            token = _publish_token(current)
+            API_PASSWORD = str(api_password)
+            _mark_token_state(TOKEN_SOURCE_SETTINGS_INI_CACHED, TOKEN_ACTION_REUSED)
+            return token
 
-    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_RECEIVED)
+        _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_REQUESTED)
+        logger.warning(
+            "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s reason=parent_refresh api_password_source=%s",
+            TOKEN_SOURCE_FRESH_TOKEN_API,
+            TOKEN_ACTION_API_REQUESTED,
+            pw_source,
+        )
 
-    # 重要: settings.ini を canonical source にしているため、publish より先に保存検証する。
-    # 保存に失敗した状態で API_TOKEN だけ更新すると、直後の requests フックが古い settings.ini token を再注入して 401 になる。
-    _save_token(token)
-    _publish_token(token)
-    API_PASSWORD = str(api_password)
-    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_SAVED)
+        token = _post_token_api(api_password)
+        logger.warning(
+            "[TOKEN ISSUE] pid=%s process=%s reason=parent_refresh old_tail=%s new_tail=%s action=api_issued",
+            os.getpid(), os.path.basename(str(sys.argv[0] or "")),
+            before_tail, _token_tail(token),
+        )
+
+        _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_RECEIVED)
+
+        # 重要: settings.ini を canonical source にしているため、publish より先に保存検証する。
+        # 保存に失敗した状態で API_TOKEN だけ更新すると、直後の requests フックが古い settings.ini token を再注入して 401 になる。
+        _save_token(token)
+        _write_token_meta(token)
+        _publish_token(token)
+        API_PASSWORD = str(api_password)
+        _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_SAVED)
 
     logger.warning(
         "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s parent token refreshed/saved "
