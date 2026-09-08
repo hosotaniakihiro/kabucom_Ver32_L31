@@ -163,6 +163,33 @@ def _push_wal_size_limit_bytes() -> int:
     return 64 * 1024 * 1024
 
 
+def _push_db_buffer_size() -> int:
+    """1 回の flush で書く行数。
+
+    2026-09-08 の実測で、flush ループが 27 回/分 -> 2-4 回/分 へ落ちたときに
+    1 回 500 行では到着 (約 3,500 行/分) に追いつかず、152,066 行を捨てた。
+    ローカル DB なら 500 行の executemany+commit は 0.03 秒なので、
+    1 回あたりを増やしてもコストはほぼ変わらない。
+    """
+    try:
+        v = os.getenv("PUSH_DB_BUFFER_SIZE")
+        if v is not None and str(v).strip() != "":
+            return max(100, int(float(str(v).strip())))
+    except Exception:
+        pass
+    return 5000
+
+
+def _push_db_flush_interval_sec() -> float:
+    try:
+        v = os.getenv("PUSH_DB_FLUSH_INTERVAL_SEC")
+        if v is not None and str(v).strip() != "":
+            return max(0.2, float(str(v).strip()))
+    except Exception:
+        pass
+    return 2.0
+
+
 def _push_nas_sync_stop_timeout_sec() -> float:
     """停止時に NAS 複製を待つ上限。
 
@@ -421,13 +448,26 @@ class StreamDBWriter:
 
     def __init__(
         self,
-        buffer_size: int = 500,
-        flush_interval_sec: float = 2.0,
+        buffer_size: int = 0,
+        flush_interval_sec: float = 0.0,
         enable_raw_save: bool = True,
     ):
-        # NAS向け既定値
-        self.buffer_size = int(buffer_size) if buffer_size else 500
-        self.flush_interval_sec = float(flush_interval_sec) if flush_interval_sec else 2.0
+        # 2026-09-08: buffer_size の既定を 500 -> 5000 へ引き上げた。
+        #
+        # 本番実測 (後場):
+        #   12:53  flush 27 回/分 = 13,500 行/分   <- 足りている
+        #   13:08  flush  4 回/分 =  2,000 行/分   <- 急落
+        #   以後   2-4 回/分 のまま大引けまで
+        # 到着は約 3,500 行/分。1 回の flush は **必ず 500 行** (548/548) なので、
+        # ループが遅くなった瞬間に構造的に追いつかなくなり、キューが上限
+        # 200,000 に達して 152,066 行を捨てた (DB の最終 tick は 13:56 で停止)。
+        #
+        # ループが遅くなる理由は未特定だが、1 回あたりの行数を増やせば
+        # ループ速度に関係なく容量が増える。4 回/分 x 5,000 行 = 20,000 行/分。
+        # ローカル DB なので 500 行の executemany+commit は 0.03 秒しかかからず、
+        # 5,000 行でも十分速い (書き込み自体は律速ではない)。
+        self.buffer_size = int(buffer_size) if buffer_size else _push_db_buffer_size()
+        self.flush_interval_sec = float(flush_interval_sec) if flush_interval_sec else _push_db_flush_interval_sec()
         self.enable_raw_save = bool(enable_raw_save)
 
         self.buffer = []

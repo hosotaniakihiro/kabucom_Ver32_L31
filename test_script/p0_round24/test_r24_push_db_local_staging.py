@@ -335,3 +335,48 @@ def test_only_the_push_db_owner_starts_periodic_sync():
     assert "_should_skip_push_db_writer_here" in src, (
         "複製側にオーナーガードが無い (2 プロセスが同じ NAS ファイルを書く)"
     )
+
+
+# ============================================================
+# 7. flush の 1 回あたり行数
+#    (2026-09-08 実測: flush ループが 27 回/分 -> 2-4 回/分 へ落ちたとき
+#     1 回 500 行では到着 約3,500 行/分 に追いつかず、キューが上限
+#     200,000 に達して 152,066 行を捨てた。DB の最終 tick は 13:56 で停止)
+# ============================================================
+
+def test_buffer_size_default_is_large_enough():
+    """4 回/分まで落ちても到着に追いつける行数であること。
+
+    到着は実測で約 3,500 行/分。最悪 2 回/分でも 2 x buffer >= 3,500 が要る。
+    """
+    from trading.push import push_db_writer as m
+
+    n = m._push_db_buffer_size()
+    assert n >= 2000, f"1 回 {n} 行では flush ループが遅くなったときに追いつかない"
+    assert 2 * n >= 3500, "最悪 2 回/分でも到着に追いつくこと"
+
+
+def test_buffer_size_and_interval_are_env_tunable(monkeypatch):
+    from trading.push import push_db_writer as m
+
+    monkeypatch.setenv("PUSH_DB_BUFFER_SIZE", "1234")
+    assert m._push_db_buffer_size() == 1234
+    monkeypatch.setenv("PUSH_DB_FLUSH_INTERVAL_SEC", "0.5")
+    assert m._push_db_flush_interval_sec() == pytest.approx(0.5)
+
+
+def test_writer_uses_the_resolved_defaults():
+    """既定値を引数のデフォルトに固定すると env 切り替えが効かなくなる。"""
+    import inspect
+
+    from trading.push.push_db_writer import StreamDBWriter
+
+    sig = inspect.signature(StreamDBWriter.__init__)
+    assert sig.parameters["buffer_size"].default == 0, (
+        "buffer_size の既定が import 時に固定されている"
+    )
+    w = StreamDBWriter.__new__(StreamDBWriter)
+    StreamDBWriter.__init__(w, enable_raw_save=False)
+    from trading.push import push_db_writer as m
+
+    assert w.buffer_size == m._push_db_buffer_size()
