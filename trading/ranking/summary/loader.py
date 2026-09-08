@@ -66,6 +66,46 @@ logger = logging.getLogger(__name__)
 # timeout は伸ばさない。NAS SQLite の安全性 (query_only / busy_timeout) は維持。
 # ============================================================
 
+# ============================================================
+# DB 読み時間の累計
+# ------------------------------------------------------------
+# [RANKING DB READ STAGE] は 1 回ごとの行なので、1 サイクルで
+# 何回・合計何秒 NAS を読んだのかが分からなかった。
+# [RANKING SUMMARY PERF] へ合流させるために累計を持つ。
+# 計測のみ。
+# ============================================================
+
+_db_read_lock = threading.Lock()
+_db_read_totals: dict = {"calls": 0, "connect": 0.0, "execute": 0.0, "fetch": 0.0,
+                         "total": 0.0, "rows": 0, "cancelled": 0}
+
+
+def _accumulate_db_read(*, connect: float, execute: float, fetch: float,
+                        total: float, rows: int, cancelled: bool) -> None:
+    try:
+        with _db_read_lock:
+            _db_read_totals["calls"] += 1
+            _db_read_totals["connect"] += float(connect or 0.0)
+            _db_read_totals["execute"] += float(execute or 0.0)
+            _db_read_totals["fetch"] += float(fetch or 0.0)
+            _db_read_totals["total"] += float(total or 0.0)
+            _db_read_totals["rows"] += int(rows or 0)
+            if cancelled:
+                _db_read_totals["cancelled"] += 1
+    except Exception:
+        pass
+
+
+def ranking_db_read_totals(reset: bool = True) -> dict:
+    """直近サイクルの DB 読み累計を返す。既定で読み出したらリセットする。"""
+    with _db_read_lock:
+        out = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in _db_read_totals.items()}
+        if reset:
+            for k in _db_read_totals:
+                _db_read_totals[k] = 0.0 if isinstance(_db_read_totals[k], float) else 0
+    return out
+
+
 _RANKING_READ_CHUNK = 5000
 # NAS I/O でブロックしている間は VM 命令が進まないため、
 # 粒度を細かくしても中断は I/O 完了待ちになる。
@@ -259,6 +299,10 @@ def read_sqlite_table(
             except Exception:
                 logger.debug("[RANKING SUMMARY RUNNER] close failed", exc_info=True)
         total = _time.perf_counter() - t_all
+        _accumulate_db_read(
+            connect=t_connect, execute=t_execute, fetch=t_fetch,
+            total=total, rows=rows_fetched, cancelled=cancelled,
+        )
         log = logger.warning if (total >= 1.0 or cancelled or t_fetch >= 1.0) else logger.info
         try:
             log(

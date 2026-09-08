@@ -50,10 +50,32 @@ PRICE_COLUMNS = (
     "last_price",
 )
 
-VOLUME_COLUMNS = (
-    "volume",
+# ------------------------------------------------------------
+# 流動性スクリーニングに使う出来高列 (2026-09-01 修正)
+# ------------------------------------------------------------
+# LIQUIDITY_MIN_VOLUME=10000 / MIN_TURNOVER=1,000,000 は
+# 「その銘柄が日中どれだけ商いがあるか」を見る *日次流動性* の閾値。
+# ところが従来は列の優先順位が "volume" 先頭だったため、
+# ranking_pipeline が渡す *1本の足の出来高* (3分足 max 5500) と
+# 日次流動性の閾値を突き合わせ、50 銘柄中 48 銘柄を落として
+# "empty after volume filter" になっていた (実測 13:46/13:48/13:50)。
+#
+# kabu Station PUSH の TradingVolume は当日累計出来高で、
+# 本システムでは trading_volume 列がそれにあたる
+# (memory_latest_1m は集計時に "last" を取っている = 累計の最新値)。
+# 流動性判定では累計側を優先する。閾値は変更しない。
+CUMULATIVE_VOLUME_COLUMNS = (
     "trading_volume",
+    "day_volume",
+    "cum_volume",
+    "volume_cum",
 )
+
+PER_BAR_VOLUME_COLUMNS = (
+    "volume",
+)
+
+VOLUME_COLUMNS = CUMULATIVE_VOLUME_COLUMNS + PER_BAR_VOLUME_COLUMNS
 
 TURNOVER_COLUMNS = (
     "turnover",
@@ -225,8 +247,33 @@ def _volume_filter(df: pd.DataFrame, min_volume: int) -> pd.DataFrame:
 
     before = len(df)
     volume = _to_numeric_col(df, volume_col, default=0.0)
+
+    is_cumulative = volume_col in CUMULATIVE_VOLUME_COLUMNS
+    if not is_cumulative:
+        # 累計列が無く 1 本足の出来高しか無い。
+        # 日次流動性の閾値をそのまま当てると全滅するので、
+        # 「何と何を比べているか」を必ず残す。閾値は動かさない。
+        logger.warning(
+            "[liquidity_filter] 累計出来高列が無いため per-bar 列で判定する col=%s "
+            "min_volume=%s vol_min=%.0f vol_max=%.0f rows=%d "
+            "(閾値は日次流動性向け。全滅する場合は上流が 1 本足を渡している)",
+            volume_col, min_volume,
+            float(volume.min()) if before else 0.0,
+            float(volume.max()) if before else 0.0,
+            before,
+        )
+
     out = df[volume >= float(min_volume)].copy()
     removed = before - len(out)
+
+    if before and len(out) == 0:
+        logger.error(
+            "[liquidity_filter] volume filter が全銘柄を除外した col=%s cumulative=%s "
+            "min_volume=%s vol_min=%.0f vol_max=%.0f rows=%d "
+            "(閾値と列の意味が一致しているか確認する)",
+            volume_col, is_cumulative, min_volume,
+            float(volume.min()), float(volume.max()), before,
+        )
 
     if removed > 0:
         logger.info(

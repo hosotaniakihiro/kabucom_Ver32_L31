@@ -24,6 +24,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import time as _ti_time
+
 import numpy as np
 import pandas as pd
 
@@ -487,6 +489,12 @@ def _fallback_vwap(df: pd.DataFrame) -> pd.Series:
 
 
 def _apply_fallback_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # R18: ここは per-symbol ループなので、通っているなら必ず記録する
+    logger.warning(
+        "[RANKING TECH STAGE] fallback indicators 経路 (per-symbol ループ) rows=%s symbols=%s",
+        len(df) if df is not None else -1,
+        df["symbol"].nunique() if df is not None and "symbol" in df.columns else -1,
+    )
     set_indicator_mode("fallback")
 
     if df is None or df.empty:
@@ -816,14 +824,34 @@ def _apply_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     try:
         from trading.ranking.summary.aggregation import AGG_KEEP_ORDER
 
+        # R18: technical 9-11 秒の内訳を出す
+        _ti_t0 = _ti_time.perf_counter()
+
         base = _build_ohlcv_compatible(df)
         base = _sort_if_possible(base, ["symbol", "datetime"])
         base["hist_len"] = base.groupby("symbol").cumcount() + 1
+        _ti_t1 = _ti_time.perf_counter()
 
         ind = _apply_external_indicators(base)
+        _ti_t2 = _ti_time.perf_counter()
+
         x = _merge_indicator_output(base, ind)
+        _ti_t3 = _ti_time.perf_counter()
 
         x = _sort_if_possible(x, ["symbol", "datetime"])
+
+        try:
+            _ti_total = _ti_t3 - _ti_t0
+            _ti_log = logger.warning if _ti_total >= 3.0 else logger.info
+            _ti_log(
+                "[RANKING TECH STAGE] rows=%s symbols=%s ohlcv=%.3fs "
+                "external_indicators=%.3fs merge=%.3fs total=%.3fs",
+                len(df),
+                df["symbol"].nunique() if "symbol" in df.columns else -1,
+                _ti_t1 - _ti_t0, _ti_t2 - _ti_t1, _ti_t3 - _ti_t2, _ti_total,
+            )
+        except Exception:
+            logger.debug("[RANKING TECH STAGE] ログに失敗", exc_info=True)
 
         if "hist_len" not in x.columns:
             x["hist_len"] = x.groupby("symbol").cumcount() + 1

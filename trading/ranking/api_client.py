@@ -20,9 +20,12 @@ import logging
 import os
 import socket
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import requests
 from configparser import ConfigParser
 from pathlib import Path
 from typing import Any
@@ -39,6 +42,87 @@ API_TIMEOUT_SEC = 5.0
 API_RETRY_MAX = 2
 API_RETRY_SLEEP_SEC = 0.35
 API_KEY_MISMATCH_CODE = 4001009
+
+# ------------------------------------------------------------
+# 失敗種別 (2026-09-01)
+# ------------------------------------------------------------
+# 以前は timeout も 429 も HTTP エラーも JSON 崩れも、すべて None を
+# 返していた。呼び出し側 (breaker) からは
+#     "probe invalid response data_type=NoneType"
+# としか見えず、
+#   ・レート制限で一時的に弾かれただけなのか
+#   ・kabu Station が本当に落ちているのか
+# を区別できなかった。実測 (13:47) では
+#     /ranking は 0.02s / 50 行で正常応答
+#     連打すると 429 が返る
+#     urllib 経由 (Connection: close) だと応答が返らず 5s タイムアウト
+# であり、breaker は「レート制限」を「障害」と誤認して
+# backoff を 120 -> 300 -> 600s と伸ばし、復旧できなくなっていた。
+OUTCOME_OK = "ok"
+OUTCOME_TIMEOUT = "timeout"
+OUTCOME_RATE_LIMITED = "rate_limited"
+OUTCOME_HTTP_ERROR = "http_error"
+OUTCOME_AUTH = "auth_rejected"
+OUTCOME_BAD_JSON = "bad_json"
+OUTCOME_TRANSPORT = "transport_error"
+
+RATE_LIMIT_STATUS = 429
+
+_LAST_OUTCOME = OUTCOME_OK
+_LAST_ERROR = ""
+_LAST_STATUS = None
+_OUTCOME_LOCK = threading.RLock()
+
+_SESSION: "requests.Session | None" = None
+_SESSION_LOCK = threading.RLock()
+
+
+def _session() -> "requests.Session":
+    """keep-alive の Session を使い回す。
+
+    urllib.request は毎回 "Connection: close" を送り、kabu Station は
+    そのリクエストに応答を返さないままタイムアウトさせる (2026-08-29/09-01 実測)。
+    token 側は既に requests へ移行済みで、ranking だけ取り残されていた。
+    """
+    global _SESSION
+    with _SESSION_LOCK:
+        if _SESSION is None:
+            _SESSION = requests.Session()
+        return _SESSION
+
+
+def _rate_limit_backoff_sec(attempt: int) -> float:
+    try:
+        base = float(os.getenv("RANKING_API_RATE_LIMIT_BACKOFF_SEC", "0.6") or 0.6)
+    except Exception:
+        base = 0.6
+    return max(0.0, base * max(1, int(attempt)))
+
+
+def _rate_limit_max_wait_sec() -> float:
+    try:
+        return max(0.0, float(os.getenv("RANKING_API_RATE_LIMIT_MAX_WAIT_SEC", "3.0") or 3.0))
+    except Exception:
+        return 3.0
+
+
+def _set_outcome(outcome: str, error: str = "", status=None) -> None:
+    global _LAST_OUTCOME, _LAST_ERROR, _LAST_STATUS
+    with _OUTCOME_LOCK:
+        _LAST_OUTCOME = outcome
+        _LAST_ERROR = str(error or "")[:200]
+        _LAST_STATUS = status
+
+
+def last_outcome() -> tuple:
+    """(outcome, error, status)。breaker が失敗種別で判断するために使う。"""
+    with _OUTCOME_LOCK:
+        return _LAST_OUTCOME, _LAST_ERROR, _LAST_STATUS
+
+
+def last_call_was_rate_limited() -> bool:
+    with _OUTCOME_LOCK:
+        return _LAST_OUTCOME == OUTCOME_RATE_LIMITED
 
 _LAST_TOKEN_DIAG_LOG_TS = 0.0
 _LAST_TOKEN_DIAG_KEY = ""
@@ -232,17 +316,47 @@ def _get_startup_token() -> str:
     return ""
 
 
+class RankingApiRateLimited(Exception):
+    """kabu Station が 429 を返した。障害ではなく流量制御。"""
+
+    def __init__(self, retry_after: float = 0.0, body: str = ""):
+        super().__init__("ranking API rate limited (429) retry_after=%.2fs" % float(retry_after or 0.0))
+        self.retry_after = float(retry_after or 0.0)
+        self.body = str(body or "")[:200]
+
+
+class RankingApiHttpError(Exception):
+    def __init__(self, status: int, body: str = ""):
+        super().__init__("ranking API HTTP %s" % status)
+        self.status = int(status)
+        self.body = str(body or "")[:200]
+
+
+def _retry_after_sec(res) -> float:
+    try:
+        v = res.headers.get("Retry-After")
+        if v is None:
+            return 0.0
+        return max(0.0, float(str(v).strip()))
+    except Exception:
+        return 0.0
+
+
 def _request_once(params: dict[str, Any], token: str | None, timeout_sec: float) -> dict[str, Any]:
-    query = urllib.parse.urlencode(params)
-    url = f"{RANKING_API_URL}?{query}"
-
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("Content-Type", "application/json")
+    headers = {"Content-Type": "application/json"}
     if token:
-        req.add_header("X-API-KEY", str(token))
+        headers["X-API-KEY"] = str(token)
 
-    with urllib.request.urlopen(req, timeout=timeout_sec) as res:
-        raw = res.read()
+    res = _session().get(
+        RANKING_API_URL, params=params, headers=headers, timeout=timeout_sec
+    )
+    status = int(res.status_code)
+    raw = res.text or ""
+
+    if status == RATE_LIMIT_STATUS:
+        raise RankingApiRateLimited(_retry_after_sec(res), raw)
+    if status >= 400:
+        raise RankingApiHttpError(status, raw)
 
     return json.loads(raw)
 
@@ -286,7 +400,54 @@ def get_data_from_api(
                 row_count,
                 elapsed,
             )
+            _set_outcome(OUTCOME_OK, "", 200)
             return payload
+
+        except RankingApiRateLimited as e:
+            # 429 は「落ちている」ではなく「速すぎる」。
+            # breaker を開かせず、Retry-After 分だけ待って次の attempt へ。
+            elapsed = time.perf_counter() - t0
+            wait = e.retry_after if e.retry_after > 0 else _rate_limit_backoff_sec(attempt)
+            logger.warning(
+                "[RANKING API CLIENT] rate limited (429) attempt=%s/%s params=%s elapsed=%.3fs "
+                "retry_after=%.2fs body=%s",
+                attempt, retry_max, params, elapsed, wait, e.body,
+            )
+            _set_outcome(OUTCOME_RATE_LIMITED, e.body or "429", 429)
+            last_exc = e
+            if attempt < retry_max and wait > 0:
+                time.sleep(min(wait, _rate_limit_max_wait_sec()))
+            continue
+
+        except RankingApiHttpError as e:
+            elapsed = time.perf_counter() - t0
+            logger.error(
+                "[RANKING API CLIENT] HTTP %s attempt=%s/%s params=%s elapsed=%.3fs body=%s",
+                e.status, attempt, retry_max, params, elapsed, e.body,
+            )
+            _set_outcome(
+                OUTCOME_AUTH if e.status in (401, 403) else OUTCOME_HTTP_ERROR,
+                e.body, e.status,
+            )
+            last_exc = e
+
+        except requests.exceptions.Timeout as e:
+            elapsed = time.perf_counter() - t0
+            logger.warning(
+                "[RANKING API CLIENT] read timeout attempt=%s/%s params=%s elapsed=%.3fs timeout=%.1fs",
+                attempt, retry_max, params, elapsed, timeout_sec,
+            )
+            _set_outcome(OUTCOME_TIMEOUT, str(e), None)
+            last_exc = e
+
+        except requests.exceptions.RequestException as e:
+            elapsed = time.perf_counter() - t0
+            logger.warning(
+                "[RANKING API CLIENT] transport error attempt=%s/%s params=%s elapsed=%.3fs err=%s: %s",
+                attempt, retry_max, params, elapsed, type(e).__name__, e,
+            )
+            _set_outcome(OUTCOME_TRANSPORT, "%s: %s" % (type(e).__name__, e), None)
+            last_exc = e
 
         except urllib.error.HTTPError as e:
             elapsed = time.perf_counter() - t0
@@ -381,9 +542,10 @@ def get_data_from_api(
             )
             time.sleep(sleep_sec)
 
+    outcome, err, status = last_outcome()
     logger.error(
-        "[RANKING API CLIENT] request failed after retries params=%s last_exc=%r",
-        params,
-        last_exc,
+        "[RANKING API CLIENT] request failed after retries params=%s outcome=%s status=%s "
+        "last_exc=%r detail=%s",
+        params, outcome, status, last_exc, err,
     )
     return None

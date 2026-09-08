@@ -12,6 +12,12 @@
 # ✔ 1 call 失敗でも全体継続
 # ✔ 売買高 / 売買高上位 表記ゆれ吸収
 # ✔ 429対策: 7項目×4市場=28 calls を1分に分散して順番取得
+#
+# 2026-09-01:
+# ✔ 連続失敗が閾値に達したらそのサイクルの残り呼び出しを fail-fast で打ち切る
+# ✔ 指数バックオフ付きサーキットブレーカー (開いている間は即時 skip)
+# ✔ バックオフ明けは軽い probe で復旧確認してから通常サイクルへ戻る
+# ✔ サイクルの並行・重複実行を防ぐ (非再入ロック)
 # ============================================================
 
 from __future__ import annotations
@@ -19,10 +25,12 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import threading
 import time
 from collections import Counter
 from typing import Any
 
+from . import api_circuit
 from .api_client import get_data_from_api
 from .normalizers import (
     floor_to_minute,
@@ -37,6 +45,9 @@ from .normalizers import (
 from .runtime_state import resolve_symbolname_from_global
 
 logger = logging.getLogger(__name__)
+
+# 同一プロセス内でサイクルを二重に走らせない。
+_CYCLE_LOCK = threading.Lock()
 
 # ============================================================
 # ranking type master
@@ -268,7 +279,94 @@ def _sleep_between_ranking_calls(call_index: int, total_calls: int, spacing_sec:
 # main collect
 # ============================================================
 
+def _run_recovery_probe(minute_now, plan, timeout_sec: float) -> bool:
+    """ブレーカー復旧確認用の軽い probe。1 呼び出しだけ、保存しない。"""
+    if not plan:
+        return False
+    type_id, type_name, exch = plan[0]
+    logger.warning(
+        "[RANKING COLLECT] breaker probe minute=%s type=%s market=%s timeout=%.1fs "
+        "(復旧していれば次サイクルから通常収集へ戻す)",
+        minute_now, type_name, exch, timeout_sec,
+    )
+    t0 = time.perf_counter()
+    try:
+        data = get_data_from_api(
+            {"type": type_id, "ExchangeDivision": exch},
+            timeout_sec=timeout_sec,
+            retry_max=1,
+        )
+    except Exception as e:  # noqa: BLE001
+        api_circuit.note_probe_failure(f"probe {type(e).__name__}: {e}")
+        logger.warning("[RANKING COLLECT] breaker probe failed minute=%s err=%r", minute_now, e)
+        return False
+
+    if not isinstance(data, dict):
+        outcome, detail, status = _last_api_outcome()
+        if outcome == "rate_limited":
+            # レート制限は「落ちている」ではない。breaker を伸ばさない。
+            api_circuit.note_rate_limited(0.0, detail)
+            logger.warning(
+                "[RANKING COLLECT] breaker probe rate limited minute=%s elapsed=%.3fs status=%s "
+                "(429 なので短いクールダウンのみ)",
+                minute_now, time.perf_counter() - t0, status,
+            )
+            return False
+        api_circuit.note_probe_failure(
+            f"probe failed outcome={outcome} status={status} detail={detail}"
+        )
+        logger.warning(
+            "[RANKING COLLECT] breaker probe failed minute=%s elapsed=%.3fs data_type=%s "
+            "outcome=%s status=%s detail=%s",
+            minute_now, time.perf_counter() - t0, type(data).__name__, outcome, status, detail,
+        )
+        return False
+
+    api_circuit.note_success()
+    logger.warning(
+        "[RANKING COLLECT] breaker probe ok minute=%s elapsed=%.3fs -> 次サイクルから通常収集",
+        minute_now, time.perf_counter() - t0,
+    )
+    return True
+
+
+def _last_api_outcome():
+    """直近の ranking API 呼び出しの失敗種別 (outcome, detail, status)。
+
+    None が返った理由が timeout なのか 429 なのか HTTP エラーなのかで
+    breaker の扱いを変えるために使う。
+    """
+    try:
+        from .api_client import last_outcome
+
+        return last_outcome()
+    except Exception:
+        return ("unknown", "", None)
+
+
 def collect_ranking_rows(
+    now_dt: dt.datetime,
+    snapshot_mgr,
+) -> tuple[list[dict], list[dict]]:
+    """1 サイクル分の ranking を収集する。
+
+    同時実行はしない。前のサイクルがまだ走っている間に呼ばれたら
+    そのまま空を返す (重複サイクルで kabu Station への接続を倍にしない)。
+    """
+    if not _CYCLE_LOCK.acquire(blocking=False):
+        logger.warning(
+            "[RANKING COLLECT] 前サイクルが実行中のため skip minute=%s "
+            "(重複サイクルを起こさない)",
+            floor_to_minute(now_dt),
+        )
+        return [], []
+    try:
+        return _collect_ranking_rows_locked(now_dt, snapshot_mgr)
+    finally:
+        _CYCLE_LOCK.release()
+
+
+def _collect_ranking_rows_locked(
     now_dt: dt.datetime,
     snapshot_mgr,
 ) -> tuple[list[dict], list[dict]]:
@@ -286,6 +384,24 @@ def collect_ranking_rows(
     total_planned = len(plan)
     spacing_sec = _ranking_api_spacing_sec(total_planned)
 
+    # ---- circuit breaker ----
+    cycle = api_circuit.begin_cycle()
+    if cycle.should_skip:
+        logger.warning(
+            "[RANKING COLLECT] breaker open のため skip minute=%s retry_in=%.0fs reason=%s "
+            "(kabu Station の読み取りAPIが復旧するまで 28 呼び出しを投げない)",
+            minute_now,
+            cycle.retry_in_sec,
+            cycle.reason or "-",
+        )
+        return [], []
+
+    if cycle.is_probe:
+        # 復旧確認は 1 呼び出しだけ、短い timeout / retry なしで行う。
+        # 部分的な ranking snapshot を書かないよう、probe では保存しない。
+        _run_recovery_probe(minute_now, plan, cycle.probe_timeout_sec)
+        return [], []
+
     logger.info(
         "[RANKING COLLECT] start minute=%s planned_calls=%s spread_enabled=%s spacing=%.3fs window=%.1fs",
         minute_now,
@@ -296,6 +412,15 @@ def collect_ranking_rows(
     )
 
     for call_index, (type_id, type_name, exch) in enumerate(plan, start=1):
+        if not api_circuit.allow_call():
+            logger.error(
+                "[RANKING COLLECT] fail-fast: 残り %s 呼び出しを打ち切る minute=%s "
+                "(連続失敗でブレーカーを開いた)",
+                total_planned - call_index + 1,
+                minute_now,
+            )
+            break
+
         total_api_calls += 1
         api_t0 = time.perf_counter()
 
@@ -312,7 +437,7 @@ def collect_ranking_rows(
             data = get_data_from_api({"type": type_id, "ExchangeDivision": exch})
             api_elapsed = time.perf_counter() - api_t0
 
-        except Exception:
+        except Exception as e:  # noqa: BLE001
             total_api_fail += 1
             logger.exception(
                 "[RANKING API] fetch failed minute=%s call=%s/%s type=%s market=%s",
@@ -322,6 +447,8 @@ def collect_ranking_rows(
                 type_name,
                 exch,
             )
+            if api_circuit.note_failure(f"{type(e).__name__}: {e}"):
+                continue
             _sleep_between_ranking_calls(call_index, total_planned, spacing_sec)
             continue
 
@@ -337,8 +464,24 @@ def collect_ranking_rows(
                 api_elapsed,
                 type(data).__name__,
             )
+            outcome, detail, status = _last_api_outcome()
+            if outcome == "rate_limited":
+                api_circuit.note_rate_limited(0.0, detail)
+                logger.warning(
+                    "[RANKING API] rate limited minute=%s call=%s/%s status=%s "
+                    "(429 は障害扱いにしない)",
+                    minute_now, call_index, total_planned, status,
+                )
+                continue
+            if api_circuit.note_failure(
+                f"invalid response outcome={outcome} status={status} detail={detail}"
+            ):
+                continue
             _sleep_between_ranking_calls(call_index, total_planned, spacing_sec)
             continue
+
+        # ここまで来たら kabu Station は応答している (空応答も応答)。
+        api_circuit.note_success()
 
         rows = data.get("Ranking")
         if not rows:
@@ -440,15 +583,23 @@ def collect_ranking_rows(
                 first_non_empty(
                     r.get("TradingValue"),
                     r.get("trading_value"),
+                    r.get("TurnOver"),
+                    r.get("Turnover"),
                     r.get("Value"),
                     r.get("value"),
                 ),
                 0.0,
             )
 
+            # kabu Station /ranking の売買代金フィールドは **TurnOver** (O が大文字)。
+            # 2026-09-01 まで "Turnover" しか見ておらず、ランキング行の turnover は
+            # 常に 0 になっていた (TradingValue は /ranking 応答に存在しない)。
+            # その結果 Ranking Entry の prefilter が turnover=0 で弾き続けていた。
             turnover = safe_float(
                 first_non_empty(
+                    r.get("TurnOver"),
                     r.get("Turnover"),
+                    r.get("turnOver"),
                     r.get("turnover"),
                     r.get("TradingValue"),
                     r.get("trading_value"),
