@@ -32,6 +32,19 @@
 #   - DB read failure != positions empty
 #   - position unknown で ENTRY を許可しない (fail-closed)
 #   - Exit は last-known position state を保持し、勝手に 0 件にしない
+#
+# 2026-09-01 の障害で追加した規則:
+#   - broker(/positions) が読めていない間は、DB が 0 件でも
+#     「建玉が無い」と確定してはならない。約定直後で DB 未反映の建玉や
+#     手動建玉を見落として二重建てになる。
+#     旧実装は db_ok=True / broker_ok=False を positions_known=True /
+#     entry_allowed=True にしていた (ログ実測: 741 件すべてこの状態)。
+#     新規 ENTRY は broker 不明なら必ず fail-closed にする。
+#   - EXIT / 表示は DB スナップショットをそのまま使えるようにする
+#     (positions は空にしない。last-good も更新する)。
+#   - broker 読み取り失敗中は DB と同じく指数バックオフする。
+#     ローカル kabu Station REST がハングしている間に毎回 3 秒待つと、
+#     その待ち時間自体が REST の同時接続を占有して障害を増幅する。
 # ============================================================
 
 from __future__ import annotations
@@ -72,13 +85,51 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _cache_ttl() -> float:
-    """このTTLの間は NAS を読まずメモリキャッシュを返す。"""
-    return max(0.2, _env_float("POSITION_STATE_CACHE_TTL_SEC", 1.0))
+    """このTTLの間は NAS を読まずメモリキャッシュを返す。
+
+    数値の持ち主は kabu_api.rest_limits ただ 1 つ
+    (POSITION_STATE_CACHE_TTL_SEC は互換のため同モジュールが読む)。
+    """
+    try:
+        from kabu_api import rest_limits
+
+        p = rest_limits.policy("positions")
+        return max(0.2, float(p.cache_ttl_sec), float(p.min_interval_sec))
+    except Exception:
+        logger.debug("[POSITIONS_STATE] rest_limits 参照に失敗", exc_info=True)
+        return max(0.2, _env_float("POSITION_STATE_CACHE_TTL_SEC", 1.0))
 
 
 def _backoff_schedule() -> Tuple[float, ...]:
     """DB 障害時の再試行間隔 (bounded exponential backoff)。"""
     raw = os.getenv("POSITION_STATE_DB_BACKOFF_SEC", "1,2,5,10,30")
+    out = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(max(0.5, float(part)))
+        except Exception:
+            continue
+    return tuple(out) if out else (1.0, 2.0, 5.0, 10.0, 30.0)
+
+
+def _broker_backoff_schedule() -> Tuple[float, ...]:
+    """broker(/positions) 障害時の再試行間隔 (bounded exponential backoff)。
+
+    DB 側と同じ考え方。ローカル kabu Station REST が無応答のとき、
+    毎回 3 秒の read timeout を踏みに行くと待ち時間そのものが負荷になる。
+    バックオフ明けの 1 回が復旧確認 probe を兼ねる。
+    """
+    try:
+        from kabu_api import rest_limits
+
+        return rest_limits.policy("positions").backoff_sec
+    except Exception:
+        logger.debug("[POSITIONS_STATE] rest_limits 参照に失敗", exc_info=True)
+
+    raw = os.getenv("POSITION_STATE_BROKER_BACKOFF_SEC", "1,2,5,10,30")
     out = []
     for part in str(raw).split(","):
         part = part.strip()
@@ -128,6 +179,10 @@ class PositionsState:
     """建玉状態のスナップショット。consumer はこれだけを見る。"""
 
     positions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # broker(/positions) から実際に読めた信用建玉だけ。
+    # EXIT 側が「broker 由来」と「DB 由来」を取り違えないために分けて持つ。
+    # broker_ok=False のときは空 (last-known ではない)。
+    broker_positions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     source_used: str = SOURCE_UNKNOWN
     db_ok: bool = False
     broker_ok: bool = False
@@ -136,6 +191,7 @@ class PositionsState:
     last_good_age: float = float("inf")
     entry_allowed: bool = False
     positions_known: bool = False
+    entry_block_reason: str = ""
     at: dt.datetime = field(default_factory=dt.datetime.now)
 
     @property
@@ -156,6 +212,7 @@ class PositionsState:
             ),
             "entry_allowed": self.entry_allowed,
             "positions_known": self.positions_known,
+            "entry_block_reason": self.entry_block_reason,
             "count": self.count,
             "symbols": self.symbols,
             "db_error": self.db_error[:120],
@@ -247,6 +304,11 @@ class PositionStateService:
         self._db_next_try_at: float = 0.0
         self._db_last_error: str = ""
 
+        # broker backoff (kabu Station REST が無応答の間の連打を止める)
+        self._broker_fail_streak: int = 0
+        self._broker_next_try_at: float = 0.0
+        self._broker_last_error: str = ""
+
         # 診断カウンタ
         self._db_reads = 0
         self._db_errors = 0
@@ -298,6 +360,32 @@ class PositionStateService:
             "episode=%d total_errors=%d err=%s "
             "(即時リトライしない: NAS へのリトライストームを止める)",
             self._db_fail_streak, wait, self._db_error_episodes, self._db_errors, err[:160],
+        )
+
+    def _broker_read_allowed(self, now: float) -> bool:
+        return now >= self._broker_next_try_at
+
+    def _note_broker_ok(self) -> None:
+        if self._broker_fail_streak:
+            logger.warning(
+                "[POSITIONS_STATE] broker(/positions) recovered fail_streak=%d",
+                self._broker_fail_streak,
+            )
+        self._broker_fail_streak = 0
+        self._broker_next_try_at = 0.0
+        self._broker_last_error = ""
+
+    def _note_broker_error(self, err: str, now: float) -> None:
+        self._broker_last_error = err
+        schedule = _broker_backoff_schedule()
+        idx = min(self._broker_fail_streak, len(schedule) - 1)
+        wait = schedule[idx]
+        self._broker_fail_streak += 1
+        self._broker_next_try_at = now + wait
+        logger.warning(
+            "[POSITIONS_STATE] broker(/positions) read failed streak=%d next_retry_in=%.1fs err=%s "
+            "(即時リトライしない: kabu Station REST への同時接続を増やさない)",
+            self._broker_fail_streak, wait, err[:160],
         )
 
     # --------------------------------------------------------
@@ -386,10 +474,22 @@ class PositionStateService:
 
         # ---- broker ----
         # DB 障害でも broker の安全確認は必ず行う。
-        broker_positions, broker_ok, broker_error = _read_broker_positions()
-        self._broker_reads += 1
-        if not broker_ok:
-            self._broker_errors += 1
+        # ただし broker 自身が連続失敗している間はバックオフする。
+        # (バックオフ明けの 1 回が復旧確認 probe を兼ねる)
+        if self._broker_read_allowed(now):
+            broker_positions, broker_ok, broker_error = _read_broker_positions()
+            self._broker_reads += 1
+            if broker_ok:
+                self._note_broker_ok()
+            else:
+                self._broker_errors += 1
+                self._note_broker_error(broker_error or "broker read failed", now)
+        else:
+            broker_positions, broker_ok = {}, False
+            broker_error = (
+                f"backoff (retry in {max(0.0, self._broker_next_try_at - now):.1f}s): "
+                f"{self._broker_last_error}"
+            )
 
         state = self._decide(
             db_positions=db_positions,
@@ -439,6 +539,8 @@ class PositionStateService:
             positions = merged
             source = SOURCE_DB_BROKER
             known = True
+            usable = True
+            block_reason = ""
 
         elif (not db_ok) and broker_ok:
             # B / C: DB 障害。broker が読めているので broker を正にする。
@@ -447,12 +549,20 @@ class PositionStateService:
             positions = dict(broker_positions)
             source = SOURCE_BROKER
             known = True
+            usable = True
+            block_reason = ""
 
         elif db_ok and (not broker_ok):
-            # broker だけ NG。DB は読めているので DB を使う。
+            # broker だけ NG。
+            #   EXIT / 表示: DB スナップショットをそのまま使う (0 件に潰さない)。
+            #   ENTRY      : broker が確認できない以上、建玉状態は「確定」ではない。
+            #                DB が 0 件でも、約定直後で未反映の建玉や手動建玉が
+            #                あり得るので新規 ENTRY は fail-closed にする。
             positions = dict(db_positions)
             source = SOURCE_DB
-            known = True
+            known = False
+            usable = True
+            block_reason = "broker_unreadable"
 
         else:
             # D: DB も broker も NG。建玉状態は unknown。
@@ -460,8 +570,12 @@ class PositionStateService:
             positions = dict(self._last_good)
             source = SOURCE_LAST_GOOD if positions or self._last_good_at > 0 else SOURCE_UNKNOWN
             known = False
+            usable = False
+            block_reason = "db_and_broker_unreadable"
 
-        if known:
+        # last-good は「EXIT が使ってよいスナップショット」。
+        # broker 未確認 (DB のみ) でも EXIT 継続のために更新する。
+        if usable:
             self._last_good = dict(positions)
             self._last_good_at = now
             self._last_good_source = source
@@ -469,11 +583,10 @@ class PositionStateService:
 
         # ENTRY 可否: 建玉状態が確定している時だけ許可する (fail-closed)。
         entry_allowed = bool(known)
-        if not known:
-            entry_allowed = False
 
         return PositionsState(
             positions=positions,
+            broker_positions=dict(broker_positions) if broker_ok else {},
             source_used=source,
             db_ok=db_ok,
             broker_ok=broker_ok,
@@ -482,6 +595,7 @@ class PositionStateService:
             last_good_age=last_good_age,
             entry_allowed=entry_allowed,
             positions_known=known,
+            entry_block_reason=block_reason,
             at=dt.datetime.now(),
         )
 
@@ -493,11 +607,12 @@ class PositionStateService:
         level = logger.info if (state.db_ok and state.broker_ok) else logger.warning
         level(
             "[POSITIONS_STATE] db_ok=%s broker_ok=%s source_used=%s last_good_age=%s "
-            "entry_allowed=%s positions_known=%s count=%d symbols=%s caller=%s "
+            "entry_allowed=%s positions_known=%s entry_block_reason=%s count=%d symbols=%s caller=%s "
             "db_err=%s broker_err=%s",
             state.db_ok, state.broker_ok, state.source_used,
             "inf" if state.last_good_age == float("inf") else "%.1f" % state.last_good_age,
-            state.entry_allowed, state.positions_known, state.count, state.symbols,
+            state.entry_allowed, state.positions_known, state.entry_block_reason or "-",
+            state.count, state.symbols,
             caller or "-", state.db_error[:120] or "-", state.broker_error[:120] or "-",
         )
 
@@ -516,6 +631,7 @@ class PositionStateService:
                 "last_db_error_at": self._last_db_error_at,
                 "broker_reads": self._broker_reads,
                 "broker_errors": self._broker_errors,
+                "broker_fail_streak": self._broker_fail_streak,
                 "cache_hits": self._cache_hits,
                 "last_good_count": len(self._last_good),
                 "last_good_source": self._last_good_source,
@@ -532,6 +648,9 @@ class PositionStateService:
             self._db_fail_streak = 0
             self._db_next_try_at = 0.0
             self._db_last_error = ""
+            self._broker_fail_streak = 0
+            self._broker_next_try_at = 0.0
+            self._broker_last_error = ""
             self._db_reads = 0
             self._db_errors = 0
             self._broker_reads = 0

@@ -29,7 +29,8 @@ import datetime as dt
 import logging
 import os
 import threading
-from typing import Any, Dict, Tuple
+import time
+from typing import Any, Dict, Optional, Tuple
 
 from core.global_context.context import global_context as GC
 from global_state import global_data
@@ -258,6 +259,90 @@ class PositionsDbUnavailable(RuntimeError):
     """positions.db が読めなかった。「建玉 0 件」とは決して同義ではない。"""
 
 
+# ============================================================
+# positions.db 読み取りの短期キャッシュ (2026-09-01)
+# ------------------------------------------------------------
+# 実測: 2026-09-01 12:53:05-12:55:37 の 2 分半で positions.db の
+#       open 回数が約 153 増えていた (接続漏れは無し / outstanding=0)。
+#
+# 内訳は「同じ 1 回転の中で何度も読んでいた」こと:
+#   exit_loop_5s 1 回転につき
+#     _sync_db_open_positions_safe()          -> load_open_positions_from_db
+#     PositionStateService._refresh()         -> load_open_positions_from_db_strict
+#     forced_position_check / entry precheck  -> さらに数回
+#   さらに schedule の二重駆動で exit_loop_5s 自体が 2 本走っていた。
+#
+# engine は NullPool なので 1 クエリ = NAS(SMB) への新規接続 1 本。
+# NAS 上の SQLite で長時間接続を持ち回すのは危険なので、
+# 接続プールを変えるのではなく「短時間の重複読み取りをまとめる」。
+#
+# TTL は kabu_api.rest_limits の positions ポリシーと同じ値を使う
+# (数値をここに書かない)。TTL 内は同じスナップショットを返す。
+# 失敗はキャッシュしない (エラーを配り回さない)。
+# ============================================================
+
+_DB_READ_CACHE_LOCK = threading.RLock()
+_DB_READ_CACHE: Dict[str, Any] = {"value": None, "at": 0.0}
+_DB_READ_STATS = {"reads": 0, "cache_hits": 0}
+
+
+def _db_read_cache_ttl() -> float:
+    try:
+        from kabu_api import rest_limits
+
+        return max(0.0, float(rest_limits.policy("positions").cache_ttl_sec))
+    except Exception:
+        return 1.0
+
+
+def _db_read_cache_get() -> Optional[Dict[str, Dict[str, Any]]]:
+    ttl = _db_read_cache_ttl()
+    if ttl <= 0:
+        return None
+    with _DB_READ_CACHE_LOCK:
+        value = _DB_READ_CACHE.get("value")
+        if value is None:
+            return None
+        if (time.monotonic() - float(_DB_READ_CACHE.get("at") or 0.0)) >= ttl:
+            return None
+        _DB_READ_STATS["cache_hits"] += 1
+        return {k: dict(v) for k, v in value.items()}
+
+
+def _db_read_cache_put(value: Dict[str, Dict[str, Any]]) -> None:
+    with _DB_READ_CACHE_LOCK:
+        _DB_READ_CACHE["value"] = {k: dict(v) for k, v in (value or {}).items()}
+        _DB_READ_CACHE["at"] = time.monotonic()
+        _DB_READ_STATS["reads"] += 1
+
+
+def invalidate_db_read_cache(*, reason: str = "") -> None:
+    """建玉が変わった直後 (約定 / 返済 / 手動同期) に呼ぶ。"""
+    with _DB_READ_CACHE_LOCK:
+        _DB_READ_CACHE["value"] = None
+        _DB_READ_CACHE["at"] = 0.0
+    if reason:
+        logger.debug("[OPEN POSITION SYNC] db read cache invalidated reason=%s", reason)
+
+
+def db_read_cache_stats() -> dict:
+    with _DB_READ_CACHE_LOCK:
+        return {
+            "db_reads": _DB_READ_STATS["reads"],
+            "cache_hits": _DB_READ_STATS["cache_hits"],
+            "ttl_sec": _db_read_cache_ttl(),
+            "has_value": _DB_READ_CACHE.get("value") is not None,
+        }
+
+
+def reset_db_read_cache_for_test() -> None:
+    with _DB_READ_CACHE_LOCK:
+        _DB_READ_CACHE["value"] = None
+        _DB_READ_CACHE["at"] = 0.0
+        _DB_READ_STATS["reads"] = 0
+        _DB_READ_STATS["cache_hits"] = 0
+
+
 def load_open_positions_from_db_strict() -> Dict[str, Dict[str, Any]]:
     """positions テーブルから未クローズ建玉を読む。失敗は例外で伝える。
 
@@ -270,7 +355,15 @@ def load_open_positions_from_db_strict() -> Dict[str, Dict[str, Any]]:
 
     握り潰し版が要る呼び出し元は load_open_positions_from_db() を使うこと
     (そちらも空 dict ではなく last-known を壊さない設計にしてある)。
+
+    TTL 内の重複読み取りは同じスナップショットを返す
+    (NAS 上の positions.db を 1 回転で何本も開かないため)。
+    失敗はキャッシュしないので、障害は必ず例外として伝わる。
     """
+    cached = _db_read_cache_get()
+    if cached is not None:
+        return cached
+
     try:
         from database import Session_position
         from database.models import Position
@@ -315,6 +408,7 @@ def load_open_positions_from_db_strict() -> Dict[str, Dict[str, Any]]:
             len(rows or []), len(out), skipped_closed, skipped_qty, skipped_price,
             sorted(out.keys()),
         )
+        _db_read_cache_put(out)
         return out
 
     except PositionsDbUnavailable:
@@ -529,14 +623,17 @@ def is_symbol_in_open_position(symbol: Any, *, sync: bool = True) -> bool:
         from trading.position.position_state_service import get_positions_state
 
         state = get_positions_state(caller="is_symbol_in_open_position")
-        if not state.entry_allowed:
-            # キャッシュが古いだけかもしれないので、判断の前に必ず取り直す。
-            # ここは二重建玉を防ぐゲートなので、古い情報で判断しない。
+        if (not state.entry_allowed) and state.positions_known:
+            # 状態自体は確定しているのに entry_allowed=False ならキャッシュが
+            # 古いだけ。ここは二重建玉を防ぐゲートなので取り直す。
+            # 逆に positions_known=False のときは取り直しても結論は変わらず
+            # (DB/broker が読めていない)、REST/NAS を連打するだけなので行わない。
             state = get_positions_state(force=True, caller="is_symbol_in_open_position:verify")
         if not state.positions_known:
             logger.warning(
-                "[OPEN POSITION SYNC] 建玉状態 unknown のため symbol=%s を保有扱いにする "
+                "[OPEN POSITION SYNC] 建玉状態 未確定(%s)のため symbol=%s を保有扱いにする "
                 "(fail-closed) db_ok=%s broker_ok=%s source=%s last_good_age=%.1fs",
+                getattr(state, "entry_block_reason", "") or "unknown",
                 s, state.db_ok, state.broker_ok, state.source_used,
                 0.0 if state.last_good_age == float("inf") else state.last_good_age,
             )

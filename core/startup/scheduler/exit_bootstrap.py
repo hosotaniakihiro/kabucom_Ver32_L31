@@ -39,6 +39,7 @@ import datetime as dt
 import logging
 import os
 import sys
+import threading
 import time
 from typing import Any
 
@@ -53,6 +54,17 @@ logger = logging.getLogger(__name__)
 _EMPTY_CONFIRMED_AT_TS: float | None = None
 _LAST_STARTED_TS: float | None = None
 _LAST_BROKER_EMPTY_LOG_TS: float = 0.0
+
+# EXIT loop の非再入ガード (所有者は 1 スレッドだけ)。
+_EXIT_LOOP_REENTRY_LOCK = threading.Lock()
+_EXIT_LOOP_OWNER: dict = {"thread": None}
+
+
+def reset_exit_loop_guard_for_test() -> None:
+    """テスト用。ロックが取られたままになっていたら解放する。"""
+    global _EXIT_LOOP_REENTRY_LOCK
+    _EXIT_LOOP_REENTRY_LOCK = threading.Lock()
+    _EXIT_LOOP_OWNER["thread"] = None
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -295,6 +307,33 @@ def _skip_reason() -> str:
 
 
 def run_exit_loop_market_guarded() -> None:
+    """EXIT loop の唯一の入口。
+
+    根本対処は「schedule を回す側を 1 つにする」こと
+    (core.startup.bootstrap.schedule_loop.may_run_pending_here / main.py)。
+    ここの非再入ロックはその後段の保険で、
+    別経路から直接呼ばれた場合でも 2 本目が本体へ入らないようにする。
+    握り潰さず、必ず理由をログに出す。
+    """
+    if not _EXIT_LOOP_REENTRY_LOCK.acquire(blocking=False):
+        logger.warning(
+            "[EXIT SCHEDULER] exit_loop_5s は既に実行中なので二重起動しない "
+            "owner_thread=%s (schedule を回す経路が 2 つ無いか確認すること)",
+            _EXIT_LOOP_OWNER.get("thread"),
+        )
+        return
+    _EXIT_LOOP_OWNER["thread"] = threading.current_thread().name
+    try:
+        _run_exit_loop_market_guarded_core()
+    finally:
+        _EXIT_LOOP_OWNER["thread"] = None
+        try:
+            _EXIT_LOOP_REENTRY_LOCK.release()
+        except RuntimeError:
+            logger.debug("[EXIT SCHEDULER] reentry lock release skipped", exc_info=True)
+
+
+def _run_exit_loop_market_guarded_core() -> None:
     global _LAST_STARTED_TS
     try:
         if not is_market_time_for_exit():
@@ -377,4 +416,5 @@ def install() -> bool:
     return bool(ok1 and ok2)
 
 
-__all__ = ["install", "run_exit_loop_market_guarded", "register_exit_loop_safe", "install_exit_order_sender_safe"]
+__all__ = ["install", "run_exit_loop_market_guarded", "register_exit_loop_safe",
+           "install_exit_order_sender_safe", "reset_exit_loop_guard_for_test"]

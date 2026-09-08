@@ -279,11 +279,23 @@ def _sync_db_open_positions_safe() -> Dict[str, Dict[str, Any]]:
         return {}
 
 
-def _read_broker_open_positions_safe() -> Dict[str, Dict[str, Any]]:
-    """kabu Station の実信用建玉を直接読む。DB/メモリに無くてもEXIT監視対象へ入れる。"""
+def _read_broker_open_positions_safe(rows: Any = None) -> Dict[str, Dict[str, Any]]:
+    """kabu Station の実信用建玉を EXIT 監視対象へ入れる形へ正規化する。
+
+    2026-09-01 修正:
+      以前はここで read_kabu_open_positions() を直接呼んでいたため、
+      同じ exit_loop_5s の 1 回転で
+        1) ここ  2) PositionStateService 経由
+      の 2 回 /positions を叩いていた (無応答時は 3 秒 x 2)。
+      建玉の取得元は PositionStateService 1 本にし、ここでは
+      渡された建玉 dict を正規化するだけにする。
+      rows=None のときだけ従来どおり自分で読む (後方互換)。
+    """
     try:
-        from trading.position.kabu_position_reader import read_kabu_open_positions
-        rows = read_kabu_open_positions() or {}
+        if rows is None:
+            from trading.position.kabu_position_reader import read_kabu_open_positions
+            rows = read_kabu_open_positions(caller="exit_utils.fallback") or {}
+        rows = rows or {}
         if not isinstance(rows, dict):
             return {}
         out: Dict[str, Dict[str, Any]] = {}
@@ -344,6 +356,17 @@ def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
     """
     merged: Dict[str, Dict[str, Any]] = {}
 
+    # 建玉状態は PositionStateService だけが読む (broker への GET はここで 1 回)。
+    # 以前はこの関数の中で broker を直接読み、さらに下で state も取っていたため、
+    # exit_loop_5s の 1 回転で /positions を 2 回叩いていた。
+    state = None
+    try:
+        from trading.position.position_state_service import get_positions_state
+
+        state = get_positions_state(caller="exit_utils.get_open_positions_safe")
+    except Exception:
+        logger.exception("[EXIT POS] position state service unavailable")
+
     try:
         _merge_position_map(merged, _sync_db_open_positions_safe(), source="DB.positions")
     except Exception:
@@ -361,8 +384,12 @@ def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
         logger.exception("[POSITION_SNAPSHOT_ERROR] merge global_data.open_positions")
 
     try:
-        broker_pos = _read_broker_open_positions_safe()
-        _merge_position_map(merged, broker_pos, source="KABU.positions.credit_only.exit_loop_direct")
+        # broker から実際に読めた行だけを broker 由来として扱う。
+        # (state.positions は DB とのマージ結果なので、そのまま渡すと
+        #  DB 由来の行まで broker 由来のラベルが付いてしまう)
+        broker_rows = dict(getattr(state, "broker_positions", {}) or {}) if state is not None else None
+        broker_pos = _read_broker_open_positions_safe(broker_rows)
+        _merge_position_map(merged, broker_pos, source="KABU.positions.credit_only.position_state")
     except Exception:
         logger.exception("[POSITION_SNAPSHOT_ERROR] merge broker positions")
 
@@ -372,16 +399,8 @@ def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
     # 上の 4 ソースはいずれも失敗時に {} を返すので、merged が空でも
     # 「建玉が無い」とは限らない。PositionStateService は
     # db_ok / broker_ok / last-known を持っているので、
-    # merged が空のときだけそちらへ問い合わせて last-known を復元する。
+    # merged が空のときだけ last-known を復元する。
     # ------------------------------------------------------------
-    state = None
-    try:
-        from trading.position.position_state_service import get_positions_state
-
-        state = get_positions_state(caller="exit_utils.get_open_positions_safe")
-    except Exception:
-        logger.exception("[EXIT POS] position state service unavailable")
-
     if state is not None:
         if not merged and state.positions:
             _merge_position_map(merged, state.positions, source="POSITION_STATE.%s" % state.source_used)
@@ -395,10 +414,11 @@ def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
             )
         logger.warning(
             "[POSITIONS_STATE] db_ok=%s broker_ok=%s source_used=%s last_good_age=%s "
-            "entry_allowed=%s positions_known=%s count=%s symbols=%s caller=exit_loop",
+            "entry_allowed=%s positions_known=%s entry_block_reason=%s count=%s symbols=%s caller=exit_loop",
             state.db_ok, state.broker_ok, state.source_used,
             "inf" if state.last_good_age == float("inf") else "%.1f" % state.last_good_age,
             state.entry_allowed, state.positions_known,
+            getattr(state, "entry_block_reason", "") or "-",
             len(merged), sorted(merged.keys()),
         )
 
@@ -407,13 +427,28 @@ def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
     except Exception:
         logger.debug("[EXIT POS] publish merged positions failed", exc_info=True)
 
+    # 共有 read キャッシュの診断を定期的に 1 行だけ残す。
+    # 「呼び出し元 / キャッシュで消えた重複 / 実リクエスト回数」を
+    # あとからログだけで確認できるようにする (内部で 60 秒間引き)。
+    try:
+        from kabu_api import orders_read_cache, positions_read_cache
+
+        positions_read_cache.log_stats()
+        orders_read_cache.log_stats()
+    except Exception:
+        logger.debug("[EXIT POS] read cache stats log failed", exc_info=True)
+
     if merged:
         logger.info("[EXIT LOOP] open positions detected count=%s symbols=%s", len(merged), sorted(merged.keys()))
     elif state is not None and not state.positions_known:
-        # 建玉状態そのものが分からない。0 件と言い切らない。
+        # 建玉状態そのものが確定していない。0 件と言い切らない。
+        # broker だけ読めない場合 (entry_block_reason=broker_unreadable) は
+        # DB スナップショットが使えているので EXIT はそのまま継続してよい。
         logger.error(
-            "[EXIT LOOP] 建玉状態 unknown (DB も broker も読めない)。"
-            "0 件とは扱わない db_err=%s broker_err=%s last_good_age=%s",
+            "[EXIT LOOP] 建玉状態 未確定 reason=%s。"
+            "0 件とは扱わない db_ok=%s broker_ok=%s db_err=%s broker_err=%s last_good_age=%s",
+            getattr(state, "entry_block_reason", "") or "unknown",
+            state.db_ok, state.broker_ok,
             state.db_error[:120] or "-", state.broker_error[:120] or "-",
             "inf" if state.last_good_age == float("inf") else "%.1f" % state.last_good_age,
         )

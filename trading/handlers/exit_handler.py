@@ -26,7 +26,46 @@ from types import SimpleNamespace
 from typing import Any, Iterable
 
 import numpy as np
-from numba import njit
+
+# ============================================================
+# numba は「あれば速い」だけの任意依存にする
+# ------------------------------------------------------------
+# 2026-09-02 08:42:55 の起動失敗:
+#   from numba import njit
+#     -> ImportError: DLL load failed while importing _devicearray:
+#        アプリケーション制御ポリシーによってこのファイルがブロックされました。
+#   sitecustomize 経由の先行 import でも同じ例外が出たあと、
+#   main.py の top-level import で未処理になり終了コード 1 で落ちた。
+#
+# このモジュールで numba を使うのは calc_ohlc(prices) 1 箇所だけで、
+# 中身は prices[0] / max / min / prices[-1] を返すだけ。
+# JIT が無くても結果は同じなので、import できない環境では
+# 同じ decorator の書き方を保てる identity decorator に落とす。
+# EXIT / 発注 / 取消 / 返済のロジックは一切変えない。
+#
+# 判定と fallback の実体は core/compat/numba_compat.py が 1 箇所で持つ。
+# ここでは従来の名前 (njit / NUMBA_AVAILABLE) を再エクスポートするだけにして、
+# 「numba をどう扱うか」の分岐がプロジェクト内で二重にならないようにする。
+try:
+    from core.compat.numba_compat import (  # noqa: F401
+        NUMBA_AVAILABLE,
+        NUMBA_IMPORT_ERROR as _NUMBA_IMPORT_ERROR,
+        njit,
+    )
+except Exception as _numba_compat_exc:  # compat 層自体が読めない最悪ケースの保険
+    _NUMBA_IMPORT_ERROR = f"numba_compat unavailable: {type(_numba_compat_exc).__name__}: {_numba_compat_exc}"
+    NUMBA_AVAILABLE = False
+
+    def njit(*args, **kwargs):  # type: ignore[misc]
+        """identity decorator (`@njit` / `@njit(...)` の両方に対応)。"""
+        if len(args) == 1 and not kwargs and callable(args[0]):
+            return args[0]
+
+        def _identity(func):
+            return func
+
+        return _identity
+
 
 from global_state import global_data
 from database import Session_position
@@ -39,6 +78,17 @@ except Exception:
     log_tonosama_trade = None
 
 logger = logging.getLogger("exit_ultra")
+
+if not NUMBA_AVAILABLE:
+    # import 時に 1 回だけ。traceback は出さない (起動ログを潰さないため)。
+    # モジュールは sys.modules にキャッシュされるので、
+    # sitecustomize 経由と main.py 経由で二度 numba を試すことはない。
+    # 失敗理由そのものは core.compat.numba_compat が [NUMBA COMPAT] で
+    # 1 回だけ出しているので、ここでは EXIT 側への影響だけを書く。
+    logger.warning(
+        "[EXIT HANDLER] JIT なしで動作します "
+        "(calc_ohlc は通常の Python 関数として実行。EXIT 判定・発注・取消・返済のロジックは不変)"
+    )
 
 # ============================================================
 # TONOSAMA フォールバックパラメータ（最後の保険）
