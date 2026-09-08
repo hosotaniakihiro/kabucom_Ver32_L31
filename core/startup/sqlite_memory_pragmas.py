@@ -307,15 +307,63 @@ def _force_summary_lock_env() -> None:
     _setdefault_env("SUMMARY_MTF_CATCHUP_UPSERT_CHUNK_SIZE", "100")
 
 
+# ============================================================
+# 2026-09-03: journal_mode は「読んでから、必要なときだけ」変える
+# ------------------------------------------------------------
+# 起動のたびに無条件で
+#     PRAGMA journal_mode=WAL
+# を投げると、SMB 上の DB では -shm のロック交渉に入るため、
+# 他の writer/reader が居るだけで
+#     sqlite3.OperationalError: locking protocol   (SQLITE_PROTOCOL)
+# になりうる。実際 2026-09-03 に db_prepare がこれで異常終了し、
+# main_database.py が exit code 1 で落ちた。
+#
+# journal_mode は DB 全体の永続設定なので、一度 WAL なら二度と設定しなくてよい。
+# 読むだけ (PRAGMA journal_mode) は排他を必要としない。
+# ============================================================
+
+
+def ensure_journal_mode_wal_if_needed(conn, label: str = "db") -> str:
+    """既に WAL なら何もしない。戻り値は最終的な journal_mode。
+
+    設定に失敗しても例外にしない (呼び出し側は続行してよい)。
+    """
+    current = ""
+    try:
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        if row and row[0] is not None:
+            current = str(row[0]).strip().lower()
+    except Exception:
+        logger.debug("[SQLITE PRAGMA] %s journal_mode read failed", label, exc_info=True)
+        return ""
+
+    if current == "wal":
+        return current
+
+    try:
+        row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        after = str(row[0]).strip().lower() if row and row[0] is not None else ""
+        logger.info("[SQLITE PRAGMA] %s journal_mode %s -> %s", label, current or "unknown", after or "?")
+        return after or current
+    except Exception as e:
+        logger.warning(
+            "[SQLITE PRAGMA] %s journal_mode=WAL skipped (current=%s) err=%s "
+            "(設定失敗だけでは落とさない)",
+            label, current or "unknown", e,
+        )
+        return current
+
+
 def _configure_summary_connection_extra(conn: sqlite3.Connection) -> None:
     """summary DB本体だけに追加で効かせるPRAGMA (busy_timeout底上げ・WAL・synchronous)。
 
     旧 core/startup/summary_sqlite_lock_tolerance_patch.py から移設。
     """
     busy_ms = max(60000, _env_int("SUMMARY_SQLITE_BUSY_TIMEOUT_MS", 60000))
+    # journal_mode は毎回投げない (既に WAL なら読むだけで終わる)。
+    ensure_journal_mode_wal_if_needed(conn, "summary")
     pragmas = [
         f"PRAGMA busy_timeout={busy_ms}",
-        "PRAGMA journal_mode=WAL",
         "PRAGMA synchronous=NORMAL",
         "PRAGMA wal_autocheckpoint=1000",
     ]
@@ -323,8 +371,82 @@ def _configure_summary_connection_extra(conn: sqlite3.Connection) -> None:
         try:
             conn.execute(sql)
         except Exception:
-            # journal_modeなどはタイミングにより失敗しても致命傷にしない。
+            # busy_timeout などはタイミングにより失敗しても致命傷にしない。
             pass
+
+
+# ============================================================
+# 2026-09-02 P0: NAS 上の SQLite で mmap を使わない
+# ------------------------------------------------------------
+# 症状: main.py が起動 3 分後に returncode=3221225477 (0xC0000005) で
+#       突然死する。Python の例外は一切出ない。
+#
+# faulthandler (-X faulthandler) で捕まえた実際のスタック:
+#       Windows fatal exception: page error
+#       File "database\session.py", line 149 in _best_effort_configure_existing_db
+#       File "database\session.py", line 653 in _build_engine
+#       File "database\session.py", line 691 in init_engines
+#
+# "page error" = EXCEPTION_IN_PAGE_ERROR (0xC0000006)。
+# メモリマップされたページを触ったときに、その裏側 (ここでは SMB 共有)
+# から読めなかった場合に発生する。これは Python では捕捉できず、
+# プロセスがそのまま落ちる。
+#
+# 原因は _apply_pragmas() が sqlite3.connect を全プロセスで差し替えて
+# **すべての** 接続に PRAGMA mmap_size=268435456 (256MB) を当てていたこと。
+# 対象 DB は全部 \\192.168.0.22\... (SMB) にある。
+# SQLite 公式も「mmap はネットワークファイルシステムで使うな」としている。
+#
+# ここではドライブ種別を見て、ネットワーク上の DB では mmap を明示的に 0 に
+# する (= 通常の read/write I/O)。ローカルディスクの DB では従来どおり。
+# SQLITE_MMAP_ALLOW_NETWORK=1 で以前の挙動へ戻せる。
+# ============================================================
+
+_DRIVE_TYPE_CACHE: dict = {}
+
+
+def _is_network_path(database: Any) -> bool:
+    try:
+        raw = str(database or "")
+    except Exception:
+        return False
+    if not raw:
+        return False
+    if raw.startswith("\\\\") or raw.startswith("//"):
+        return True
+    drive = ""
+    try:
+        drive = os.path.splitdrive(raw)[0]
+    except Exception:
+        drive = ""
+    if not drive or len(drive) < 2 or drive[1] != ":":
+        return False
+    key = drive.upper()
+    if key in _DRIVE_TYPE_CACHE:
+        return _DRIVE_TYPE_CACHE[key]
+    result = False
+    try:
+        import ctypes
+
+        # DRIVE_REMOTE = 4
+        result = int(ctypes.windll.kernel32.GetDriveTypeW(key + "\\")) == 4
+    except Exception:
+        result = False
+    _DRIVE_TYPE_CACHE[key] = result
+    return result
+
+
+def resolve_mmap_size_bytes(database: Any, default_bytes: int = 268435456) -> int:
+    """この DB に使ってよい mmap サイズ。NAS 上なら 0。"""
+    try:
+        want = max(0, _env_int("SQLITE_MMAP_SIZE_BYTES", int(default_bytes)))
+    except Exception:
+        want = int(default_bytes)
+    if want <= 0:
+        return 0
+    if _is_network_path(database) and not _env_bool("SQLITE_MMAP_ALLOW_NETWORK", False):
+        return 0
+    return want
 
 
 def _apply_pragmas(conn: sqlite3.Connection, database: Any) -> None:
@@ -359,9 +481,9 @@ def _apply_pragmas(conn: sqlite3.Connection, database: Any) -> None:
         pass
 
     try:
-        mmap_bytes = max(0, _env_int("SQLITE_MMAP_SIZE_BYTES", 268435456))
-        if mmap_bytes:
-            conn.execute(f"PRAGMA mmap_size={mmap_bytes}")
+        mmap_bytes = resolve_mmap_size_bytes(database)
+        # NAS 上では 0 を明示的に投げる (既定値の継承を断ち切る)。
+        conn.execute(f"PRAGMA mmap_size={int(mmap_bytes)}")
     except Exception:
         # NAS/Windows環境では mmap が無効なことがある。失敗しても無視する。
         pass

@@ -493,6 +493,42 @@ def _install_summary_entry_runtime_context():
         logger.exception("summary/entry runtime context install failed")
 
 
+_SCHEDULE_DRIVE_STATE = {"allowed": None, "logged": False}
+
+
+def _may_drive_schedule() -> bool:
+    """main loop が schedule.run_pending() を呼んでよいか。
+
+    core.startup.bootstrap.schedule_loop の dispatcher thread が
+    schedule を回しているなら、ここでは回さない (二重 dispatch 防止)。
+    判定は毎周ではなく、状態が変わったときだけログへ出す。
+    """
+    try:
+        from core.startup.bootstrap.schedule_loop import (
+            is_schedule_run_pending_loop_running,
+            may_run_pending_here,
+        )
+    except Exception:
+        # dispatcher が居ないビルドでは従来どおり main loop が回す。
+        return True
+
+    allowed = bool(may_run_pending_here("main_loop"))
+    if allowed != _SCHEDULE_DRIVE_STATE["allowed"]:
+        _SCHEDULE_DRIVE_STATE["allowed"] = allowed
+        if allowed:
+            logger.warning(
+                "[EXIT SCHEDULER] main loop が schedule を駆動する "
+                "(dispatcher thread running=%s)",
+                is_schedule_run_pending_loop_running(),
+            )
+        else:
+            logger.warning(
+                "[EXIT SCHEDULER] main loop は schedule.run_pending を呼ばない "
+                "(owner=schedule_loop dispatcher。同じ job の二重起動を防ぐ)",
+            )
+    return allowed
+
+
 def _register_exit_scheduler():
     try:
         if not callable(run_exit_pipeline):
@@ -736,7 +772,15 @@ def main():
         heartbeat("main", status="RUNNING")
         while True:
             try:
-                schedule.run_pending()
+                # schedule の default scheduler はプロセスで 1 つ。
+                # core.startup.bootstrap.schedule_loop の dispatcher thread が
+                # 動いているときにここでも run_pending() を回すと、
+                # **同じ job (exit_loop_5s など) が 2 本同時に走る**。
+                # 2026-09-01 12:53 のログでは 244ms ずれた exit_loop_5s が
+                # 常時 2 本走り、/positions への GET も 2 倍になっていた。
+                # 駆動の所有者は 1 つに限定する。
+                if _may_drive_schedule():
+                    schedule.run_pending()
                 process_realtime()
                 time.sleep(0.2)
             except KeyboardInterrupt:

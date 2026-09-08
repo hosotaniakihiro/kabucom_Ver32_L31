@@ -56,7 +56,25 @@ PUSH_DEFAULTS: Dict[str, str] = {
     "PUSH_WS_ENABLE_PING": "0",
     "PUSH_ROTATION_CLOSE_BEFORE_REGISTER": "0",
     "PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER": "0",
-    "PUSH_ROTATION_REGISTER_WITH_WS_CLOSED": "0",
+    # 2026-09-02 の reconnect storm (consecutive=170) の原因。
+    #
+    # rotation_A / rotation_B の登録は **REST の PUT /kabusapi/register** で行う。
+    # WebSocket を使わないので、WS が切れている間でも実行できる
+    # (transport.py REV1.6 のコメントがまさにそう書いている)。
+    # ところがここが "0" だと transport._allow_refresh_with_ws_closed() が False になり、
+    #   [push_stream] refresh skipped reason=rotation_A ws_not_ready
+    # で登録そのものが行われない。
+    #
+    # PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 により on_open 側でも登録しないため、
+    # **銘柄登録を行う経路が 1 つも残らない**。実測 (09:14:30 起動):
+    #   09:15:10 rotation A register failed (ws_not_ready) failure_count=1 -> backoff 180s
+    #   以降 600s backoff で 10 分に 1 回だけ再試行し、毎回同じ理由で失敗
+    #   その間 WS は 3〜7 秒で切られ続け generation=171 まで到達
+    # 登録が無い -> kabu Station が PUSH を切る -> 切れているから登録できない、
+    # という相互ロックになっていた。
+    #
+    # REST 登録は WS の状態に依存しないので "1" が本来の設計値。
+    "PUSH_ROTATION_REGISTER_WITH_WS_CLOSED": "1",
     "PUSH_ROTATION_WAIT_WS_READY_AFTER_REGISTER": "1",
     "PUSH_ROTATION_HOLD_SEC": "4.8",
     "PUSH_ROTATION_CLEAR_GAP_SEC": "0.2",
@@ -76,11 +94,18 @@ PUSH_DEFAULTS: Dict[str, str] = {
     "PUSH_STREAM_ONOPEN_WS_READY_TIMEOUT_SEC": "1.0",
     "PUSH_STREAM_PAUSE_RECONNECT_DURING_REGISTER": "1",
     "PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC": "0.3",
-    "PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC": "1.0",
+    # 即死が続くときの上限。1.0 だと 300 回連続でも 1 秒間隔で撃ち続けるため 15 秒まで許す。
+    "PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC": "15.0",
+    "PUSH_STREAM_RECONNECT_BACKOFF_LADDER_SEC": "1,2,4,8,15",
     "PUSH_STREAM_RECONNECT_STABLE_RESET_SEC": "5.0",
     "PUSH_STREAM_SHORT_LIVED_SEC": "1.0",
     "PUSH_STREAM_SHORT_LIVED_EXTRA_COOLDOWN_SEC": "0.0",
     "PUSH_STREAM_SINGLE_OWNER_LOCK": "1",
+    # kabu Station の PUSH は 1 セッション 1 接続。OS レベルの single-instance lock で担保する。
+    "KABU_PUSH_WS_OWNER_LOCK": "1",
+    "KABU_REGISTER_REQUIRE_WS_OWNER": "1",
+    "PUSH_ROTATION_REQUIRE_WS_OWNER": "1",
+    "ATS_REGISTER_REQUIRE_WS_OWNER": "1",
     "PUSH_STREAM_SINGLE_OWNER_WAIT_RETRY": "1",
     "PUSH_STREAM_SINGLE_OWNER_RETRY_SEC": "1.0",
     "PUSH_STREAM_SINGLE_OWNER_LOG_EVERY_SEC": "20.0",

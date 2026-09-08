@@ -143,6 +143,42 @@ def _build_env() -> dict[str, str]:
     root = str(PROJECT_ROOT)
     env["PYTHONPATH"] = root + (os.pathsep + old if old else "")
 
+    # ------------------------------------------------------------
+    # 子プロセスの標準出力を UTF-8 に固定する (2026-09-03)
+    # ------------------------------------------------------------
+    # _popen_captured() は encoding="utf-8" でパイプを読んでいるが、
+    # 子プロセス側は日本語 Windows の既定 (cp932) でエンコードしていた。
+    # そのため絵文字を含むログ行 (🚀 Starting Push Storage System /
+    # ✅ Push Storage System started) で logging が
+    #   UnicodeEncodeError: 'cp932' codec can't encode character '🚀'
+    # を起こし、"--- Logging error ---" + Traceback が毎回出ていた。
+    # 機能影響は無いが、本物の Traceback と見分けが付かなくなる。
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    # ------------------------------------------------------------
+    # バイトコードキャッシュをローカルへ (2026-09-03)
+    # ------------------------------------------------------------
+    # 1 spawn = NAS venv から数千ファイルの import。NAS の __pycache__ を
+    # 使うと W: へ 800 回以上 open() が飛び、SMB セッションが落ちて
+    # OSError(22)/(9)/(24) の連鎖になる (実測: 817 opens で失敗、
+    # ローカル cache なら 5 opens で 2156 module 完走)。
+    # 環境変数で渡すとインタプリタ初期化時点から効くので、
+    # sitecustomize より前の stdlib import もローカル cache になる。
+    if str(os.environ.get("AUTOSTOCK_LOCAL_PYCACHE", "")).strip().lower() not in {
+        "0", "false", "no", "off", "disable", "disabled"
+    }:
+        _pycache = str(os.environ.get("PYTHONPYCACHEPREFIX", "")).strip() or str(
+            os.environ.get("AUTOSTOCK_PYCACHE_DIR", "")
+        ).strip()
+        if not _pycache:
+            _local = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(PROJECT_ROOT)
+            _pycache = os.path.join(_local, "autostock_pycache")
+        try:
+            os.makedirs(_pycache, exist_ok=True)
+            env["PYTHONPYCACHEPREFIX"] = _pycache
+        except Exception:
+            pass
+
     env["AUTOSTOCK_DATA_COLLECTORS_PROCESS"] = "1"
     env["AUTOSTOCK_MAIN_DATABASE_PROCESS"] = "1"
     env["AUTOSTOCK_EXTERNAL_DATA_COLLECTORS"] = "1"
@@ -292,6 +328,15 @@ def _popen_captured(logger: logging.Logger, name: str, cmd: list[str], env: dict
             daemon=True,
         )
         th.start()
+        # 死んだ pump スレッドを溜め続けない (2026-09-03)。
+        # 子を再起動するたびに Thread オブジェクトが 1 個ずつ増え、
+        # その args が閉じ済みパイプを参照したまま残っていた。
+        # (パイプ自体は _pump_child_output の finally で close 済みなので
+        #  ハンドルリークではないが、クラッシュループ時に無制限に増える)
+        try:
+            _CAPTURE_THREADS[:] = [t for t in _CAPTURE_THREADS if t.is_alive()]
+        except Exception:
+            pass
         _CAPTURE_THREADS.append(th)
     return proc
 
@@ -546,6 +591,36 @@ def _handle_signal(signum, frame) -> None:
     _STOP = True
 
 
+def _acquire_single_instance_or_report(logger, role: str) -> bool:
+    """collector ツリーがこのマシンで 1 つだけであることを確定する。
+
+    既に生きている本人が居る場合だけ False を返す (= 子を 1 つも起動しない)。
+    判定できない場合は起動を止めない。無関係なプロセスには触らない。
+    """
+    try:
+        from core.process_lock import acquire_single_instance, describe_holder
+    except Exception:
+        logger.exception("[DATA COLLECTORS] single instance guard unavailable -> チェックなしで続行")
+        return True
+
+    try:
+        ok, holder = acquire_single_instance(role)
+    except Exception:
+        logger.exception("[DATA COLLECTORS] single instance guard failed -> チェックなしで続行")
+        return True
+
+    if ok:
+        return True
+
+    logger.error(
+        "[DATA COLLECTORS][DUPLICATE START BLOCKED] 既に %s が動いているので "
+        "push_receiver / yahoo_complement / summary_database / ranking_collector を "
+        "1 つも起動しない。holder: %s",
+        role, describe_holder(holder),
+    )
+    return False
+
+
 def main() -> int:
     logger = setup_logging("data_collectors_runner")
     signal.signal(signal.SIGINT, _handle_signal)
@@ -556,6 +631,15 @@ def main() -> int:
     logger.info("=" * 80)
     logger.info("[DATA COLLECTORS] START project_root=%s python=%s", PROJECT_ROOT, _python_exe())
     logger.info("[DATA COLLECTORS] specs=%s", {k: str(v) for k, v in specs.items()})
+    # ------------------------------------------------------------
+    # 多重起動ガード (2026-09-03)
+    # ------------------------------------------------------------
+    # main_database.py から呼ばれる場合はそちらで既に止まっているが、
+    # data_collectors_runner.py を直接叩かれた場合もここで止める。
+    # 既存の collector が生きているなら子プロセスを 1 つも起動しない。
+    if not _acquire_single_instance_or_report(logger, "data_collectors_runner"):
+        return 0
+
     logger.info("[DATA COLLECTORS] parent heartbeat enabled=%s", _parent_heartbeat_enabled())
     logger.info("=" * 80)
 

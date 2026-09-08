@@ -675,6 +675,96 @@ def is_schedule_run_pending_loop_running() -> bool:
             return False
 
 
+# ============================================================
+# schedule の駆動所有権 (2026-09-01)
+# ------------------------------------------------------------
+# schedule ライブラリの default scheduler はプロセスで 1 つの
+# グローバルな job リストを持つ。これを 2 箇所から回すと、
+# **同じ job が同時に 2 回走る**。
+#
+# 2026-09-01 12:53 の実測 (console_20260901_102907_74088.log):
+#     12:53:05,932 [EXIT SCHEDULER] exit_loop_5s start   <- main.py の run_pending
+#     12:53:06,176 [startup.schedule_loop] dispatch start
+#     12:53:06,176 [EXIT SCHEDULER] exit_loop_5s start   <- dispatcher
+#   244 ms ずれた 2 本の exit_loop_5s が並走し、
+#   [KABU POSITION READER] timeout も 244 ms 間隔の対で出続けていた。
+#   ログの [EXIT LOOP] / [POSITIONS_STATE] が毎回 2 行ずつ出ていたのはこのため。
+#
+# dispatcher 側の「前回がまだ実行中なら skip」ガードは、自分が dispatch した
+# 分しか見ていないので main.py 側の実行は止められない。
+# = 実行中フラグでは隠せない。駆動側を 1 つに決めるのが根本対処。
+#
+# ここでは「誰が schedule を回すか」を 1 プロセス 1 名義で登録する。
+# dispatcher thread が動いていれば main loop は run_pending を呼ばない。
+# ============================================================
+
+_RUN_PENDING_OWNER: Optional[str] = None
+_RUN_PENDING_OWNER_LOCK = threading.RLock()
+_OWNER_DENY_LOGGED: set = set()
+
+
+def acquire_run_pending_owner(name: str) -> bool:
+    """schedule を回す権利を取る。既に別の所有者が居れば False。
+
+    dispatcher thread が生きている限り、他の呼び出し元は False になる。
+    """
+    global _RUN_PENDING_OWNER
+    name = str(name or "unknown")
+    with _RUN_PENDING_OWNER_LOCK:
+        if is_schedule_run_pending_loop_running() and name != "schedule_loop":
+            if name not in _OWNER_DENY_LOGGED:
+                _OWNER_DENY_LOGGED.add(name)
+                logger.warning(
+                    "[startup.schedule_loop] schedule.run_pending の所有権を渡さない requester=%s "
+                    "owner=schedule_loop(dispatch thread) "
+                    "(同じ job が 2 回 dispatch されるのを防ぐ。"
+                    "SCHEDULE_RUN_PENDING_OWNER で明示的に切り替えられる)",
+                    name,
+                )
+            return False
+        if _RUN_PENDING_OWNER in (None, name):
+            _RUN_PENDING_OWNER = name
+            return True
+        if name not in _OWNER_DENY_LOGGED:
+            _OWNER_DENY_LOGGED.add(name)
+            logger.warning(
+                "[startup.schedule_loop] schedule.run_pending は既に %s が所有している requester=%s",
+                _RUN_PENDING_OWNER, name,
+            )
+        return False
+
+
+def run_pending_owner() -> Optional[str]:
+    with _RUN_PENDING_OWNER_LOCK:
+        return _RUN_PENDING_OWNER
+
+
+def release_run_pending_owner(name: str) -> None:
+    global _RUN_PENDING_OWNER
+    with _RUN_PENDING_OWNER_LOCK:
+        if _RUN_PENDING_OWNER == str(name or ""):
+            _RUN_PENDING_OWNER = None
+
+
+def reset_run_pending_owner_for_test() -> None:
+    global _RUN_PENDING_OWNER
+    with _RUN_PENDING_OWNER_LOCK:
+        _RUN_PENDING_OWNER = None
+        _OWNER_DENY_LOGGED.clear()
+
+
+def may_run_pending_here(name: str) -> bool:
+    """この呼び出し元が schedule.run_pending() を呼んでよいか。
+
+    ENV SCHEDULE_RUN_PENDING_OWNER で明示指定できる
+    (既定は「dispatcher thread が居るならそちら」)。
+    """
+    forced = str(os.getenv("SCHEDULE_RUN_PENDING_OWNER", "") or "").strip()
+    if forced:
+        return forced == str(name or "")
+    return acquire_run_pending_owner(name)
+
+
 def stop_schedule_run_pending_loop_safe(timeout: float = 3.0) -> bool:
     """
     schedule async dispatch loop を停止する。
@@ -885,4 +975,9 @@ __all__ = [
     "get_schedule_loop_status",
     "log_schedule_jobs_snapshot",
     "dispatch_due_jobs_once",
+    "acquire_run_pending_owner",
+    "release_run_pending_owner",
+    "reset_run_pending_owner_for_test",
+    "run_pending_owner",
+    "may_run_pending_here",
 ]

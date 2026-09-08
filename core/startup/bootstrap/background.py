@@ -29,6 +29,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import threading
 import time
 from typing import Any
@@ -244,6 +246,40 @@ def _start_stream_db():
 # push_stream runner
 # ============================================================
 
+def _is_push_owner_process() -> tuple[bool, str]:
+    """このプロセスが PUSH WebSocket の所有者か。
+
+    kabu Station の PUSH は 1 セッションしか張れない。2 本目が繋がると
+    サーバ側が古い方を切るため、両者が数秒おきに互いを蹴り合う。
+
+    2026-08-31 の実測:
+      10:42 push_receiver_runner(PID 52480) 起動 -> WS は 230 秒維持
+      10:46 main.py(PID 51468) 起動 = 2 本目の WS を張る
+      10:47 以降 632 回連続で uptime 2〜4 秒の切断が継続 (40 分以上回復せず)
+      netstat: 51468 と 52480 が同時に :18080 へ Established
+               (main.py 側は一時 5 本同時、TimeWait 約 85 本)
+      main.py 側は total_received=0 のまま (配信は勝った方にしか来ない)
+
+    設計上も main.py は PUSH を張らない側で、
+    scheduler_jobs/summary/memory_latest_1m._writeback_push_df() の docstring に
+    「main.py は自前の PUSH WebSocket を張らないので push_df を書く担当が居ない」
+    と明記されている。bootstrap がその設計に反して無条件起動していた。
+
+    所有してよいのは role=push_receiver だけ。判定は
+    trading.push.push_stream.ownership に一本化する
+    (runner.start_push_stream と必ず同じ結論になること)。
+    PUSH_STREAM_FORCE_OWNER=1 で従来動作に戻せる。
+    """
+    try:
+        from trading.push.push_stream.ownership import is_push_owner
+
+        owner, role, reason = is_push_owner()
+        return bool(owner), "role=%s %s" % (role, reason)
+    except Exception:
+        logger.exception("[PUSH WS OWNER] owner 判定に失敗したので安全側 (非所有) に倒す")
+        return False, "owner_check_failed"
+
+
 def _start_push_stream_runner():
     """
     新 push_stream package の WebSocket runner を起動する。
@@ -260,6 +296,21 @@ def _start_push_stream_runner():
         logger.info("push_stream runner already started")
         return
 
+    is_owner, owner_reason = _is_push_owner_process()
+    if not is_owner:
+        logger.warning(
+            "[PUSH WS OWNER] pid=%s owner=False reason=%s argv=%s "
+            "-> WebSocket と subscription rotation を起動しない。"
+            "PUSH は data collector 側プロセスが所有し、このプロセスは PUSH DB 経由で読む。"
+            "(kabu Station の PUSH は 1 セッションのみ。2 本張ると互いを切り合う)",
+            os.getpid(), owner_reason, " ".join(sys.argv[:3]),
+        )
+        return
+    logger.warning(
+        "[PUSH WS OWNER] pid=%s owner=True reason=%s argv=%s -> このプロセスが PUSH を所有する",
+        os.getpid(), owner_reason, " ".join(sys.argv[:3]),
+    )
+
     try:
         from trading.push.push_stream.runner import start_push_stream, get_status
 
@@ -267,12 +318,31 @@ def _start_push_stream_runner():
         refresh_callable = _resolve_refresh_callable()
         ws_url = _resolve_ws_url()
 
+        # rotation は PUSH WebSocket 所有者だけが行う。
+        # 所有権が取れない (= 他プロセスが所有している) 状態で
+        # enable_rotate=True を渡すと unregister/all を撃ってしまうため、
+        # ここで所有状況を見てから決める。
+        enable_rotate = True
+        try:
+            from trading.push.push_stream.ws_owner import owned_elsewhere
+
+            elsewhere, holder = owned_elsewhere()
+            if elsewhere:
+                logger.error(
+                    "[PUSH WS OWNER][MULTI_WS_DETECTED] pid=%s: PUSH WebSocket は別プロセスが所有している holder=%s "
+                    "-> rotation を要求しない",
+                    os.getpid(), holder,
+                )
+                enable_rotate = False
+        except Exception:
+            logger.debug("[PUSH WS OWNER] ownership probe failed", exc_info=True)
+
         start_push_stream(
             ws_url=ws_url,
             stream_writer=writer,
             order_book_writer=None,
             refresh_callable=refresh_callable,
-            enable_rotate=True,
+            enable_rotate=enable_rotate,
         )
 
         _PUSH_STREAM_STARTED = True

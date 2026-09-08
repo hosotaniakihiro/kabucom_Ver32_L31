@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 from typing import Any
 
@@ -103,8 +104,8 @@ def _set_default_envs() -> None:
     os.environ.setdefault("PUSH_REGISTER_MAX_KEEP", "100")
 
 
-def _patch_yfinance_download_fail_cache() -> bool:
-    """Wrap yfinance.download directly because the active Yahoo helper may be late/import-dynamic."""
+def _apply_yfinance_download_wrap() -> bool:
+    """yfinance.download を fail-cache でラップする (yfinance が import 済みの前提)。"""
     try:
         import yfinance as yf  # type: ignore
     except Exception:
@@ -158,6 +159,97 @@ def _patch_yfinance_download_fail_cache() -> bool:
     except Exception:
         logger.exception("[INTRADAY LOAD GUARD] yfinance.download fail-cache patch failed")
         return False
+
+
+# ============================================================
+# yfinance の遅延ラップ (2026-09-03)
+# ------------------------------------------------------------
+# 旧実装は install() から無条件に `import yfinance` していた。
+# yfinance は pandas / numpy / requests / bs4 / curl_cffi / protobuf を
+# 芋づるで引き込み、NAS(SMB) 上の実測で **単独 43.9 秒** かかっていた
+# (push_receiver context の probe: 全 48.05 秒中 43.88 秒)。
+#
+# yfinance.download を実際に呼ぶのは Yahoo 補完系だけで、
+# push_receiver / db_prepare / ranking_collector / summary_database は
+# 一度も呼ばない。それらのプロセスでは丸ごと無駄だった。
+#
+# ここでは import 済みなら即ラップし、未 import なら meta_path に
+# post-import hook を置く。誰かが yfinance を import した瞬間に
+# 同じラップが必ず適用されるので、ガードが外れる経路は無い。
+#
+# INTRADAY_LOAD_GUARD_YFINANCE_EAGER=1 で従来の即時 import に戻せる。
+# ============================================================
+_YF_HOOK_INSTALLED = False
+
+
+class _YFinanceLazyPatchFinder:
+    """yfinance の import 完了直後に download ラップを当てる meta_path finder。"""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "yfinance":
+            return None
+        # 自分を外してから本来の spec を取り直す (無限再帰防止)。
+        try:
+            sys.meta_path.remove(self)
+        except ValueError:
+            pass
+        try:
+            import importlib.util
+
+            spec = importlib.util.find_spec(fullname)
+        except Exception:
+            logger.debug("[INTRADAY LOAD GUARD] yfinance spec lookup failed", exc_info=True)
+            return None
+        if spec is None or spec.loader is None:
+            return None
+
+        loader = spec.loader
+        original_exec_module = getattr(loader, "exec_module", None)
+        if not callable(original_exec_module):
+            return spec
+
+        def _exec_module(module):
+            original_exec_module(module)
+            try:
+                ok = _apply_yfinance_download_wrap()
+                logger.warning(
+                    "[INTRADAY LOAD GUARD] yfinance imported later -> download fail-cache applied ok=%s", ok
+                )
+            except Exception:
+                logger.exception("[INTRADAY LOAD GUARD] deferred yfinance wrap failed")
+
+        loader.exec_module = _exec_module  # type: ignore[assignment]
+        return spec
+
+
+def _patch_yfinance_download_fail_cache() -> Any:
+    """yfinance.download のラップを「今」か「import された時」に必ず適用する。
+
+    戻り値: True (適用済み) / "deferred" (hook 設置) / False (失敗)
+    """
+    global _YF_HOOK_INSTALLED
+
+    if "yfinance" in sys.modules:
+        return _apply_yfinance_download_wrap()
+
+    if _env_bool("INTRADAY_LOAD_GUARD_YFINANCE_EAGER", False):
+        return _apply_yfinance_download_wrap()
+
+    if _YF_HOOK_INSTALLED:
+        return "deferred"
+
+    try:
+        sys.meta_path.insert(0, _YFinanceLazyPatchFinder())
+        _YF_HOOK_INSTALLED = True
+        logger.warning(
+            "[INTRADAY LOAD GUARD] yfinance not imported yet -> deferred download wrap via meta_path hook "
+            "(yfinance の即時 import は NAS 上で 43.9 秒かかるため。"
+            "INTRADAY_LOAD_GUARD_YFINANCE_EAGER=1 で従来動作)"
+        )
+        return "deferred"
+    except Exception:
+        logger.exception("[INTRADAY LOAD GUARD] yfinance lazy hook install failed")
+        return _apply_yfinance_download_wrap()
 
 
 def install() -> bool:

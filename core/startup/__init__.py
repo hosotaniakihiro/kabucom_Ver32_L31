@@ -750,6 +750,52 @@ def _install_entry_runtime_init_patches() -> None:
     # へ本文化済み (main.py での全銘柄同期warmupスキップ / async / 強制実行の env 判定)。
 
 
+# ============================================================
+# install 群の冪等ガード (2026-09-03)
+# ------------------------------------------------------------
+# core.startup の import 中に例外が出ると、Python は途中まで作った
+# モジュールを sys.modules から削除する。呼び出し側の try/except が
+# それを飲み込むと、次に誰かが core.startup(.X) を import した時点で
+# **この __init__.py が先頭から再実行され、install 群が丸ごと再走**する。
+#
+# 2026-09-03 の main.py 起動失敗ログで実際に起きていた:
+#   core/startup/__init__.py:599  -> OSError(24) scipy/.../__init__.py
+#   core/startup/__init__.py:650  -> OSError(24) trading/ranking/__init__.py
+#   core/startup/__init__.py:743  -> OSError(24) trading/summary/existing_null_repair.py
+#   sitecustomize.py:182          -> OSError(24) core/startup/__init__.py
+# 1 回の失敗が再 import を呼び、再 import が更に NAS への open を増やして
+# SMB セッション断を悪化させる、という増幅ループになっていた。
+#
+# モジュール変数のフラグは再実行で作り直されるので効かない。
+# プロセス内で確実に生き残る sys 上の属性に置く。
+# _installing は再入 (循環 import 中の再呼び出し) も止める。
+# ============================================================
+_ENTRY_PATCHES_DONE_ATTR = "_autostock_core_startup_entry_patches_installed"
+_ENTRY_PATCHES_BUSY_ATTR = "_autostock_core_startup_entry_patches_installing"
+
+
+def _entry_runtime_init_patches_once() -> None:
+    if getattr(sys, _ENTRY_PATCHES_DONE_ATTR, False):
+        logger.warning(
+            "[core.startup] entry/ranking/summary runtime init patches already installed "
+            "in this process; skipping re-install (module re-execution guard)"
+        )
+        return
+    if getattr(sys, _ENTRY_PATCHES_BUSY_ATTR, False):
+        logger.warning(
+            "[core.startup] entry/ranking/summary runtime init patches are already running "
+            "(re-entrant import detected); skipping nested install"
+        )
+        return
+
+    setattr(sys, _ENTRY_PATCHES_BUSY_ATTR, True)
+    try:
+        _install_entry_runtime_init_patches()
+        setattr(sys, _ENTRY_PATCHES_DONE_ATTR, True)
+    finally:
+        setattr(sys, _ENTRY_PATCHES_BUSY_ATTR, False)
+
+
 if _SKIP_ENTRY_RUNTIME_INIT_PATCHES:
     logger.warning(
         "[core.startup] database-context process detected (argv=%s); skipping "
@@ -757,13 +803,88 @@ if _SKIP_ENTRY_RUNTIME_INIT_PATCHES:
         sys.argv,
     )
 else:
-    _install_entry_runtime_init_patches()
+    _entry_runtime_init_patches_once()
 
-from .startup import system_startup
-from .summary.bootstrap import (
-    bootstrap_summary,
-    run_bootstrap_incremental_rebuild_if_available,
-)
+# ============================================================
+# 公開名の遅延解決 (DB 専用子プロセスの起動時間対策)
+# ------------------------------------------------------------
+# 2026-09-03 実測:
+#   sitecustomize.py は全プロセスで core.startup.runtime_env.installer を
+#   import する。その副作用でこのファイルが走り、下の 2 行が
+#   core.startup.startup_orchestrator 経由で取引スタック全体
+#   (約1600 module) を NAS(SMB) から読み込んでいた。
+#
+#     何もしない probe スクリプト    473 秒
+#       site           cum 471.16s
+#       sitecustomize  cum 468.48s
+#       core.startup   cum 450.17s   <- ほぼ全部
+#     SMB 実測: stat 4.2ms/file, read 16.8ms/file
+#
+#   db_prepare_runner / push_receiver_runner / ranking_collector_runner /
+#   summary_database_runner / yahoo_complement_runner は system_startup() も
+#   bootstrap_summary() も呼ばない。import するだけで 5 分近く待たされていた。
+#
+# 方針:
+#   DB 専用プロセス (= _SKIP_ENTRY_RUNTIME_INIT_PATCHES と同じ判定) のときだけ
+#   PEP 562 の module __getattr__ で遅延解決する。
+#   `from core.startup import system_startup` は従来どおり動き、
+#   実際に名前が参照された時点で初めて重い import が走る。
+#
+#   main.py (live trading) は従来どおり即時 import のまま。
+#   そもそも main.py は `from core.startup.startup import system_startup` と
+#   サブモジュールを直接指定しているのでこの分岐の影響を受けない。
+#
+#   CORE_STARTUP_EAGER_EXPORTS=1 で従来の即時 import に戻せる。
+# ============================================================
+_LAZY_EXPORTS = {
+    "system_startup": ("core.startup.startup", "system_startup"),
+    "bootstrap_summary": ("core.startup.summary.bootstrap", "bootstrap_summary"),
+    "run_bootstrap_incremental_rebuild_if_available": (
+        "core.startup.summary.bootstrap",
+        "run_bootstrap_incremental_rebuild_if_available",
+    ),
+}
+
+
+def _core_startup_lazy_exports_enabled() -> bool:
+    try:
+        if str(os.getenv("CORE_STARTUP_EAGER_EXPORTS", "")).strip().lower() in {
+            "1", "true", "yes", "y", "on", "enable", "enabled",
+        }:
+            return False
+    except Exception:
+        pass
+    return bool(_SKIP_ENTRY_RUNTIME_INIT_PATCHES)
+
+
+if _core_startup_lazy_exports_enabled():
+
+    def __getattr__(name: str):
+        target = _LAZY_EXPORTS.get(name)
+        if target is None:
+            raise AttributeError("module %r has no attribute %r" % (__name__, name))
+        module_name, attr = target
+        import importlib
+
+        value = getattr(importlib.import_module(module_name), attr)
+        globals()[name] = value
+        return value
+
+    def __dir__():
+        return sorted(set(list(globals().keys()) + list(_LAZY_EXPORTS)))
+
+    logger.warning(
+        "[core.startup] database-context process detected; deferring %s to first use "
+        "(system_startup / bootstrap_summary の即時 import をやめて起動時間を短縮する。"
+        "CORE_STARTUP_EAGER_EXPORTS=1 で従来動作)",
+        ",".join(sorted(_LAZY_EXPORTS)),
+    )
+else:
+    from .startup import system_startup
+    from .summary.bootstrap import (
+        bootstrap_summary,
+        run_bootstrap_incremental_rebuild_if_available,
+    )
 
 __all__ = [
     "system_startup",

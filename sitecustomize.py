@@ -33,6 +33,70 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+
+# ============================================================
+# 起動時 NAS I/O 対策 (2026-09-03)
+# ------------------------------------------------------------
+# この行より下は全部 NAS (W:) からの import になる。
+#
+# (1) バイトコードキャッシュをローカルへ
+#     NAS 側の __pycache__ を使うと 1 プロセスの起動で W: へ
+#     817 回 open() が飛び、その途中で SMB セッションが落ちる。実測:
+#         NAS cache    W: open=817 / 8.4s -> OSError(22) 予期しないネットワークエラー
+#                                         -> OSError(9)  ハンドルが無効です
+#                                         -> OSError(24) Too many open files
+#                      import は 1154 module で中断 (main.py が起動できない)
+#         local cache  W: open=5          -> 2156 module 完走・成功 (5/5)
+#     fd 残量は終始 4000 あり、ファイルディスクリプタは枯渇していない。
+#     Errno 24 は SMB セッション断の後始末として CRT が返しているだけで、
+#     直すべきは NAS への open 回数そのもの。
+#     AUTOSTOCK_LOCAL_PYCACHE=0 で従来動作 (NAS の __pycache__)。
+#     AUTOSTOCK_PYCACHE_DIR=... で置き場を変更。
+#
+# (2) NAS 表記を 1 つに固定
+#     nas_root() は UNC が到達可能なら UNC を優先するが、X: は既に
+#     同じ共有 (AutoStockBuyAndSell) にマップされている。同一共有へ
+#     UNC とドライブレターの 2 表記で触ると Windows は別々の SMB
+#     セッションとして扱い、サーバ側 open スロットを 2 倍消費する。
+#     nas_root.py 自身のコメントに残る 2026-08-28 の実測でも、
+#     落ちるのは UNC 側で X: は生きていた (優先順が実測と逆)。
+#     ここでは既定値だけを与える (setdefault 相当。明示指定が常に勝つ)。
+# ============================================================
+def _install_local_pycache_prefix() -> None:
+    try:
+        flag = str(os.environ.get('AUTOSTOCK_LOCAL_PYCACHE', '')).strip().lower()
+        if flag in {'0', 'false', 'no', 'off', 'disable', 'disabled'}:
+            return
+        if getattr(sys, 'pycache_prefix', None):
+            return
+        base = str(os.environ.get('AUTOSTOCK_PYCACHE_DIR', '')).strip()
+        if not base:
+            local = os.environ.get('LOCALAPPDATA') or os.environ.get('TEMP') or os.getcwd()
+            base = os.path.join(local, 'autostock_pycache')
+        os.makedirs(base, exist_ok=True)
+        sys.pycache_prefix = base
+        os.environ.setdefault('PYTHONPYCACHEPREFIX', base)
+    except Exception:
+        pass
+
+
+def _pin_nas_root_spelling() -> None:
+    try:
+        if os.environ.get('AUTOSTOCK_NAS_ROOT') is not None:
+            return
+        preferred = str(os.environ.get('AUTOSTOCK_NAS_ROOT_PREFERRED', 'X:')).strip()
+        if not preferred:
+            return
+        if os.path.exists(preferred + os.sep):
+            os.environ['AUTOSTOCK_NAS_ROOT'] = preferred
+    except Exception:
+        pass
+
+
+_install_local_pycache_prefix()
+_pin_nas_root_spelling()
+
 from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
