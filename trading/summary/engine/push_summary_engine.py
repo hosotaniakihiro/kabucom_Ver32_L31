@@ -65,7 +65,20 @@ def _push_summary_db_source_safe_latest_dt(df: pd.DataFrame) -> pd.Timestamp | N
         if col not in df.columns:
             continue
         try:
-            s = pd.to_datetime(df[col], errors="coerce")
+            # 2026-09-09: 最新時刻を 1 つ取るためだけに列全体を変換していた。
+            # すでに datetime 型なら変換しない。文字列なら ISO を先に試す
+            # (push の datetime は tz 付き ISO で、素の to_datetime より速い)。
+            col_s = df[col]
+            if pd.api.types.is_datetime64_any_dtype(col_s):
+                s = col_s
+            else:
+                s = None
+                try:
+                    s = pd.to_datetime(col_s, format="ISO8601", errors="coerce")
+                except Exception:
+                    s = None
+                if s is None or not s.notna().any():
+                    s = pd.to_datetime(col_s, errors="coerce")
             if s.notna().any():
                 latest = s.max()
                 try:
@@ -486,7 +499,20 @@ def _safe_latest_dt(df: pd.DataFrame):
         if col not in df.columns:
             continue
         try:
-            s = pd.to_datetime(df[col], errors="coerce")
+            # 2026-09-09: 最新時刻を 1 つ取るためだけに列全体を変換していた。
+            # すでに datetime 型なら変換しない。文字列なら ISO を先に試す
+            # (push の datetime は tz 付き ISO で、素の to_datetime より速い)。
+            col_s = df[col]
+            if pd.api.types.is_datetime64_any_dtype(col_s):
+                s = col_s
+            else:
+                s = None
+                try:
+                    s = pd.to_datetime(col_s, format="ISO8601", errors="coerce")
+                except Exception:
+                    s = None
+                if s is None or not s.notna().any():
+                    s = pd.to_datetime(col_s, errors="coerce")
             if s.notna().any():
                 ts = s.max()
                 try:
