@@ -52,7 +52,16 @@ def _env_float(name, default):
 # 取り合う) は残るが、1 周あたりを増やせばループ速度に関係なく容量が増える。
 # 25 秒 x 5,000 行 = 12,000 行/分 で余裕ができる。
 # DB はローカルなので 5,000 行の executemany+commit でも 0.04 秒程度。
-FLUSH_BATCH_SIZE = max(1, _env_int("PUSH_FLUSH_BATCH_SIZE", 5000))
+# 2026-09-09 追記: 5000 でもまだ足りなかった。
+#     14:23:09 / 14:26:12 / 14:28:48  いずれも buffer=5000
+#     ループ間隔が約 3 分まで伸びており 5,000 行 / 3 分 = 1,667 行/分。
+#     到着は約 2,600 行/分 で、まだ 950 行/分ずつ負ける。
+# ループが遅いのは同一プロセスの summary が GIL を握るため (1 世代 198 秒に
+# なることがある)。ループ速度は今日の範囲では直せないので、1 周あたりの
+# 容量で吸収する。必要量は「到着 2,600 行/分 x 最悪ループ 3 分 = 7,800 行」。
+# 大引け前の増加を見込んで 2-3 倍の余裕を取る。
+# ローカル DB なので 20,000 行の executemany+commit でも 0.1 秒程度。
+FLUSH_BATCH_SIZE = max(1, _env_int("PUSH_FLUSH_BATCH_SIZE", 20000))
 FLUSH_INTERVAL_SEC = max(0.2, _env_float("PUSH_FLUSH_INTERVAL_SEC", 2.0))
 MONITOR_INTERVAL_SEC = 5.0
 RECONNECT_WAIT_SEC = 0.5
