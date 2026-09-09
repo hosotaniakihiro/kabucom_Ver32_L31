@@ -87,20 +87,53 @@ def _push_summary_db_source_safe_symbol_count(df: pd.DataFrame) -> int:
         return 0
 
 
-def _push_summary_db_source_resolve_db_path() -> Path | None:
+def _push_db_dir_candidates() -> list[Path]:
+    """push DB を探す順番。ローカル (writer の書き先) が先、NAS の複製が後。
+
+    2026-09-05 に writer はローカルへ書くようになったが、この読み手だけ
+    NAS 固定のまま取り残されていた。NAS へは既定で 30 分に 1 回しか複製
+    されないので、1 分足がずっと最大 30 分古いまま固定され、鮮度ガードが
+    毎分すべて落として entry が出なくなる (2026-09-09 の実測で確認)。
+
+    過去日のリプレイでは古い DB がローカルに無いことがあるので、
+    NAS も候補として残す。
+    """
+    candidates: list[Path] = []
+    try:
+        from trading.push import push_db_location
+
+        candidates.append(Path(push_db_location.push_db_dir()))
+    except Exception:
+        logger.exception("[PUSH SUMMARY DB SOURCE] push_db_location を使えない")
+
     try:
         from config.paths import get_path
-        base_dir = Path(get_path("raw_push"))
+
+        candidates.append(Path(get_path("raw_push")))
     except Exception:
         logger.exception("[PUSH SUMMARY DB SOURCE] get_path(raw_push) failed")
+        env_dir = os.getenv("PUSH_DB_DIR")
+        candidates.append(Path(env_dir) if env_dir else Path(nas_path(r"raw_data\kabu_station\push")))
+
+    return candidates
+
+
+def _push_summary_db_source_resolve_db_path() -> Path | None:
+    candidates = _push_db_dir_candidates()
+    if not candidates:
         return None
 
     today = dt.datetime.now().strftime("%Y%m%d")
-    db_path = base_dir / f"push{today}.db"
-    if not db_path.exists():
-        logger.warning("[PUSH SUMMARY DB SOURCE] db not found path=%s", db_path)
-        return None
-    return db_path
+    for base_dir in candidates:
+        db_path = base_dir / f"push{today}.db"
+        if db_path.exists():
+            return db_path
+
+    logger.warning(
+        "[PUSH SUMMARY DB SOURCE] db not found tried=%s",
+        [str(d / f"push{today}.db") for d in candidates],
+    )
+    return None
 
 
 def _push_summary_db_source_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
@@ -844,12 +877,16 @@ def _push_summary_db_latest_source_scope_enabled() -> bool:
 
 def _push_summary_db_latest_source_push_db_path() -> Path:
     ymd = os.getenv("KABU_TODAY") or os.getenv("TARGET_DATE") or dt.datetime.now().strftime("%Y%m%d")
-    try:
-        from config.paths import get_path
-        root = Path(get_path("raw_push"))
-    except Exception:
-        root = Path(os.getenv("PUSH_DB_DIR", nas_path(r"raw_data\kabu_station\push")))
-    return root / f"push{ymd}.db"
+    # 置き場所の判断は _push_db_dir_candidates に集約した (ローカル優先)。
+    candidates = _push_db_dir_candidates()
+    for root in candidates:
+        path = root / f"push{ymd}.db"
+        if path.exists():
+            return path
+    fallback = candidates[0] if candidates else Path(
+        os.getenv("PUSH_DB_DIR", nas_path(r"raw_data\kabu_station\push"))
+    )
+    return fallback / f"push{ymd}.db"
 
 
 def _push_summary_db_latest_source_latest_dt(df: Any):
