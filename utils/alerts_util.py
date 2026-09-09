@@ -58,6 +58,25 @@ DEFAULT_MAX_LEN = 1800
 _last_send_time = 0.0
 _send_lock = Lock()
 
+# 2026-09-09: 送信のたびに requests.post を呼ぶと、その都度 TLS ハンドシェイクが
+# 走る。この送信は summary の tick の中から呼ばれるため、ハンドシェイクの時間が
+# そのまま 25 秒バジェットを押し上げていた (py-spy 実測で、summary ワーカー
+# スレッドのサンプルの 5.2% が ssl_wrap_socket だった)。接続を使い回す。
+_session: Optional["requests.Session"] = None
+_session_lock = Lock()
+
+
+def _get_session() -> "requests.Session":
+    """Discord 送信用の使い回しセッション。keep-alive で TLS を張り直さない。"""
+    global _session
+    s = _session
+    if s is not None:
+        return s
+    with _session_lock:
+        if _session is None:
+            _session = requests.Session()
+        return _session
+
 # ------------------------------------------------------------
 # 通信失敗のサーキットブレーカー
 # ------------------------------------------------------------
@@ -678,7 +697,7 @@ def _post_discord(payload, *, webhook_url: Optional[str] = None, timeout: int = 
     with _send_lock:
         _wait_rate_limit()
         try:
-            r = requests.post(resolved_webhook, json=payload, timeout=timeout, verify=verify)
+            r = _get_session().post(resolved_webhook, json=payload, timeout=timeout, verify=verify)
             # HTTP 応答が返った時点で通信レイヤは生きている。
             _breaker_note_success()
 
@@ -690,7 +709,7 @@ def _post_discord(payload, *, webhook_url: Optional[str] = None, timeout: int = 
                 retry_after = _safe_float(r.headers.get("Retry-After", 1), 1.0)
                 logger.warning("Discord rate limit hit. sleeping %ss", retry_after)
                 time.sleep(retry_after)
-                r = requests.post(resolved_webhook, json=payload, timeout=timeout, verify=verify)
+                r = _get_session().post(resolved_webhook, json=payload, timeout=timeout, verify=verify)
                 if r.status_code in (200, 204):
                     logger.info("✅ Discord再送信成功 status=%s", r.status_code)
                     return True
