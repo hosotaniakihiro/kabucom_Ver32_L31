@@ -297,12 +297,35 @@ class OrderBookDBWriter:
     # ========================================================
 
     def _resolve_db_path(self) -> Path:
+        # 2026-09-09: 置き場所の判断は order_book_db_location へ集約した。
+        # この DB は push の flush ワーカーから **同期で** 書かれる。
+        # NAS 上に置いていたため executemany 1 回が十数分かかる状態になり、
+        # flush ワーカーが 15:13 から止まって 111,862 件を失った。
+        # ローカルなら同じ書き込みが 100 分の 1 で終わる。
+        try:
+            from trading.push import order_book_db_location
+
+            return order_book_db_location.order_book_db_path()
+        except Exception:
+            logger.exception(
+                "[OrderBookDB] order_book_db_location を使えないので NAS 直書きへ退避する"
+            )
+
         today = dt.datetime.now().strftime("%Y%m%d")
 
         base_dir: Path = get_path("raw_order_book")
         base_dir.mkdir(parents=True, exist_ok=True)
 
         return base_dir / f"orderbook{today}.db"
+
+    def _sync_to_nas(self, *, date=None, reason: str = "") -> None:
+        """ローカルの板情報 DB を NAS へ複製する。失敗しても止めない。"""
+        try:
+            from trading.push import order_book_db_location
+
+            order_book_db_location.sync_to_nas(date=date, reason=reason)
+        except Exception:
+            logger.exception("[OrderBookDB] NAS 複製に失敗 reason=%s", reason)
 
     # ========================================================
     # CONNECTION
@@ -404,6 +427,9 @@ class OrderBookDBWriter:
                 self.flush()
             except Exception:
                 logger.exception("[OrderBookDB] flush before rotate failed")
+
+            # 日付が変わる前の DB を NAS へ残す (読むのは AI の場外バッチ)。
+            self._sync_to_nas(date=self.current_date, reason="rotate")
 
             with self.lock:
                 try:
@@ -756,6 +782,10 @@ class OrderBookDBWriter:
                     self.conn = None
 
                 self._started = False
+
+            # 停止時に NAS へ残す。NAS がハングしても見切って先へ進む
+            # (sync_to_nas は deadline 付きで、失敗してもローカルは残る)。
+            self._sync_to_nas(date=self.current_date, reason="close")
 
             logger.info("[OrderBookDB] stopped")
 
