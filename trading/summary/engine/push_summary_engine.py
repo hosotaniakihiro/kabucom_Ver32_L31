@@ -1029,6 +1029,31 @@ def _resolve_push_source_df() -> pd.DataFrame:
         logger.exception("[PUSH SUMMARY DB SOURCE] original resolve failed")
     if not _push_summary_db_latest_source_scope_enabled():
         return base
+
+    # 2026-09-09: この 2 回目の読みは、core が NAS の古い複製を読んでいた頃の
+    # 救済として入っている。core もローカル DB を読むようになった今は、
+    # 同じ DB をもう一度読み直しているだけになることが多い。
+    # py-spy 実測で summary ワーカーのサンプルの 24.5% がこの 2 回目だった。
+    # core の結果が十分新しいときは省く。
+    # PUSH_SUMMARY_DB_SOURCE_SKIP_SECOND_READ_SEC=0 で従来どおり必ず 2 回読む。
+    try:
+        skip_sec = _push_summary_db_latest_source_env_float(
+            "PUSH_SUMMARY_DB_SOURCE_SKIP_SECOND_READ_SEC", 20.0
+        )
+        if skip_sec > 0 and isinstance(base, pd.DataFrame) and not base.empty:
+            base_dt = _push_summary_db_latest_source_latest_dt(base)
+            if base_dt is not None:
+                base_age = _push_summary_db_latest_source_age_sec(base_dt)
+                if base_age <= skip_sec:
+                    logger.info(
+                        "[PUSH SUMMARY DB SOURCE] 2 回目の DB 読みを省略 "
+                        "base_latest=%s base_age=%.1fs skip_sec=%.1fs rows=%s",
+                        base_dt, base_age, skip_sec, len(base),
+                    )
+                    return base
+    except Exception:
+        logger.exception("[PUSH SUMMARY DB SOURCE] 省略判定に失敗; 従来どおり 2 回読む")
+
     try:
         db_df = _push_summary_db_latest_source_read_recent()
         return _push_summary_db_latest_source_better_df(base, db_df)
