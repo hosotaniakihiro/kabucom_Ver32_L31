@@ -50,7 +50,12 @@ def _start_push_storage_for_database_process(logger: logging.Logger) -> None:
     try:
         from core.startup.push.storage_bootstrap import start_push_storage
 
-        start_push_storage(buffer_size=500)
+        # 2026-09-09: ここで 500 を直書きしていたため、push_db_writer 側で
+        # 既定を 500 -> 5000 に上げた 2026-09-08 の修正が効いていなかった。
+        # 本番でキューが 10 分で 22,000 行増え、上限 200,000 に向かっていた。
+        # 引数を渡さず writer の既定 (_push_db_buffer_size / 既定 5000、
+        # PUSH_DB_BUFFER_SIZE で変更可) に任せる。
+        start_push_storage()
         logger.warning(
             "[PUSH RECEIVER RUNNER] push storage start requested in database process only"
         )

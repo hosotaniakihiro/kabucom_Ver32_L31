@@ -89,7 +89,9 @@ def start_push_storage_safe() -> None:
 
     try:
         logger.info("📡 push storage bootstrap start")
-        start_push_storage(buffer_size=100)
+        # 2026-09-09: 直書きの 100 をやめ、writer 側の既定に任せる
+        # (push_receiver_runner の 500 直書きと同じ理由。滞留の原因になる)
+        start_push_storage()
 
         running = False
         try:

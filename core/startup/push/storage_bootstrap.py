@@ -71,7 +71,7 @@ def _is_writer_alive(writer: Any) -> bool:
         return False
 
 
-def start_push_storage(buffer_size: int = 100) -> None:
+def start_push_storage(buffer_size: int = 0) -> None:
     """
     PUSH DB writer を起動する。
 
@@ -105,9 +105,13 @@ def start_push_storage(buffer_size: int = 100) -> None:
                 logger.error("[PushStorage] stream_writer resolve failed")
                 return
 
-            # buffer_size を変更できる実装なら反映
+            # buffer_size を変更できる実装なら反映。
+            # 2026-09-09: ここは呼び出し側の値で writer の既定を無条件に
+            # 上書きしていた。そのため push_db_writer 側で既定を
+            # 500 -> 5000 に上げても効かず、9/8 と同じ滞留が再発した。
+            # 明示指定 (>0) のときだけ上書きし、0 なら writer の既定に任せる。
             try:
-                if hasattr(writer, "buffer_size"):
+                if buffer_size and hasattr(writer, "buffer_size"):
                     writer.buffer_size = int(buffer_size)
             except Exception:
                 logger.debug("[PushStorage] buffer_size update skipped", exc_info=True)
