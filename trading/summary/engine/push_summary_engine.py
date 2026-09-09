@@ -161,6 +161,33 @@ def _push_summary_db_source_table_exists(conn: sqlite3.Connection, table_name: s
 
 
 
+# push DB の datetime / received_at は ISO の T 区切りで入っている。
+# cutoff を空白区切りで作ると 'T' > ' ' の文字列比較で全行が一致してしまう。
+_PUSH_DB_CUTOFF_FMT = "%Y-%m-%dT%H:%M:%S"
+
+
+def _push_db_cutoff_from_anchor(anchor_txt: Any, lookback_min: int) -> str:
+    """DB の最新行を起点に cutoff を作る。
+
+    2026-09-09: 「現在時刻から N 分」で窓を取ると、書き込みが遅れている
+    ときに 0 行になる。実際 13:29 時点で DB の最新行は 13:26 より前で、
+    3 分窓が空になった。書き込み遅延と読み取りの重さは互いを悪化させる
+    ので、窓は DB が実際に持っている最新行を起点にする。
+    起点が取れないときだけ現在時刻を使う。
+    """
+    base = None
+    if anchor_txt:
+        try:
+            base = dt.datetime.fromisoformat(str(anchor_txt))
+            if base.tzinfo is not None:
+                base = base.replace(tzinfo=None)
+        except Exception:
+            base = None
+    if base is None:
+        base = dt.datetime.now()
+    return (base - dt.timedelta(minutes=max(1, int(lookback_min)))).strftime(_PUSH_DB_CUTOFF_FMT)
+
+
 def _push_db_effective_lookback_min(default_min: int, *, warm_env: str, cold_min: int) -> int:
     """1分足キャッシュが温まっていれば、PUSH DB を読む窓を短くする。
 
@@ -237,7 +264,15 @@ def _push_summary_db_source_read_recent_rows() -> pd.DataFrame:
     busy_timeout_ms = max(1000, _push_summary_db_source_env_int("PUSH_SUMMARY_DB_BUSY_TIMEOUT_MS", 5000))
 
     now = dt.datetime.now()
-    cutoff = (now - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
+    # 2026-09-09: cutoff を空白区切りで作っていたが、DB の値は ISO の T 区切り
+    #   datetime    = 2026-09-09T13:07:58.782187+09:00
+    #   received_at = 2026-09-09T13:07:58.782187
+    # 文字列比較では 'T'(0x54) > ' '(0x20) なので、日付部が同じ行はすべて
+    # cutoff より「大きい」と判定される。つまり絞り込みが効いていなかった。
+    # 実測 (2026-09-09 13:21 / 533,979 行):
+    #   一致 533,979 行 (= 全件) / 600ms / SCAN + USE TEMP B-TREE FOR ORDER BY
+    # 行数は場中ずっと増えるので、午後ほど遅くなっていた。
+    cutoff = (now - dt.timedelta(minutes=lookback_min)).strftime(_PUSH_DB_CUTOFF_FMT)
 
     conn: sqlite3.Connection | None = None
     try:
@@ -294,15 +329,30 @@ def _push_summary_db_source_read_recent_rows() -> pd.DataFrame:
             )
             return pd.DataFrame()
 
-        where_parts = ["datetime >= ?"]
-        params: list[Any] = [cutoff]
+        # 2026-09-09: 以前は datetime と received_at の OR で絞っていたが、
+        # 別々の列を OR でつなぐと索引が使えず全表 SCAN になる。
+        # このテーブルにあるのは idx_stream_data_raw_received_at と
+        # (symbol, datetime) の複合索引だけで、datetime 単独の索引は無い。
+        # received_at 一本にすると索引検索になる。
+        # 実測 (533,979 行): 現行 600ms -> received_at + 正しい cutoff で 0.8ms。
+        # 両列の値はほぼ同一 (実測で max が一致) なので取りこぼしはしない。
         if "received_at" in colset:
-            where_parts.append("received_at >= ?")
-            params.append(cutoff)
+            where_col = "received_at"
+        else:
+            where_col = "datetime"
+
+        # 窓は DB の最新行を起点にする (書き込み遅延で空にならないように)。
+        try:
+            _anchor = conn.execute(f"SELECT max({where_col}) FROM {table_name}").fetchone()[0]
+        except Exception:
+            _anchor = None
+        cutoff = _push_db_cutoff_from_anchor(_anchor, lookback_min)
+
+        params: list[Any] = [cutoff]
 
         sql = (
             f"SELECT {', '.join(select_cols)} FROM {table_name} "
-            f"WHERE ({' OR '.join(where_parts)}) "
+            f"WHERE {where_col} >= ? "
             f"ORDER BY datetime DESC LIMIT ?"
         )
         params.append(max_rows)
@@ -310,6 +360,26 @@ def _push_summary_db_source_read_recent_rows() -> pd.DataFrame:
         _read_t0 = _pse_time.perf_counter()
         df = pd.read_sql_query(sql, conn, params=params)
         _read_dt = _pse_time.perf_counter() - _read_t0
+
+        # cutoff が効くようになったぶん、保存形式が変わると 0 行になりうる。
+        # そのときは従来どおり「新しい順に max_rows 行」を読んで退避する。
+        if df.empty:
+            try:
+                fb_sql = (
+                    f"SELECT {', '.join(select_cols)} FROM {table_name} "
+                    f"ORDER BY datetime DESC LIMIT ?"
+                )
+                df = pd.read_sql_query(fb_sql, conn, params=[max_rows])
+                if not df.empty:
+                    logger.warning(
+                        "[PUSH SUMMARY DB SOURCE] cutoff で 0 行 -> 無条件の直近 %s 行へ退避 "
+                        "col=%s cutoff=%s rows=%s (保存形式が変わった可能性)",
+                        max_rows, where_col, cutoff, len(df),
+                    )
+            except Exception:
+                logger.exception("[PUSH SUMMARY DB SOURCE] 退避読みに失敗")
+            _read_dt = _pse_time.perf_counter() - _read_t0
+
         if _read_dt >= 3.0:
             logger.warning(
                 "[PUSH SUMMARY DB SOURCE] slow read %.3fs table=%s cutoff=%s rows=%s db=%s "
@@ -957,7 +1027,9 @@ def _push_summary_db_latest_source_read_recent() -> pd.DataFrame:
     )
     limit = max(100, _push_summary_db_latest_source_env_int("PUSH_SUMMARY_DB_SOURCE_LIMIT", 20000))
     busy_ms = max(100, _push_summary_db_latest_source_env_int("PUSH_SUMMARY_DB_SOURCE_BUSY_TIMEOUT_MS", 1000))
-    cutoff = (dt.datetime.now() - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
+    # 2026-09-09: 空白区切りだと 'T' > ' ' の比較でその日の全行に一致し、
+    # 絞り込みが効いていなかった (1 つ目の読み取りと同じ問題)。
+    cutoff = (dt.datetime.now() - dt.timedelta(minutes=lookback_min)).strftime(_PUSH_DB_CUTOFF_FMT)
     try:
         with committing_connect(str(db), timeout=max(0.5, busy_ms / 1000.0)) as conn:
             conn.execute("PRAGMA query_only=ON")
@@ -967,14 +1039,42 @@ def _push_summary_db_latest_source_read_recent() -> pd.DataFrame:
                 conn.execute("SELECT 1 FROM stream_data_raw LIMIT 1").fetchone()
             except Exception:
                 table = "stream_data"
+            # 2026-09-09: ここは SELECT * のままだった。
+            # stream_data_raw の raw_json は PUSH メッセージ全文でこの表で最大の列。
+            # 1 つ目の読み取りでは 2026-09-03 に除外済みだが、こちらは
+            # 20,000 行ぶんを引いて下流で使っていない。合わせて外す。
+            # WHERE も datetime (索引なし) から received_at (索引あり) へ。
+            try:
+                cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            except Exception:
+                cols = []
+            sel_cols = [c for c in cols if c != "raw_json"]
+            select_sql = ", ".join(sel_cols) if sel_cols else "*"
+            where_col = "received_at" if "received_at" in cols else "datetime"
+            # 窓は DB の最新行を起点にする (1 つ目の読み取りと同じ理由)。
+            try:
+                _anchor = conn.execute(f"SELECT max({where_col}) FROM {table}").fetchone()[0]
+            except Exception:
+                _anchor = None
+            cutoff = _push_db_cutoff_from_anchor(_anchor, lookback_min)
             sql = f"""
-                SELECT *
+                SELECT {select_sql}
                   FROM {table}
-                 WHERE datetime >= ?
+                 WHERE {where_col} >= ?
                  ORDER BY datetime DESC
                  LIMIT ?
             """
             df = pd.read_sql_query(sql, conn, params=(cutoff, int(limit)))
+            if df.empty:
+                # cutoff が効くようになったぶん、保存形式が変わると 0 行になりうる。
+                fb = f"SELECT {select_sql} FROM {table} ORDER BY datetime DESC LIMIT ?"
+                df = pd.read_sql_query(fb, conn, params=(int(limit),))
+                if not df.empty:
+                    logger.warning(
+                        "[PUSH SUMMARY DB SOURCE] cutoff で 0 行 -> 無条件の直近 %s 行へ退避 "
+                        "col=%s cutoff=%s rows=%s",
+                        limit, where_col, cutoff, len(df),
+                    )
     except Exception:
         logger.exception("[PUSH SUMMARY DB SOURCE] read db failed db=%s", db)
         return pd.DataFrame()
