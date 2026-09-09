@@ -99,11 +99,26 @@ def _today() -> str:
 
 
 def _push_db_path() -> str:
-    base = os.getenv(
-        "PUSH_DB_DIR",
-        os.getenv("RAW_PUSH_DIR", nas_path(r"raw_data\kabu_station\push")),
-    )
-    return os.getenv("PUSH_DB_PATH", str(Path(base) / f"push{_today()}.db"))
+    explicit = os.getenv("PUSH_DB_PATH")
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+
+    base = os.getenv("PUSH_DB_DIR") or os.getenv("RAW_PUSH_DIR")
+    if not base:
+        # 2026-09-09: writer はローカルへ書くようになったので、既定の
+        # 置き場所は push_db_location に聞く。NAS 固定のままだと
+        # 30 分ごとの複製 (最大 30 分古い) を読むことになる。
+        # 同じ取り残しが push_summary_engine にもあった (6909f89)。
+        # このガードは現状 fail-open で affected=0 だが、閾値を厳しくした
+        # ときに古いデータで誤判定する。
+        try:
+            from trading.push import push_db_location
+
+            return str(push_db_location.push_db_path())
+        except Exception:
+            base = nas_path(r"raw_data\kabu_station\push")
+
+    return str(Path(base) / f"push{_today()}.db")
 
 
 def _qident(name: Any) -> str:
