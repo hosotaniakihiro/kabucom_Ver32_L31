@@ -37,7 +37,22 @@ def _env_float(name, default):
 # 後場寄りの 1,300-1,700 msg/分に追いつかない
 # (実測: queue 242 -> 4,482、db_age 29s -> 180s と発散)。
 # ------------------------------------------------------------
-FLUSH_BATCH_SIZE = max(1, _env_int("PUSH_FLUSH_BATCH_SIZE", 1000))
+# 2026-09-09: 1000 -> 5000。
+#
+# push_db_writer 側の buffer_size は 2026-09-08 に 5000 へ上げたが、
+# ここが 1000 のままだと 1 周で writer へ渡せるのが 1000 行までなので、
+# writer 側の 5000 は一度も効かない (実測: flush prepare buffer=1000 が並ぶ)。
+#
+# 本番実測 (2026-09-09 14:00 後場):
+#     flush 間隔 25 秒 x 1000 行 = 約 2,400 行/分
+#     到着                        = 約 2,640 行/分
+# わずかに足りず、queue が 0 -> 9,912 へ再び発散した。
+#
+# flush ループが遅くなる理由 (同一プロセスで summary も走るので GIL を
+# 取り合う) は残るが、1 周あたりを増やせばループ速度に関係なく容量が増える。
+# 25 秒 x 5,000 行 = 12,000 行/分 で余裕ができる。
+# DB はローカルなので 5,000 行の executemany+commit でも 0.04 秒程度。
+FLUSH_BATCH_SIZE = max(1, _env_int("PUSH_FLUSH_BATCH_SIZE", 5000))
 FLUSH_INTERVAL_SEC = max(0.2, _env_float("PUSH_FLUSH_INTERVAL_SEC", 2.0))
 MONITOR_INTERVAL_SEC = 5.0
 RECONNECT_WAIT_SEC = 0.5
