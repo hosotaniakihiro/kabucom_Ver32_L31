@@ -205,8 +205,32 @@ def check_ranking_collect() -> None:
 # 3-4. ranking_snapshot_1min
 # ------------------------------------------------------------
 
+def _ranking_db_path() -> Path:
+    """ranking DB の場所。ローカル (writer の書き先) を優先する。
+
+    2026-09-10: ここは NAS 固定だった。ranking DB は 2026-09-07 に
+    ローカル書き + NAS 複製へ移っており、NAS への複製は既定で 30 分に
+    1 回しか走らない。そのため寄り後すぐに実行すると NAS 側が 0 行で、
+    「03 ranking_snapshot_1min rows>0 が FAIL」という誤判定になる。
+    実測 (2026-09-10 09:07):
+        ローカル raw=9,350 / snapshot=8,949   (正常に溜まっている)
+        NAS      raw=0     / snapshot=0       (まだ複製されていない)
+    このチェックは「自動売買を有効化してよいか」の判断材料なので、
+    誤 FAIL は害がある。
+    """
+    try:
+        from trading.ranking import ranking_db_location
+
+        p = Path(ranking_db_location.ranking_db_path())
+        if p.exists():
+            return p
+    except Exception:
+        pass
+    return _kabu_dir("ranking") / ("ranking%s.db" % _today())
+
+
 def check_ranking_db() -> None:
-    path = _kabu_dir("ranking") / ("ranking%s.db" % _today())
+    path = _ranking_db_path()
     if not path.exists():
         record("03 ranking_snapshot_1min rows>0", FAIL, "DB が無い: %s" % path)
         record("04 ranking 最新時刻 fresh", FAIL, "DB が無い")
