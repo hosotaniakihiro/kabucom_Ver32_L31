@@ -120,6 +120,43 @@ def main() -> int:
     logger.info("[YAHOO COMPLEMENT RUNNER] cwd=%s", os.getcwd())
     logger.info("=" * 80)
 
+    # ------------------------------------------------------------
+    # 2026-09-10: Yahoo の CA バンドルをここで入れる。
+    #
+    # この環境では Norton の TLS スキャンが HTTPS を傍受し、Norton の
+    # ルートCAは Windows の証明書ストアにしか無い。yfinance が内部で使う
+    # curl_cffi は certifi しか見ないので Yahoo に到達できず、例外ではなく
+    # **空の結果** が返る。ログには "possibly delisted" と出るだけなので
+    # 気付きにくい。
+    #
+    # 対策モジュール scripts/yahoo_ca_bundle.install() は 2026-08-08 から
+    # あるが、夜間バッチ (night_yahoo_daily_update_batch) からしか呼ばれて
+    # おらず、**場中のこの経路は配線が漏れていた**。
+    #
+    # 実測 (2026-09-10 09:55):
+    #     install 前  yfinance 7203.T -> 0 行 ("possibly delisted")
+    #                 curl_cffi       -> CertificateVerifyError
+    #     install 後  yfinance 7203.T -> 27 行 (最終 09:31)
+    #                 curl_cffi       -> HTTP 200
+    #
+    # この取得が空だと候補銘柄の 1 分足が無く、entry の ATR/RANGE
+    # フィルタが「1m本数不足 bars=0」で全件落ちる。2026-09-10 は
+    # ATR_1M_FILTER_NG 30 件 / RANGE_5M_FILTER_NG 25 件がこれだった。
+    # ------------------------------------------------------------
+    try:
+        from scripts.yahoo_ca_bundle import install as _install_yahoo_ca_bundle
+
+        _ok = _install_yahoo_ca_bundle()
+        logger.warning(
+            "[YAHOO COMPLEMENT RUNNER] CA バンドル install=%s CURL_CA_BUNDLE=%s",
+            _ok, os.environ.get("CURL_CA_BUNDLE"),
+        )
+    except Exception:
+        logger.exception(
+            "[YAHOO COMPLEMENT RUNNER] CA バンドルの設定に失敗。"
+            "Yahoo 取得が空になる可能性がある (Norton の TLS 傍受)"
+        )
+
     _bootstrap_token_if_needed()
     _run_startup_once()
     _register_tasks()
