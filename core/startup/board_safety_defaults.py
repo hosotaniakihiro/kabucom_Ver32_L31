@@ -54,6 +54,17 @@ def _set_safe_defaults() -> None:
     os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_COUNT", "0")
     os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_WAIT_SEC", "0.05")
 
+    # 2026-09-11: 最終ゲートの板取得フォールバックを開ける。
+    #   entry_controller._final_guard_try_get_bid_ask_from_api() は
+    #   ENTRY_BOARD_API_LOOKUP_ENABLED 既定 False で入口から即 0 を返しており、
+    #   このフラグはソース中ここ以外に出てこない = 一度もセットされていなかった。
+    #   そのため板は PUSH 登録中の銘柄しか取れず、候補は最終ゲートで必ず
+    #   BOARD_MISSING になっていた (9/7-9/10 は発注 0 件)。
+    #   これは「板なし発注の許可」ではない。HARD_BLOCK と
+    #   ALLOW_ENTRY_WITHOUT_BOARD は上の通り従来どおり維持し、
+    #   板を取りに行く経路だけを有効化する。
+    os.environ.setdefault("ENTRY_BOARD_API_LOOKUP_ENABLED", "1")
+
 
 def _restore_final_guard_board_guard() -> bool:
     """
