@@ -24,9 +24,13 @@ from database import Session_position
 from database.models import Position
 
 # ENTRY_EVENT
-from trading.entry.entry_event_updater import (
-    mark_entry_filled,
-)
+#   2026-09-14: mark_entry_filled は entry_event_updater に存在しない。
+#   同モジュールにあるのは update_entry_result(symbol, pnl, holding_seconds) で、
+#   これは EXIT 後に損益を埋める関数であり、ENTRY 約定時には呼べない
+#   (pnl / holding_seconds がまだ確定していない)。
+#   このファイルは 2026-05-04 の作成以来一度も呼び出されておらず、
+#   import した時点で ImportError になっていた。責務4は呼び先ごと
+#   存在しないので、ENTRY_EVENT の約定済み更新は行わない。
 
 # EXIT CONTEXT
 from trading.exit.exit_context_factory import create_exit_context
@@ -62,6 +66,12 @@ def on_entry_filled(
         # ----------------------------------------------------
         # 1. Position OPEN
         # ----------------------------------------------------
+        # 2026-09-14: order_id は database.models.Position に列が無い。
+        #   実DB (positions.db) には order_id 列があるが、モデル定義が
+        #   9 列ぶん古い (order_id / high_since_entry / low_since_entry /
+        #   entry_id / entry_source / entry_mode / entry_reason /
+        #   reason_code / technical_snapshot が未定義)。
+        #   モデルを触ると他の読み書きに影響するため、ここでは渡さない。
         pos = Position(
             symbol=symbol,
             symbolname=symbolname,
@@ -70,7 +80,6 @@ def on_entry_filled(
             avg_price=price,
             entry_time=now,
             status="OPEN",
-            order_id=order_id,
         )
         session.add(pos)
         session.commit()
@@ -104,14 +113,8 @@ def on_entry_filled(
             global_data.pending_orders.pop(order_id, None)
 
         # ----------------------------------------------------
-        # 4. ENTRY_EVENT を約定済みに更新
+        # 4. ENTRY_EVENT 更新は行わない (上記 import のコメント参照)
         # ----------------------------------------------------
-        mark_entry_filled(
-            symbol=symbol,
-            order_id=order_id,
-            filled_price=price,
-            filled_time=now,
-        )
 
         logger.info(
             "✅ ENTRY FILLED %s %s qty=%s price=%.2f order_id=%s",

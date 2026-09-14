@@ -1030,6 +1030,36 @@ def _obm_merge_and_publish(db_positions: Dict[str, Dict[str, Any]], broker_posit
         pass
 
     changed = before_keys != merged_keys
+
+    # ------------------------------------------------------------
+    # 2026-09-14: ENTRY 約定フック
+    #   このシステムには約定イベントが無い。約定を最初に知るのはここで、
+    #   ブローカー側に新しい建玉が現れた差分 (merged_keys - before_keys) が
+    #   それに当たる。
+    #
+    #   trading/entry/fill_handler.py の on_entry_filled() は
+    #   「ENTRY 約定後の唯一の処理点」として 2026-05-04 に書かれたが、
+    #   呼び出し元が一度も実装されず (git log -S で作成コミットのみ)、
+    #   さらに import 自体が ImportError になっていた。そのため
+    #     * positions.db に OPEN 建玉が書かれない
+    #       -> [PROTECTED PUSH] の保護対象が常に 0 件になり、保有銘柄が
+    #          PUSH 登録から外れて価格が止まる
+    #       -> 2026-09-14 に 4667 を 12 秒前の価格で利確判断し -5,300 円
+    #     * 決済時に DB 建玉が見つからずブローカーから救出していた
+    #   という状態だった。
+    #
+    #   ここで呼ぶことで OPEN 建玉が約定時点で記録される。
+    #   注意: atr_1min は建玉 dict に無いので 0.0 になる。ExitContext の
+    #   ATR が実値になるわけではない (fallback と同じ)。別途 ATR の
+    #   供給源が必要。
+    #
+    #   絶対にこのフックで position sync を落とさないこと。例外は飲む。
+    # ------------------------------------------------------------
+    try:
+        _notify_entry_filled_for_new_positions(before_keys, merged_keys, merged)
+    except Exception:
+        logger.exception("[ENTRY FILL HOOK] failed (position sync は継続する)")
+
     logger.warning(
         "[OPEN POSITION BROKER PATCH] merged credit open positions count=%d changed=%s mode=%s broker_read_ok=%s parse_suspicious=%s broker_authoritative=%s db_fallback_on_parse_suspicious=%s keep_existing_on_parse_suspicious=%s stale_closed=%s broker_status=%s db_count=%d db_credit=%d existing_credit=%d broker_count=%d symbols=%s",
         len(merged), changed, source_mode, broker_read_ok, parse_suspicious,
@@ -1037,6 +1067,66 @@ def _obm_merge_and_publish(db_positions: Dict[str, Dict[str, Any]], broker_posit
         sorted(stale_symbols), broker_status, len(db_positions or {}), len(db_credit), len(existing_credit), len(broker_positions or {}), sorted(merged.keys()),
     )
     return merged
+
+
+_ENTRY_FILL_NOTIFIED: set[str] = set()
+
+
+def _notify_entry_filled_for_new_positions(before_keys, merged_keys, merged) -> None:
+    """新しく現れた建玉について on_entry_filled() を一度だけ呼ぶ。
+
+    建玉が消えたら記録も落として、次に同じ銘柄を建てたときに再通知できる
+    ようにする。同じ建玉で二重に Position 行を作らないための冪等化。
+    """
+    if not _osc_env_bool("ENTRY_FILL_HOOK_ENABLED", True):
+        return
+
+    try:
+        before = set(before_keys or ())
+        after = set(merged_keys or ())
+    except Exception:
+        return
+
+    # 消えた建玉は通知済みフラグを落とす
+    for gone in (_ENTRY_FILL_NOTIFIED - after):
+        _ENTRY_FILL_NOTIFIED.discard(gone)
+
+    new_symbols = [s for s in (after - before) if s not in _ENTRY_FILL_NOTIFIED]
+    if not new_symbols:
+        return
+
+    from trading.entry.fill_handler import on_entry_filled
+
+    for sym in new_symbols:
+        pos = (merged or {}).get(sym) or {}
+        try:
+            qty = int(float(pos.get("qty") or 0))
+            price = float(pos.get("avg_price") or 0.0)
+        except Exception:
+            qty, price = 0, 0.0
+        if qty <= 0 or price <= 0:
+            logger.warning(
+                "[ENTRY FILL HOOK] skip symbol=%s qty=%s price=%s (建玉の数量/価格が取れない)",
+                sym, pos.get("qty"), pos.get("avg_price"),
+            )
+            continue
+        _ENTRY_FILL_NOTIFIED.add(sym)
+        logger.warning(
+            "[ENTRY FILL HOOK] on_entry_filled symbol=%s side=%s qty=%s price=%s",
+            sym, pos.get("side"), qty, price,
+        )
+        try:
+            on_entry_filled(
+                symbol=sym,
+                symbolname=str(pos.get("symbolname") or ""),
+                side=str(pos.get("side") or "BUY"),
+                qty=qty,
+                price=price,
+                atr_1min=float(pos.get("atr_1min") or pos.get("atr") or 0.0),
+                order_id=str(pos.get("order_id") or pos.get("execution_id") or ""),
+            )
+        except Exception:
+            logger.exception("[ENTRY FILL HOOK] on_entry_filled raised symbol=%s", sym)
 
 
 def _osc_env_bool(name: str, default: bool = True) -> bool:
