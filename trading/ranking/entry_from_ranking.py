@@ -2039,6 +2039,140 @@ def _ranking_technical_filter(row: Dict[str, Any], side: str) -> Tuple[bool, str
     return True, "OK", tech_score
 
 
+# ============================================================
+# マルチタイムフレーム 移動平均フィルタ (5MA/25MA/75MA)
+#   BUY: 終値 > 各MA / SELL: 終値 < 各MA
+#   1分足で成立 かつ (3分足 または 5分足) で成立
+#   却下理由は "MTF_MA_" 接頭辞 = 救済対象外のハードゲート。
+# ============================================================
+_RANKING_MTF_TF_MAP = {1: "1m", 3: "3m", 5: "5m"}
+
+
+def _ranking_mtf_ma_enabled(cfg: Dict[str, Any]) -> bool:
+    env = os.getenv("RANKING_ENTRY_MTF_MA_ENABLED")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip().lower() not in ("0", "false", "no", "off")
+    return bool((cfg or {}).get("ENABLED", False))
+
+
+def _ranking_mtf_ma_map(symbols: set) -> Dict[str, Dict[str, float]]:
+    """各銘柄について 1m/3m/5m の close と ma5/ma25/ma75 を、
+    足を潰さずサフィックス付きキー (close_1m, ma5_3m, ...) で返す。
+
+    _ranking_entry_fix_latest_summary_tech_map() は「最初にヒットした足だけ」
+    採用して 3m/5m を捨てるが、こちらは全足を保持する点が異なる。
+    データ源は GC.get_summary_history(tf, source="push") (in-memory / NAS 非依存)。
+    """
+    result: Dict[str, Dict[str, float]] = {}
+    if not symbols:
+        return result
+    for tf_i, tf_s in _RANKING_MTF_TF_MAP.items():
+        try:
+            df = _ranking_entry_fix_get_gc_history(tf_i, symbols=symbols)
+        except Exception:
+            logger.debug("[RANKING MTF MA] history fetch failed tf=%s", tf_i, exc_info=True)
+            continue
+        if not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
+            continue
+        work = df.copy()
+        work["symbol"] = work["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        work = work[work["symbol"].isin(symbols)]
+        if work.empty:
+            continue
+        if "datetime" in work.columns:
+            work["datetime"] = pd.to_datetime(work["datetime"], errors="coerce")
+            work = work.sort_values(["symbol", "datetime"], kind="stable")
+        latest = work.groupby("symbol", as_index=False).tail(1)
+        for _, r in latest.iterrows():
+            sym = str(r.get("symbol") or "").strip()
+            if not sym:
+                continue
+            bucket = result.setdefault(sym, {})
+            close_v = r.get("close")
+            if close_v is None or (isinstance(close_v, float) and pd.isna(close_v)):
+                close_v = r.get("current_price")
+            bucket[f"close_{tf_s}"] = _safe_float(close_v, 0.0)
+            for ma in ("ma5", "ma25", "ma75"):
+                bucket[f"{ma}_{tf_s}"] = _safe_float(r.get(ma), 0.0)
+    return result
+
+
+def _ranking_mtf_ma_side_ok_for_tf(row: Dict[str, Any], side: str, tf_s: str, mas) -> Tuple[Any, str]:
+    """指定足について「終値 vs 各MA」を判定。
+    戻り値: (True/False/None, detail)。None = データ不足で判定不能。
+    値が無い MA は個別にスキップし、寄り直後の ma75 未成熟でも止めない。
+    """
+    close = _safe_float(row.get(f"close_{tf_s}"), 0.0)
+    if close <= 0 and tf_s == "1m":
+        close = _safe_float(row.get("close") or row.get("current_price") or row.get("price"), 0.0)
+    if close <= 0:
+        return None, f"{tf_s}:no_close"
+    checked = 0
+    for ma in mas:
+        mav = _safe_float(row.get(f"{ma}_{tf_s}"), 0.0)
+        if mav <= 0 and tf_s == "1m":
+            mav = _safe_float(row.get(ma), 0.0)  # 1m はサフィックス無しキーにも入る
+        if mav <= 0:
+            continue  # そのMAはデータ不足 → スキップ
+        checked += 1
+        if side == "BUY" and close < mav:
+            return False, f"{tf_s}:{ma} c={close:.1f}<{mav:.1f}"
+        if side == "SELL" and close > mav:
+            return False, f"{tf_s}:{ma} c={close:.1f}>{mav:.1f}"
+    if checked == 0:
+        return None, f"{tf_s}:no_ma"
+    return True, f"{tf_s}:ok({checked})"
+
+
+def _ranking_mtf_ma_filter(row: Dict[str, Any], side: str) -> Tuple[bool, str]:
+    cfg = RANKING_ENTRY_CONFIG.get("MTF_MA", {}) or {}
+    if not _ranking_mtf_ma_enabled(cfg):
+        return True, "MTF_MA_DISABLED"
+    side_u = str(side or "").upper().strip()
+    apply_sides = tuple(str(s).upper() for s in cfg.get("APPLY_SIDES", ("BUY", "SELL")))
+    if side_u not in apply_sides:
+        return True, "MTF_MA_SIDE_SKIP"
+    if side_u not in ("BUY", "SELL"):
+        return True, "MTF_MA_SIDE_NONE"
+
+    mas = tuple(cfg.get("MAS", ("ma5", "ma25", "ma75")))
+    base_tf = str(cfg.get("BASE_TF", "1m"))
+    confirm_tfs = tuple(cfg.get("CONFIRM_TFS", ("3m", "5m")))
+    confirm_mode = str(cfg.get("CONFIRM_MODE", "ANY")).upper()
+    allow_no_data = bool(cfg.get("ALLOW_WHEN_NO_DATA", True))
+
+    # (1) BASE 足 (1分足) は必須で成立
+    base_ok, base_detail = _ranking_mtf_ma_side_ok_for_tf(row, side_u, base_tf, mas)
+    if base_ok is False:
+        return False, f"MTF_MA_BASE_NG {base_detail}"
+    if base_ok is None and not allow_no_data:
+        return False, f"MTF_MA_BASE_NODATA {base_detail}"
+
+    # (2) CONFIRM 足 (3分足 / 5分足)
+    results = []
+    details = []
+    for tf_s in confirm_tfs:
+        ok, det = _ranking_mtf_ma_side_ok_for_tf(row, side_u, tf_s, mas)
+        results.append(ok)
+        details.append(det)
+    has_data = any(r is not None for r in results)
+    detail_s = ";".join(details)
+
+    if not has_data:
+        if allow_no_data:
+            return True, f"MTF_MA_OK_CONFIRM_NODATA base={base_detail}"
+        return False, f"MTF_MA_CONFIRM_NODATA {detail_s}"
+
+    if confirm_mode == "ALL":
+        if any(r is False for r in results):
+            return False, f"MTF_MA_CONFIRM_ALL_NG {detail_s}"
+        return True, f"MTF_MA_OK_ALL {detail_s}"
+    # ANY (既定): 3分足 または 5分足 のどれかが成立
+    if any(r is True for r in results):
+        return True, f"MTF_MA_OK_ANY {detail_s}"
+    return False, f"MTF_MA_CONFIRM_ANY_NG {detail_s}"
+
+
 def _calc_ranking_only_score(row: Dict[str, Any], side: str, prev_price: float, prev_rank: int, consecutive: int) -> Tuple[float, Dict[str, float]]:
     cfg_rank = RANKING_ENTRY_CONFIG["RANKING"]
     cfg_vol = RANKING_ENTRY_CONFIG["VOLUME"]
@@ -2312,6 +2446,9 @@ def _passes_ranking_only_filters_core(row: Dict[str, Any], side: str, prev_h: Di
     tech_ok, tech_reason, _tech_score = _ranking_technical_filter(row, side)
     if not tech_ok:
         return False, tech_reason
+    mtf_ok, mtf_reason = _ranking_mtf_ma_filter(row, side)
+    if not mtf_ok:
+        return False, mtf_reason
     min_score = _safe_float(cfg_score.get("MIN_ENTRY_SCORE", 70.0), 70.0)
     if score < min_score:
         return False, f"SCORE_NG score={score:.2f} min={min_score:.2f}"
@@ -2377,6 +2514,19 @@ def entry_from_ranking():
         )
         logger.info("[RANKING ENTRY LOOP] ranking_technical attached symbols=%s prefiltered_rows=%s raw_rows=%s", len(tech_map), len(rows), len(rows_all))
 
+    # マルチタイムフレーム MA (5/25/75) を 1m/3m/5m 別に取得して行へ付与する。
+    # tech_map (足を潰した 1 足分) とは別に、close_3m/ma75_5m 等のサフィックス付き
+    # キーを additive に載せる。MTF_MA フィルタが無効なら構築自体をスキップ。
+    mtf_ma_map: Dict[str, Dict[str, float]] = {}
+    if _ranking_mtf_ma_enabled(RANKING_ENTRY_CONFIG.get("MTF_MA", {}) or {}):
+        try:
+            _mtf_syms = {str(r.get("symbol") or "").strip() for r in rows if str(r.get("symbol") or "").strip()}
+            mtf_ma_map = _ranking_mtf_ma_map(_mtf_syms)
+            logger.info("[RANKING MTF MA] map built symbols=%s/%s", len(mtf_ma_map), len(_mtf_syms))
+        except Exception:
+            logger.exception("[RANKING MTF MA] map build failed -> MTF MA gate falls back to no-data behavior")
+            mtf_ma_map = {}
+
     created = 0
     build_reject = 0
     filter_reject = 0
@@ -2412,6 +2562,11 @@ def entry_from_ranking():
             break
         if callable(attach_ranking_technicals):
             row = attach_ranking_technicals(row, tech_map)
+        if mtf_ma_map:
+            _mtf = mtf_ma_map.get(str(row.get("symbol") or "").strip())
+            if _mtf:
+                for _k, _v in _mtf.items():
+                    row.setdefault(_k, _v)  # 既存キーは壊さず additive に付与
         symbol = str(row.get("symbol") or "").strip()
         if not symbol:
             continue
