@@ -97,11 +97,16 @@ def _set_default_envs() -> None:
     os.environ.setdefault("YAHOO_SYMBOL_FAIL_BACKOFF_SEC", "1800")
     os.environ.setdefault("YAHOO_SYMBOL_FAIL_CACHE_MAX", "1000")
 
-    # PUSH候補は各段階で100固定に寄せる。
-    os.environ.setdefault("PUSH_ROTATION_TARGET_MIN_KEEP", "100")
-    os.environ.setdefault("PUSH_ROTATION_TARGET_MAX_KEEP", "100")
-    os.environ.setdefault("PUSH_REGISTER_MIN_KEEP", "100")
-    os.environ.setdefault("PUSH_REGISTER_MAX_KEEP", "100")
+    # PUSH候補は各段階で 50 固定に寄せる。
+    # 2026-09-14: 以前は 100 だった。9/11 に rotation_settings.py で 50 へ
+    # 下げたが、ここは sitecustomize -> installer 経由で rotation_settings より
+    # 先に走るため、この setdefault が勝って 100 のままだった (実測)。
+    # MIN_KEEP も 50 にする。100 のままだと rotation_symbols の
+    # max(min_keep, max_keep) で 100 に戻る。kabu Station の登録上限は 50。
+    os.environ.setdefault("PUSH_ROTATION_TARGET_MIN_KEEP", "50")
+    os.environ.setdefault("PUSH_ROTATION_TARGET_MAX_KEEP", "50")
+    os.environ.setdefault("PUSH_REGISTER_MIN_KEEP", "50")
+    os.environ.setdefault("PUSH_REGISTER_MAX_KEEP", "50")
 
 
 def _apply_yfinance_download_wrap() -> bool:

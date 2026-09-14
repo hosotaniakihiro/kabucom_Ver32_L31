@@ -161,10 +161,14 @@ def _wrl_recent_stats(symbol: str) -> dict[str, Any]:
 
             select_close = close_col if close_col else "0"
             select_turn = turn_col if turn_col else "0"
+            # symbol 列は TEXT NOT NULL (全行 text)。CAST(symbol AS TEXT) は
+            # (symbol, datetime) のインデックスを殺して全表スキャンになり、
+            # NAS 上の 4.8 万行で 1 銘柄 27〜58 秒かかっていた (symbol=? なら 0.2 秒)。
+            # 2026-09-14 後場、100 銘柄の判定で PUSH 登録が 45 分以上止まった原因。
             sql = f"""
                 SELECT {tm_col}, {select_close}, {vol_col}, {select_turn}
                 FROM {table}
-                WHERE CAST({sym_col} AS TEXT)=?
+                WHERE {sym_col}=?
                 ORDER BY {tm_col} DESC
                 LIMIT ?
             """
@@ -455,9 +459,9 @@ def _wbk_read_bulk_stats_sync(mod: Any, missing: List[str], symbols_total: int) 
         select_turn = turn_col if turn_col else "0"
         placeholders = ",".join(["?"] * len(missing))
         sql = f"""
-            SELECT CAST({sym_col} AS TEXT) AS symbol, {tm_col}, {select_close}, {vol_col}, {select_turn}
+            SELECT {sym_col} AS symbol, {tm_col}, {select_close}, {vol_col}, {select_turn}
             FROM {table}
-            WHERE CAST({sym_col} AS TEXT) IN ({placeholders})
+            WHERE {sym_col} IN ({placeholders})
             ORDER BY {sym_col}, {tm_col} DESC
             LIMIT ?
         """
