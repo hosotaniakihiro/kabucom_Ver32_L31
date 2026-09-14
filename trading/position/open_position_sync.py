@@ -47,6 +47,11 @@ CLOSED_STATUSES = {
     "CANCELLED",
     "REJECTED",
     "FAILED",
+    # 2026-09-14: 同ファイルの _osc_cleanup_stale_db_positions が付ける
+    #   status。ここに無かったため「未知の status = 監視対象」に倒れ、
+    #   決済済みの建玉行を決済側が採用し続け、9984 で 14:48〜15:29 に
+    #   74 回 Code 8 (決済指定内容に誤りがあります) を送り続けた。
+    "CLOSED_BROKER_NOT_OPEN",
 }
 
 OPEN_LIKE_STATUSES = {
@@ -99,7 +104,7 @@ def _normalize_status(v: Any) -> str:
 
 def _is_open_like_status(v: Any) -> bool:
     st = _normalize_status(v)
-    if st in CLOSED_STATUSES:
+    if st in CLOSED_STATUSES or st.startswith("CLOSED"):
         return False
     if st in OPEN_LIKE_STATUSES:
         return True
@@ -1221,7 +1226,7 @@ def _osc_safe_float(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
-def _osc_cleanup_stale_db_positions() -> int:
+def _osc_cleanup_stale_db_positions(broker_symbols: set[str] | None = None) -> int:
     if not _osc_env_bool("OPEN_POSITION_AUTO_CLOSE_STALE_DB", True):
         return 0
     if not _osc_broker_authoritative_active():
@@ -1231,12 +1236,12 @@ def _osc_cleanup_stale_db_positions() -> int:
     if not _OSC_CLEAN_LOCK.acquire(blocking=False):
         return 0
     try:
-        return _osc_cleanup_stale_db_positions_locked()
+        return _osc_cleanup_stale_db_positions_locked(broker_symbols=broker_symbols)
     finally:
         _OSC_CLEAN_LOCK.release()
 
 
-def _osc_cleanup_stale_db_positions_locked() -> int:
+def _osc_cleanup_stale_db_positions_locked(broker_symbols: set[str] | None = None) -> int:
     global _OSC_LAST_CLEAN_AT
 
     # 毎秒UPDATEを打たない。DB scanは走っても、cleanupは少し間引く。
@@ -1250,7 +1255,16 @@ def _osc_cleanup_stale_db_positions_locked() -> int:
             return 0
     _OSC_LAST_CLEAN_AT = now
 
-    broker_symbols = _osc_current_broker_symbols()
+    # 2026-09-14: global_data.open_positions は GC.positions.snapshot_dict() を
+    #   返す読み取り専用 property で、_obm_merge_and_publish はそのコピーに
+    #   書いているだけなので常に空。結果、ブローカーに建玉があっても
+    #   「broker_symbols=[]」で DB 行を数秒後に CLOSED_BROKER_NOT_OPEN にしていた
+    #   (7013 / 8001 / 9984 で実測)。直前の merge が返したブローカー建玉の集合を
+    #   呼び出し側から渡してもらい、それを正とする。渡されなければ従来どおり。
+    if broker_symbols is None:
+        broker_symbols = _osc_current_broker_symbols()
+    else:
+        broker_symbols = {_osc_norm(s) for s in broker_symbols if _osc_norm(s)}
 
     try:
         from database import Session_position
@@ -1408,7 +1422,12 @@ def _sync_layer1_broker_merge(*, force_log: bool = False):
 def _sync_layer2_stale_cleanup(*args, **kwargs):
     result = _sync_layer1_broker_merge(*args, **kwargs)
     try:
-        _osc_cleanup_stale_db_positions()
+        # merge が返す dict はブローカー正のときブローカー建玉そのもの。
+        # ブローカーが読めなかった回は DB フォールバックが返るので、その時は
+        # 何も消さない (読めない = 消してよい根拠が無い)。
+        broker_ok = bool(getattr(global_data, "open_positions_broker_read_ok", False))
+        if broker_ok and isinstance(result, dict):
+            _osc_cleanup_stale_db_positions(broker_symbols=set(result.keys()))
     except Exception:
         logger.exception("[OPEN POSITION STALE DB CLEAN] cleanup after sync failed")
     return result

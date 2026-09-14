@@ -132,16 +132,28 @@ def _normalize_push_df(push_df: Any) -> pd.DataFrame:
 
     out["close"] = pd.to_numeric(out[close_col], errors="coerce")
 
+    # 2026-09-14: kabu PUSH のティック行が持つ opening_price / high_price /
+    #   low_price (HighPrice / LowPrice) は **当日** の始値・高値・安値であって
+    #   そのティックの値ではない。これを足の high/low にして _build_bars で
+    #   max/min を取ると、全ての 1 分足が当日高安 (7013: 2746.5/2616.0) になり、
+    #   ATR が 10〜100 倍に膨らんでボラティリティ判定が素通りしていた
+    #   (8001 伊藤忠: 実 1 分 ATR 0.5 円 = 0.02% が min 0.35% を通過)。
+    #   ティック行では high/low をティック価格 (close) にして、足の高安は
+    #   _build_bars の max/min に任せる。足形の入力 (Yahoo 1 分足など、
+    #   ティック価格列 `price` を持たず high/low が足の値) は従来どおり。
+    is_kabu_tick = ("price" in out.columns) and (
+        _first_existing(out, ["high_price", "HighPrice", "low_price", "LowPrice", "opening_price"]) is not None
+    )
     for target, candidates in {
         "open": ["open", "open_price", "Open", "OpenPrice"],
         "high": ["high", "high_price", "High", "HighPrice"],
         "low": ["low", "low_price", "Low", "LowPrice"],
     }.items():
         c = _first_existing(out, candidates)
-        if c is not None:
-            out[target] = pd.to_numeric(out[c], errors="coerce")
-        else:
+        if is_kabu_tick or c is None:
             out[target] = out["close"]
+        else:
+            out[target] = pd.to_numeric(out[c], errors="coerce")
 
     vol_col = _first_existing(out, [
         "volume", "Volume", "trading_volume", "TradingVolume", "CumVolume",
