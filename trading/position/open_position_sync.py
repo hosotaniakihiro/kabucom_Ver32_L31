@@ -1116,6 +1116,9 @@ def _notify_entry_filled_for_new_positions(before_keys, merged_keys, merged) -> 
             sym, pos.get("side"), qty, price,
         )
         try:
+            # 2026-09-14: 決済に必要な建玉の属性 (hold_id / 取引所 / 信用区分 /
+            #   口座区分) も渡す。これが無いと DB 行が side=BUY・hold_id なしに
+            #   なり、決済側が現物売りを送って 4001005 で失敗する。
             on_entry_filled(
                 symbol=sym,
                 symbolname=str(pos.get("symbolname") or ""),
@@ -1124,9 +1127,24 @@ def _notify_entry_filled_for_new_positions(before_keys, merged_keys, merged) -> 
                 price=price,
                 atr_1min=float(pos.get("atr_1min") or pos.get("atr") or 0.0),
                 order_id=str(pos.get("order_id") or pos.get("execution_id") or ""),
+                exchange=_osc_opt_int(pos.get("exchange")),
+                margin_trade_type=_osc_opt_int(pos.get("margin_trade_type")),
+                account_type=_osc_opt_int(pos.get("account_type")),
+                hold_id=str(pos.get("hold_id") or pos.get("HoldID") or pos.get("execution_id") or ""),
+                execution_id=str(pos.get("execution_id") or pos.get("ExecutionID") or ""),
             )
         except Exception:
             logger.exception("[ENTRY FILL HOOK] on_entry_filled raised symbol=%s", sym)
+
+
+def _osc_opt_int(v):
+    """建玉 dict の数値属性。無ければ None のまま (0 や 1 を勝手に補わない)。"""
+    try:
+        if v is None or str(v).strip() == "":
+            return None
+        return int(float(v))
+    except Exception:
+        return None
 
 
 def _osc_env_bool(name: str, default: bool = True) -> bool:

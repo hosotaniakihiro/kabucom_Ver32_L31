@@ -38,6 +38,27 @@ from trading.exit.exit_context_factory import create_exit_context
 logger = logging.getLogger("entry_fill_handler")
 
 
+def _to_db_side(side: str, *, margin_trade_type, hold_id) -> str:
+    """建玉 dict の side (BUY/SELL) を positions.db の側 (BUY_CREDIT/SELL_CREDIT) へ。
+
+    信用建玉の判定は trading/exit/order_sender._is_credit_position と同じ基準
+    (hold_id があるか margin_trade_type があるか)。現物なら BUY/SELL のまま。
+    """
+    s = str(side or "").strip().upper()
+    if s in {"BUY_CREDIT", "SELL_CREDIT"}:
+        return s
+    if s in {"LONG", "2"}:
+        s = "BUY"
+    elif s in {"SHORT", "1"}:
+        s = "SELL"
+    is_credit = bool(hold_id) or margin_trade_type not in (None, "", 0, "0")
+    if is_credit and s == "BUY":
+        return "BUY_CREDIT"
+    if is_credit and s == "SELL":
+        return "SELL_CREDIT"
+    return s or "BUY"
+
+
 # ============================================================
 # ENTRY 約定イベント（唯一の入口）
 # ============================================================
@@ -52,6 +73,11 @@ def on_entry_filled(
     atr_1min: float,
     order_id: str,
     filled_time: Optional[dt.datetime] = None,
+    exchange: Optional[int] = None,
+    margin_trade_type: Optional[int] = None,
+    account_type: Optional[int] = None,
+    hold_id: str = "",
+    execution_id: str = "",
 ):
     """
     ENTRY 約定後に必ず呼ばれる唯一の関数
@@ -72,14 +98,30 @@ def on_entry_filled(
         #   entry_id / entry_source / entry_mode / entry_reason /
         #   reason_code / technical_snapshot が未定義)。
         #   モデルを触ると他の読み書きに影響するため、ここでは渡さない。
+        # 2026-09-14 後場の実害: side=BUY / hold_id なしで書いた行を決済側が
+        #   ブローカー情報より優先して採用し、信用建玉に現物売り
+        #   (CashMargin=1) を送って 4001005 で失敗し続けた。
+        #   決済 (kabu_api.close._process_exit_core) は side が BUY_CREDIT /
+        #   SELL_CREDIT かつ hold_id があるときだけ信用返済 (CashMargin=3,
+        #   ClosePositions[].HoldID) を送る。HoldID は /positions の
+        #   ExecutionID と同じ値なので、建玉から来た execution_id で埋める。
+        #   朝の 4667 (ブローカー由来: BUY_CREDIT / hold_id=E2026... /
+        #   exchange=27 / margin_trade_type=3) と同じ形にする。
+        db_side = _to_db_side(side, margin_trade_type=margin_trade_type, hold_id=hold_id or execution_id)
+        db_hold_id = str(hold_id or execution_id or "") or None
         pos = Position(
             symbol=symbol,
             symbolname=symbolname,
-            side=side,
+            side=db_side,
             qty=qty,
             avg_price=price,
             entry_time=now,
             status="OPEN",
+            exchange=exchange,
+            margin_trade_type=margin_trade_type,
+            account_type=account_type,
+            hold_id=db_hold_id,
+            execution_id=str(execution_id or hold_id or "") or None,
         )
         session.add(pos)
         session.commit()
@@ -117,8 +159,8 @@ def on_entry_filled(
         # ----------------------------------------------------
 
         logger.info(
-            "✅ ENTRY FILLED %s %s qty=%s price=%.2f order_id=%s",
-            symbol, side, qty, price, order_id,
+            "✅ ENTRY FILLED %s %s qty=%s price=%.2f order_id=%s hold_id=%s exchange=%s margin_trade_type=%s",
+            symbol, db_side, qty, price, order_id, db_hold_id, exchange, margin_trade_type,
         )
 
     except Exception:
