@@ -18,7 +18,7 @@
 #        「テクニカル指標は 3 分足・5 分足の 5MA・25MA を使い、これをもとにエントリー」):
 #   BUY  : 終値 > 5MA > 25MA   (終値が両 MA の上、かつ 5MA が 25MA の上)
 #   SELL : 終値 < 5MA < 25MA
-#   3 分足 と 5 分足の **両方** で成立 (ALL)。1 分足は見ない。
+#   3 分足 または 5 分足 で成立 (ANY。9/15 夕に ALL から緩めた)。1 分足は見ない。
 #   env: MTF_MA_GATE_CONFIRM_MODE=ANY / MTF_MA_GATE_REQUIRE_ORDER=0 / MTF_MA_GATE_BASE_TF=1m
 #
 # データ:
@@ -45,7 +45,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1.3-MTF-GATE-LOCAL-BARS"
+VERSION = "V1.4-MTF-GATE-ANY-RSI80"
 
 _TF_MAP = {1: "1m", 3: "3m", 5: "5m"}
 _CACHE_TTL_SEC = 5.0
@@ -227,9 +227,9 @@ def _side_ok(vals: Dict[str, float], side: str, mas, tf_s: str, *, require_order
         if rsi != rsi:
             return False, f"{tf_s}:rsi_nan"
         if side == "BUY":
-            lo, hi = _env_f("MTF_GATE_RSI_BUY_MIN", 50.0), _env_f("MTF_GATE_RSI_BUY_MAX", 75.0)
+            lo, hi = _env_f("MTF_GATE_RSI_BUY_MIN", 50.0), _env_f("MTF_GATE_RSI_BUY_MAX", 80.0)  # 2026-09-15 夕: 75→80
         else:
-            lo, hi = _env_f("MTF_GATE_RSI_SELL_MIN", 25.0), _env_f("MTF_GATE_RSI_SELL_MAX", 50.0)
+            lo, hi = _env_f("MTF_GATE_RSI_SELL_MIN", 20.0), _env_f("MTF_GATE_RSI_SELL_MAX", 50.0)  # 2026-09-15 夕: 25→20
         if not (lo <= rsi <= hi):
             return False, f"{tf_s}:rsi {rsi:.1f} not in [{lo:.0f},{hi:.0f}]"
     if _env_bool("MTF_GATE_MACD_ENABLED", True):
@@ -274,7 +274,7 @@ def mtf_ma_gate(symbol: Any, side: Any, entry_row: Optional[Dict[str, Any]] = No
     base_tf_s = os.getenv("MTF_MA_GATE_BASE_TF", "").strip()
     base_tf = int(base_tf_s.rstrip("m")) if base_tf_s else 0
     confirm_tfs = tuple(int(str(x).rstrip("m")) for x in os.getenv("MTF_MA_GATE_CONFIRM_TFS", "3m,5m").split(",") if x.strip())
-    confirm_mode = os.getenv("MTF_MA_GATE_CONFIRM_MODE", "ALL").strip().upper()
+    confirm_mode = os.getenv("MTF_MA_GATE_CONFIRM_MODE", "ANY").strip().upper()  # 2026-09-15 夕: ALL→ANY (9/15 は 3m と 5m の両方成立が 261 件中 14 件)
     require_order = _env_bool("MTF_MA_GATE_REQUIRE_ORDER", True)
     allow_no_data = _env_bool("MTF_MA_GATE_ALLOW_NO_DATA", False)
 

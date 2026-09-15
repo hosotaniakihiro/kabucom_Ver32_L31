@@ -512,6 +512,14 @@ def _add_pending_core(entry: Dict) -> bool:
     new_bucket.append(entry)
     replace_bucket(sym, new_bucket)
 
+    # 2026-09-15: 候補銘柄を push_receiver プロセスへ渡す (PUSH 登録の優先対象にする)。
+    #   trading/entry/candidate_bridge.py。失敗しても pending 処理は止めない。
+    try:
+        from trading.entry.candidate_bridge import publish as _publish_candidates
+        _publish_candidates(list(global_data.pending_entries.keys()))
+    except Exception:
+        logger.debug("[CANDIDATE BRIDGE] publish skipped", exc_info=True)
+
     logger.info(
         "🧩 pending added symbol=%s source=%s side=%s interval=%s entry_type=%s score=%s bucket_size=%d identity=%s",
         sym,

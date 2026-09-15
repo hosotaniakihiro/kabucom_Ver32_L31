@@ -320,6 +320,11 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     "ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER": "10000000",
     "ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE": "200",
     "ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE": "0.90",
+    # 2026-09-15: 1 分足の方向確認ガード (close vs ma5/ma25 の構造・乖離) は
+    #   3 分/5 分足の MA/RSI/MACD ゲート (trading/filters/mtf_ma_gate) と役割が重複し、
+    #   ゲート通過後に 1 分の揺れで落としていた ([ENTRY DIRECTION SAFETY] BLOCK
+    #   original_guard_ng が 9/15 に多発)。既定で無効化。戻すときは env で 1。
+    "ENTRY_DIRECTION_CONFIRM_ENABLED": "0",
     "PULLBACK_ENTRY_ENABLED": "1",
     "PULLBACK_ENTRY_MAX_CANDIDATES": "5",
     "PULLBACK_ENTRY_LOT_RATIO": "0.5",

@@ -249,6 +249,24 @@ def _from_runtime_pending_orders() -> list[str]:
     return []
 
 
+def _from_candidate_bridge_file() -> list[str]:
+    """main.py が書いたエントリー候補 (trading/entry/candidate_bridge)。
+
+    2026-09-15: 候補は main.py のメモリにあり、この (push_receiver) プロセスからは
+    見えないため P2_PENDING_* が一日中 0 件だった。候補が登録 50 銘柄に入らず、
+    /board が 400 (未登録) を返して BOARD_MISSING、MTF ゲートもデータ無しになっていた。
+    """
+    try:
+        from trading.entry.candidate_bridge import load
+        syms = _dedupe(load())
+        if syms:
+            logger.info('[PROTECTED PUSH] candidate bridge symbols=%s', syms[:30])
+        return syms
+    except Exception:
+        logger.debug('[PROTECTED PUSH] candidate bridge load failed', exc_info=True)
+    return []
+
+
 def _priority_buckets() -> list[tuple[str, list[str]]]:
     """リスク順に保護銘柄を返す。前ほど優先。"""
     position_attrs = (
@@ -282,6 +300,7 @@ def _priority_buckets() -> list[tuple[str, list[str]]]:
         ('P1_POSITION_GLOBAL', _symbols_from_global_attrs(position_attrs, label='P1_POSITION')),
         ('P2_PENDING_RUNTIME', _from_runtime_pending_orders()),
         ('P2_PENDING_GLOBAL', _symbols_from_global_attrs(order_attrs, label='P2_PENDING')),
+        ('P2_CANDIDATE_FILE', _from_candidate_bridge_file()),
         ('P3_RECENT_ENTRY', _symbols_from_global_attrs(entry_attrs, label='P3_RECENT_ENTRY')),
         ('P4_AI_CANDIDATE', _symbols_from_global_attrs(ai_attrs, label='P4_AI')),
     ]
