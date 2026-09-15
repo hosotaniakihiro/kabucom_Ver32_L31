@@ -95,6 +95,54 @@ def _pin_nas_root_spelling() -> None:
 
 
 _install_local_pycache_prefix()
+
+
+# ============================================================
+# lightgbm が Smart App Control に止められた時のスタブ
+# ------------------------------------------------------------
+# 2026-09-15 08:34: lib_lightgbm.dll の読み込みが WinError 4551 (アプリケーション
+# 制御ポリシー) で失敗し、main.py が import 連鎖 (entry_controller ->
+# AI.entry_gate_tonosama -> import lightgbm) で起動できなかった。DLL は 7/29
+# から変わっておらず、前日までは読めていた (SAC の評価が変わった)。
+# lightgbm は推論モジュールが module レベルで import しているため、読めないと
+# 売買本体ごと落ちる。ここで先に試し、4551 なら Booster が例外を投げる
+# スタブを sys.modules に入れる。各 _load_model は例外を捕まえて
+# fallback (MODEL_MISSING_FAIL_OPEN 等) へ倒れるので、モデル無しと同じ挙動になる。
+# SAC 自体は勝手に切らない (ユーザー判断)。
+# ============================================================
+def _install_lightgbm_sac_stub() -> None:
+    if os.environ.get("DISABLE_LIGHTGBM_SAC_STUB", "").strip() in {"1", "true", "yes"}:
+        return
+    try:
+        import lightgbm  # noqa: F401
+        return
+    except OSError as e:
+        if getattr(e, "winerror", None) != 4551 and "4551" not in str(e):
+            return
+        reason = f"WinError 4551 (Smart App Control): {e}"
+    except Exception:
+        return
+
+    import types
+
+    class _BlockedBooster:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(f"lightgbm is unavailable: {reason}")
+
+    m = types.ModuleType("lightgbm")
+    m.__blocked__ = True
+    m.__blocked_reason__ = reason
+    m.__version__ = "0.0.0-sac-blocked"
+    for name in ("Booster", "Dataset", "LGBMClassifier", "LGBMRegressor", "LGBMModel", "LGBMRanker"):
+        setattr(m, name, _BlockedBooster)
+    for name in list(sys.modules):
+        if name == "lightgbm" or name.startswith("lightgbm."):
+            sys.modules.pop(name, None)
+    sys.modules["lightgbm"] = m
+    print(f"[SITECUSTOMIZE] lightgbm stubbed: {reason}", file=sys.stderr, flush=True)
+
+
+_install_lightgbm_sac_stub()
 _pin_nas_root_spelling()
 
 from nas_root import nas_path, nas_root

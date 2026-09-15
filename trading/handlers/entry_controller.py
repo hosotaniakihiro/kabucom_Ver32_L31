@@ -122,6 +122,8 @@ from trading.filters.volatility_filter import (
     atr_1m_filter as _atr_1m_filter_core,
     range_5m_filter as _range_5m_filter_core,
 )
+from trading.filters.mtf_ma_gate import mtf_ma_gate
+from trading.filters.mtf_score_gate import mtf_score_gate
 
 from trading.entry.lot_sizer import calculate_entry_quantity as _calculate_entry_quantity_base
 
@@ -1854,6 +1856,34 @@ def _build_scored_candidates(
                     continue
             except Exception:
                 logger.exception("RANGE_5M_FILTER failed symbol=%s", symbol)
+                continue
+
+            # 2026-09-15: 3 分足 / 5 分足の 5MA・25MA ゲート (全経路共通)。
+            #   SUMMARY 経路は 3m/5m の MA を見ていなかった (ランキング経路だけ
+            #   f864193 で入っていた)。ここは全 source が通る唯一の場所なので
+            #   ここで 1 回だけ判定する。データ無しは fail-closed。
+            #   詳細は trading/filters/mtf_ma_gate.py。
+            try:
+                _mtf_ok, _mtf_reason = mtf_ma_gate(symbol, side, entry_row)
+            except Exception:
+                logger.exception("MTF_MA_GATE failed symbol=%s (fail-closed)", symbol)
+                _mtf_ok, _mtf_reason = False, "MTF_MA_GATE_ERROR"
+            logger.info("[MTF MA GATE] symbol=%s side=%s ok=%s %s", symbol, side, _mtf_ok, _mtf_reason)
+            if not _mtf_ok:
+                _log_skip(symbol, "MTF_MA_GATE_NG", side=side, reason=_mtf_reason)
+                continue
+
+            # 2026-09-15: score_config.ini の点数を 3 分足 / 5 分足の指標で計算し直す
+            #   ゲート。両方の足で MIN (SUMMARY_ENTRY_MIN_SCORE=3.0) 以上が必要。
+            #   詳細は trading/filters/mtf_score_gate.py。
+            try:
+                _mts_ok, _mts_reason = mtf_score_gate(symbol, side)
+            except Exception:
+                logger.exception("MTF_SCORE_GATE failed symbol=%s (fail-closed)", symbol)
+                _mts_ok, _mts_reason = False, "MTF_SCORE_GATE_ERROR"
+            logger.info("[MTF SCORE GATE] symbol=%s side=%s ok=%s %s", symbol, side, _mts_ok, _mts_reason)
+            if not _mts_ok:
+                _log_skip(symbol, "MTF_SCORE_GATE_NG", side=side, reason=_mts_reason)
                 continue
 
             ai = _tonosama_bridge_ai_result(entry_row, ai_final_entry_check(entry_row))
