@@ -301,6 +301,46 @@ def _flag_builder_max_rows() -> int:
 
 
 def _attach_condition_flags(out: pd.DataFrame) -> pd.DataFrame:
+    """旧 builder (conditions_long/short) と追加フラグ (flag_builder_extra) を順に付ける。
+    旧 builder が行数上限などで skip しても追加フラグは必ず付ける。"""
+    out = _attach_condition_flags_legacy(out)
+    return _attach_extra_flags(out)
+
+
+def _attach_extra_flags(out: pd.DataFrame) -> pd.DataFrame:
+    # 2026-09-15: score_config.ini にあるのに一度も算出されなかった 60 個の
+    #   フラグ (クロス系 / 構造 / VWAP / 出来高 / 時間帯) をベクトル化して足す。
+    #   全行 (履歴込み) に対して groupby(symbol) で計算するので軽い。
+    #   trading/indicators/flag_builder_extra.py。SCORE_FLAG_EXTRA_ENABLED=0 で OFF。
+    if not isinstance(out, pd.DataFrame) or out.empty:
+        return out
+    if str(os.getenv("SCORE_FLAG_EXTRA_ENABLED", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        return out
+    if "datetime" not in out.columns or "symbol" not in out.columns:
+        return out
+    t1 = time.perf_counter()
+    try:
+        from trading.indicators.flag_builder_extra import build_extra_flags, EXTRA_FLAGS
+        extra = build_extra_flags(out)
+        if isinstance(extra, pd.DataFrame) and len(extra) == len(out):
+            # 追加フラグ列は毎回計算し直した値で置き換える (前 tick の値が入力に残るため)
+            extra_cols = [c for c in EXTRA_FLAGS if c in extra.columns]
+            new_cols = [c for c in extra_cols if c not in out.columns]
+            if new_cols:
+                out = pd.concat([out, extra[new_cols].reindex(out.index)], axis=1)
+            for c in extra_cols:
+                if c not in new_cols:
+                    out[c] = extra[c].reindex(out.index)
+            logger.warning(
+                "[SCORE FLAGS] extra attached rows=%s new_flag_cols=%s elapsed=%.2fs",
+                len(out), len(extra_cols), time.perf_counter() - t1,
+            )
+    except Exception:
+        logger.exception("[SCORE FLAGS] extra flags failed rows=%s", len(out))
+    return out
+
+
+def _attach_condition_flags_legacy(out: pd.DataFrame) -> pd.DataFrame:
     """score_config.ini の flag に対応する 0/1 列を DataFrame へ生やす。
 
     これが無いと score_breakdown が table_flags=180 / matched_flags=2 で
@@ -327,12 +367,18 @@ def _attach_condition_flags(out: pd.DataFrame) -> pd.DataFrame:
         # 246 銘柄 x 75 本 = 12,345 行)。全行に行ごと評価をかけると
         # 毎分処理を潰すので、ENTRY 判定に効く「銘柄あたり最新足」だけに絞る。
         try:
-            target = (
-                out.sort_values(["symbol", "datetime"], kind="stable")
-                .groupby("symbol", as_index=False)
-                .tail(1)
-            )
-            scope = "latest_per_symbol"
+            # 2026-09-15: 最新 1 本だけ渡すと conditions_long/short の「前の足との
+            #   比較」(ma5_ma25_cross / macd_gc など) が prev=None で一度も立たない。
+            #   銘柄あたり直近 SCORE_FLAG_HISTORY_BARS 本 (既定 3) を渡し、
+            #   最新足の行にだけ結果を取り込む (下の add.reindex)。
+            _hist_bars = max(1, int(os.getenv("SCORE_FLAG_HISTORY_BARS", "3") or 3))
+            _sorted = out.sort_values(["symbol", "datetime"], kind="stable")
+            target = _sorted.groupby("symbol", as_index=False).tail(_hist_bars)
+            scope = f"last{_hist_bars}_per_symbol"
+            if len(target) > limit and _hist_bars > 1:
+                # 履歴込みで上限を超えるなら、従来どおり最新 1 本に落として黙って捨てない
+                target = _sorted.groupby("symbol", as_index=False).tail(1)
+                scope = "latest_per_symbol"
         except Exception:
             logger.exception("[SCORE FLAGS] latest-per-symbol 抽出に失敗 rows=%s", n_before)
             return out
@@ -398,6 +444,7 @@ def _attach_condition_flags(out: pd.DataFrame) -> pd.DataFrame:
         "new_flag_cols=%s nonzero_cols=%s elapsed=%.2fs",
         len(out), scope, n_target, len(new_cols), nonzero, time.perf_counter() - t0,
     )
+
     return out
 
 

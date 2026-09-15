@@ -123,10 +123,22 @@ def _frame(tf: int) -> pd.DataFrame:
 
 def _completed_bar(symbol: str, tf: int, now: dt.datetime, entry_time: Optional[dt.datetime]) -> Optional[pd.Series]:
     """エントリー後に確定した最新の足。無ければ None。"""
-    df = _frame(tf)
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return None
-    rows = df[df["symbol"] == symbol]
+    rows = pd.DataFrame()
+    if _env_bool("MTF_TREND_EXIT_LOCAL_BARS", True):
+        try:
+            from trading.summary.mtf_local_bars import get_bars, is_stale
+            rows = get_bars(symbol, tf, now)
+            if isinstance(rows, pd.DataFrame) and not rows.empty and is_stale(rows, tf, now, max_age_bars=3.0):
+                # 足が止まっている (PUSH 登録から外れた) 間は判定しない。損切りは別途走る。
+                return None
+        except Exception:
+            logger.debug("[MTF TREND EXIT] local bars failed symbol=%s tf=%s", symbol, tf, exc_info=True)
+            rows = pd.DataFrame()
+    if not isinstance(rows, pd.DataFrame) or rows.empty:
+        df = _frame(tf)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        rows = df[df["symbol"] == symbol]
     if rows.empty:
         return None
     bar_len = dt.timedelta(minutes=tf)

@@ -238,6 +238,53 @@ def ranking_signal(row: dict) -> bool:
 
 
 # ------------------------------------------------------------
+def _derive_features(row: dict) -> dict:
+    """価格スケールに依存しない比率特徴量を row に足す (学習側 train_ranking_entry.py の
+    derive() と同じ名前・同じ式)。既にあるキーは上書きしない。"""
+    out = dict(row or {})
+
+    def f(k):
+        try:
+            v = float(out.get(k))
+            return v if not (math.isnan(v) or math.isinf(v)) else 0.0
+        except Exception:
+            return 0.0
+
+    close = f("close") or f("current_price") or f("price")
+
+    def gap(k):
+        v = f(k)
+        return (close / v - 1.0) if (v > 0 and close > 0) else 0.0
+
+    out.setdefault("ma5_gap", gap("ma5"))
+    out.setdefault("ma25_gap", gap("ma25"))
+    out.setdefault("ma75_gap", gap("ma75"))
+    m5, m25 = f("ma5"), f("ma25")
+    out.setdefault("ma5_ma25_gap", (m5 / m25 - 1.0) if (m5 > 0 and m25 > 0) else 0.0)
+    for k in ("macd", "signal", "hist"):
+        out.setdefault(f"{k}_pct", (f(k) / close) if close > 0 else 0.0)
+    out.setdefault("vwap_gap", gap("vwap"))
+    out.setdefault("log_volume", math.log1p(max(f("volume"), 0.0)))
+    if "minute_of_day" not in out:
+        try:
+            import datetime as _dt
+            dtv = out.get("datetime")
+            if not isinstance(dtv, _dt.datetime):
+                dtv = _dt.datetime.fromisoformat(str(dtv).replace("T", " ")[:19]) if dtv else _dt.datetime.now()
+            out["minute_of_day"] = dtv.hour * 60 + dtv.minute
+        except Exception:
+            out["minute_of_day"] = 0
+    return out
+
+
+def _legacy_signal_required() -> bool:
+    """旧 ma75_slope ベースの前段シグナルを必須にするか。
+    2026-09-15: ランキング行に ma75_slope が無いと常に NONE になり、entry_gate が
+    ranking_ai_mismatch で全件ブロックしてしまうため、既定では要求しない。"""
+    v = os.getenv("RANKING_AI_LEGACY_SIGNAL_REQUIRED", "0")
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def predict_entry(row: dict) -> dict:
     """
     ranking entry AI 推論
@@ -250,7 +297,9 @@ def predict_entry(row: dict) -> dict:
     # --------------------------------------------------------
     # ranking 最終シグナル（前段フィルタ）
     # --------------------------------------------------------
-    if not ranking_signal(row):
+    row = _derive_features(row)
+
+    if _legacy_signal_required() and not ranking_signal(row):
         return {
             "action": "NONE",
             "confidence": 0.0,

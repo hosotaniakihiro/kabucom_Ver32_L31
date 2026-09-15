@@ -45,7 +45,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1.2-MTF-GATE-3M5M-MA-RSI-MACD"
+VERSION = "V1.3-MTF-GATE-LOCAL-BARS"
 
 _TF_MAP = {1: "1m", 3: "3m", 5: "5m"}
 _CACHE_TTL_SEC = 5.0
@@ -141,6 +141,29 @@ def _tf_values(symbol: str, tf: int, entry_row: Optional[Dict[str, Any]]) -> Dic
             out["close"] = c
             for ma in ("ma5", "ma25", "ma75", "rsi", "macd", "signal", "hist"):
                 out[ma] = _f(entry_row.get(f"{ma}_{tf_s}"), float("nan"))
+            return out
+    # 2026-09-15: main.py の in-memory 3m/5m 履歴は指標が無く古い (午前 119 件全却下)。
+    #   ローカル push DB から作った足 (trading/summary/mtf_local_bars) を正とし、
+    #   無いときだけ GC 履歴へ落ちる。
+    if tf in (3, 5) and _env_bool("MTF_GATE_LOCAL_BARS", True):
+        try:
+            from trading.summary.mtf_local_bars import get_bars, is_stale, latest_bar
+            bars = get_bars(symbol, tf)
+            if isinstance(bars, pd.DataFrame) and not bars.empty and is_stale(bars, tf):
+                # PUSH 登録から外れて足が止まっている (朝の足しか無い) → データ無し扱いで却下
+                out["_src"] = "local_stale"
+                return out
+            r = latest_bar(symbol, tf)
+        except Exception:
+            logger.debug("[MTF MA GATE] local bars failed symbol=%s tf=%s", symbol, tf, exc_info=True)
+            r = None
+        if r is not None:
+            out["close"] = _f(r.get("close"))
+            for ma in ("ma5", "ma25", "ma75"):
+                out[ma] = _f(r.get(ma))
+            for k in ("rsi", "macd", "signal", "hist"):
+                out[k] = _f(r.get(k), float("nan"))
+            out["_src"] = "local"
             return out
     df = _latest_rows(tf)
     if isinstance(df, pd.DataFrame) and not df.empty and symbol in df.index:

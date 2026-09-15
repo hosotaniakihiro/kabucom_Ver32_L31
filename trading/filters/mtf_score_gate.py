@@ -118,8 +118,12 @@ def _tables() -> Dict[str, Dict[str, int]]:
     return _tables_cache
 
 
-def _score_row(row: pd.Series, side: str) -> Tuple[Optional[float], List[str]]:
-    """1 行にフラグを立てて ini の点数で合計する。None = 評価できない。"""
+def _score_row(row, side: str) -> Tuple[Optional[float], List[str]]:
+    """最新足にフラグを立てて ini の点数で合計する。None = 評価できない。
+
+    row は 1 行 (Series) か、直近数本の DataFrame (最終行を採点)。DataFrame で
+    渡すと旧 conditions_long/short のクロス系 (前の足との比較) も評価できる。
+    """
     try:
         from trading.indicators.flag_builder_buy import build_buy_flags
         from trading.indicators.flag_builder_sell import build_sell_flags
@@ -127,16 +131,17 @@ def _score_row(row: pd.Series, side: str) -> Tuple[Optional[float], List[str]]:
     except Exception:
         logger.exception("[MTF SCORE GATE] flag builder / scorer import failed")
         return None, []
-    one = pd.DataFrame([row])
+    frame = row.copy() if isinstance(row, pd.DataFrame) else pd.DataFrame([row])
+    sym_for_log = frame["symbol"].iloc[-1] if "symbol" in frame.columns and len(frame) else "?"
     try:
-        built = build_buy_flags(one.copy())
+        built = build_buy_flags(frame)
         built = build_sell_flags(built)
     except Exception:
-        logger.exception("[MTF SCORE GATE] flag build failed symbol=%s", row.get("symbol"))
+        logger.exception("[MTF SCORE GATE] flag build failed symbol=%s", sym_for_log)
         return None, []
     if not isinstance(built, pd.DataFrame) or built.empty:
         return None, []
-    r = built.iloc[0]
+    r = built.iloc[-1]
     t = _tables()
     if side == "BUY":
         entry_t, bonus_t = t.get("buy_entry", {}), t.get("buy_bonus", {})
@@ -166,12 +171,36 @@ def mtf_score_gate(symbol: Any, side: Any) -> Tuple[bool, str]:
     parts: List[str] = []
     ok_all = True
     for tf in _TFS:
-        df = _latest_frame(tf)
-        if not isinstance(df, pd.DataFrame) or df.empty or sym not in df.index:
-            ok_all = False
-            parts.append(f"{tf}m:no_bar")
-            continue
-        score, hits = _score_row(df.loc[sym], side_u)
+        row = None
+        if _env_bool("MTF_SCORE_LOCAL_BARS", True):
+            try:
+                from trading.summary.mtf_local_bars import get_bars, is_stale
+                bars = get_bars(sym, tf)
+                if isinstance(bars, pd.DataFrame) and not bars.empty and is_stale(bars, tf):
+                    # PUSH 登録から外れて足が止まっている銘柄。朝の足で判定しない。
+                    ok_all = False
+                    parts.append(f"{tf}m:stale({bars.iloc[-1]['datetime']})")
+                    continue
+                if isinstance(bars, pd.DataFrame) and not bars.empty:
+                    # ini の追加フラグ (クロス系・時間帯・構造) は履歴が要るので
+                    # 直近 30 本に対して立てて、最新足の行を採点する。
+                    try:
+                        from trading.indicators.flag_builder_extra import build_extra_flags
+                        bars = build_extra_flags(bars.tail(30).copy())
+                    except Exception:
+                        logger.debug("[MTF SCORE GATE] extra flags failed symbol=%s tf=%s", sym, tf, exc_info=True)
+                    # 旧 builder は行ごと評価で重いので直近 3 本だけ渡す (クロス判定には足りる)
+                    row = bars.tail(3)
+            except Exception:
+                logger.debug("[MTF SCORE GATE] local bars failed symbol=%s tf=%s", sym, tf, exc_info=True)
+        if row is None:
+            df = _latest_frame(tf)
+            if not isinstance(df, pd.DataFrame) or df.empty or sym not in df.index:
+                ok_all = False
+                parts.append(f"{tf}m:no_bar")
+                continue
+            row = df.loc[sym]
+        score, hits = _score_row(row, side_u)
         if score is None:
             ok_all = False
             parts.append(f"{tf}m:no_score")
