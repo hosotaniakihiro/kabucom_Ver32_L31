@@ -35,6 +35,7 @@ from trading.exit.exit_state_machine import manage_exit
 from trading.exit.exit_utils import safe_float
 from trading.exit.partial_profit_executor import execute_partial_profit
 from trading.exit.tonosama_exit_runner import apply_tonosama_exit_if_needed
+from trading.exit.mtf_trend_exit import judge_mtf_trend_exit, time_rules_enabled as _mtf_time_rules_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -453,6 +454,25 @@ def run_exit_for_position(*, symbol: str, pos: Dict[str, Any], now: dt.datetime,
         except Exception:
             cluster_id = 0
 
+        # 2026-09-15: 3 分足のトレンドで手仕舞う (エントリーを 3m/5m の指標で
+        #   判定するよう変えたのに合わせた)。損切りの後、利確判定の前。
+        #   エントリー時刻は約定時に作った ExitContext を優先する
+        #   (ブローカー由来の pos は entry_time が読み取り時刻になるため)。
+        try:
+            _mtf_entry_time = getattr(ctx, "entry_time", None)
+            if not isinstance(_mtf_entry_time, dt.datetime):
+                _mtf_entry_time = _fallback_entry_time(pos, now)
+            if getattr(_mtf_entry_time, "tzinfo", None) is not None:
+                _mtf_entry_time = _mtf_entry_time.replace(tzinfo=None)
+            _mtf_exit, _mtf_reason, _mtf_detail = judge_mtf_trend_exit(symbol=symbol, side=side, entry_time=_mtf_entry_time, now=now)
+        except Exception:
+            logger.exception("[MTF TREND EXIT] judge failed symbol=%s", symbol)
+            _mtf_exit, _mtf_reason, _mtf_detail = False, "", {}
+        if _mtf_exit:
+            logger.warning("[MTF TREND EXIT] EXIT symbol=%s detail=%s reason=%s", symbol, _mtf_detail, _mtf_reason)
+            finalize_exit(symbol=symbol, price=price, reason=_mtf_reason, cluster_id=cluster_id, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=ctx)
+            return True
+
         partial_exit, partial_reason, partial_detail = _judge_partial_profit_take(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=price, ctx=ctx)
         if partial_exit:
             logger.warning("[PARTIAL PROFIT] TAKE_CHECK symbol=%s detail=%s reason=%s", symbol, partial_detail, partial_reason)
@@ -470,7 +490,10 @@ def run_exit_for_position(*, symbol: str, pos: Dict[str, Any], now: dt.datetime,
             finalize_exit(symbol=symbol, price=price, reason=trail_reason, cluster_id=cluster_id, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=ctx)
             return True
 
-        three_min_exit, three_min_reason, three_min_detail, mark_attr, mark_set_name = _judge_three_min_exit_rules(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=price, ctx=ctx, now=now)
+        # 2026-09-15: 時間基準のルール (3 分ルール / 進展なし / 停滞) は
+        #   MTF trend exit が有効な間は評価しない (EXIT_TIME_RULES_ENABLED=1 で併用)。
+        _time_rules = _mtf_time_rules_enabled()
+        three_min_exit, three_min_reason, three_min_detail, mark_attr, mark_set_name = (False, "", {}, "", "") if not _time_rules else _judge_three_min_exit_rules(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=price, ctx=ctx, now=now)
         if three_min_exit:
             logger.warning("[THREE_MIN_EXIT_RULE] EXIT symbol=%s detail=%s reason=%s", symbol, three_min_detail, three_min_reason)
             if mark_attr and mark_set_name:
@@ -478,7 +501,7 @@ def run_exit_for_position(*, symbol: str, pos: Dict[str, Any], now: dt.datetime,
             finalize_exit(symbol=symbol, price=price, reason=three_min_reason, cluster_id=cluster_id, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=ctx)
             return True
 
-        early_exit, early_reason = judge_early_profit_guard(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=price, ctx=ctx, now=now, bar5s=bar5s)
+        early_exit, early_reason = (False, "") if not _time_rules else judge_early_profit_guard(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=price, ctx=ctx, now=now, bar5s=bar5s)
         if early_exit:
             finalize_exit(symbol=symbol, price=price, reason=early_reason, cluster_id=cluster_id, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=ctx)
             return True
