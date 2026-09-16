@@ -1885,6 +1885,26 @@ def _build_scored_candidates(
             if not _mts_ok:
                 _log_skip(symbol, "MTF_SCORE_GATE_NG", side=side, reason=_mts_reason)
                 continue
+            # 2026-09-16: AI ゲート (ai_final_entry_check) は 1 分足の score_buy/score_sell が
+            #   3.0 未満だと BUY_SCORE_LOW / BUY_COMPOSITE_LOW で落とす。RANKING 由来の行は
+            #   1 分足の ini 点数が小さい (5020: 0.74) ので、3m/5m ゲートを通っても AI ゲートで
+            #   止まっていた。判定の根拠を 3m/5m に揃えるため、3m と 5m の ini 点数の小さい方を
+            #   行の score_buy/score_sell (と score) に反映する (元の値より大きい時だけ)。
+            try:
+                from trading.filters.mtf_score_gate import last_scores as _mtf_last_scores
+                _sc = _mtf_last_scores(symbol, side)
+                if _sc:
+                    _mtf_min = float(min(_sc.values()))
+                    _key = "score_buy" if str(side).upper() == "BUY" else "score_sell"
+                    _cur = _safe_float(entry_row.get(_key), 0.0)
+                    if _mtf_min > _cur:
+                        entry_row[_key] = _mtf_min
+                        entry_row["score"] = max(_safe_float(entry_row.get("score"), 0.0), _mtf_min)
+                        entry_row["score_total"] = max(_safe_float(entry_row.get("score_total"), 0.0), _mtf_min)
+                        entry_row["mtf_ini_score"] = _mtf_min
+                        logger.info("[MTF SCORE GATE] row score lifted symbol=%s side=%s %s %.2f -> %.2f", symbol, side, _key, _cur, _mtf_min)
+            except Exception:
+                logger.debug("[MTF SCORE GATE] score lift failed symbol=%s", symbol, exc_info=True)
 
             ai = _tonosama_bridge_ai_result(entry_row, ai_final_entry_check(entry_row))
 

@@ -170,6 +170,7 @@ def mtf_score_gate(symbol: Any, side: Any) -> Tuple[bool, str]:
     need = min_score()
     parts: List[str] = []
     ok_all = True
+    _LAST_SCORES[f"{sym}|{side_u}"] = {}
     for tf in _TFS:
         row = None
         if _env_bool("MTF_SCORE_LOCAL_BARS", True):
@@ -207,9 +208,18 @@ def mtf_score_gate(symbol: Any, side: Any) -> Tuple[bool, str]:
             continue
         flag = "ok" if score >= need else "NG"
         parts.append(f"{tf}m:{flag} score={score:.1f} hits={hits[:8]}")
+        _LAST_SCORES.setdefault(f"{sym}|{side_u}", {})[f"{tf}m"] = float(score)
         if score < need:
             ok_all = False
     detail = f"min={need:.1f} " + " | ".join(parts)
     if ok_all:
         return True, f"MTF_SCORE_OK {detail}"
     return False, f"MTF_SCORE_NG {detail}"
+
+
+_LAST_SCORES: Dict[str, Dict[str, float]] = {}
+
+
+def last_scores(symbol: Any, side: Any) -> Dict[str, float]:
+    """直近の mtf_score_gate 判定で得た {"3m": score, "5m": score}。無ければ {}。"""
+    return dict(_LAST_SCORES.get(f"{_norm_symbol(symbol)}|{str(side or '').upper()}", {}))

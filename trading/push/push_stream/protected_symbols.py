@@ -351,6 +351,17 @@ def merge_protected_first(targets: Iterable[Any], *, max_symbols: int = 100) -> 
     protected = resolve_protected_push_symbols()
     normal = _symbols_from_any(targets)
     merged = _dedupe(list(protected) + list(normal))
+    # 2026-09-16: 上限は kabu Station の登録枠 (PUSH_REGISTER_MAX_KEEP=50) に揃える。
+    #   呼び出し側は DEFAULT_REGISTER_MAX_SYMBOLS=100 を渡してくるため、保護銘柄が
+    #   通常 50 と重ならないと merged=56 のように 50 を超え、rotation が A/B 2 面に
+    #   分割して 5 秒ごとに 39 銘柄を入れ替え → 4001019 が 106 回、受信 1,694 行/分
+    #   (前日 4,112) に落ちた (9/16 09:03〜09:44 実測)。
+    try:
+        keep = int(float(os.getenv("PUSH_REGISTER_MAX_KEEP", "50") or 50))
+    except Exception:
+        keep = 50
+    if keep > 0 and (max_symbols <= 0 or keep < max_symbols):
+        max_symbols = keep
     if max_symbols > 0:
         merged = merged[:max_symbols]
     logger.warning(
