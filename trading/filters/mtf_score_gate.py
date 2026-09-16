@@ -151,6 +151,10 @@ def _score_row(row, side: str) -> Tuple[Optional[float], List[str]]:
         return None, []
     s1, h1 = _score_flags_for_row(r, entry_t)
     s2, h2 = _score_flags_for_row(r, bonus_t)
+    if side == "SELL":
+        # ini の [sell_entry]/[sell_bonus] は負の点数で書かれている。candidates.py と同じく
+        # 絶対値で合計する (9/16 10:09 9130 SELL が score=-40 で NG になっていた)。
+        return abs(float(s1)) + abs(float(s2)), list(h1) + list(h2)
     return float(s1) + float(s2), list(h1) + list(h2)
 
 
