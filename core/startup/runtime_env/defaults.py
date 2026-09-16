@@ -325,6 +325,11 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     #   ゲート通過後に 1 分の揺れで落としていた ([ENTRY DIRECTION SAFETY] BLOCK
     #   original_guard_ng が 9/15 に多発)。既定で無効化。戻すときは env で 1。
     "ENTRY_DIRECTION_CONFIRM_ENABLED": "0",
+    # 2026-09-16: 「3分/5分足で MA5 を超えて 3 本目、かつ MA5 が順行」を要求するガード。
+    #   3m/5m ゲート (終値>5MA>25MA, RSI, MACD) を通った候補をさらに 9 分待たせ、
+    #   in-memory の古い 3m 履歴で判定していた (4075: closes [1473,1608,1618] で NG)。
+    #   9/16 午前、ゲート通過後の唯一の候補をこれが落とした。既定で無効化。
+    "ENTRY_MA5_THIRD_BAR_SLOPE_GUARD_ENABLED": "0",
     "PULLBACK_ENTRY_ENABLED": "1",
     "PULLBACK_ENTRY_MAX_CANDIDATES": "5",
     "PULLBACK_ENTRY_LOT_RATIO": "0.5",

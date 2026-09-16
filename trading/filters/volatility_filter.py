@@ -897,6 +897,62 @@ def _entry_row_range_ok(entry_row: Any, min_pct: float = DEFAULT_ENTRY_ROW_RANGE
 # entry_row compatibility mode
 # ==========================================================
 
+# ----------------------------------------------------------
+# 2026-09-16: ローカル push DB のティックから作る 1 分足での代替計算
+#   main.py の in-memory 1m 履歴は銘柄あたり 1 本しか無く、entry_row に atr /
+#   high / low が無い候補は「1m本数不足」→ ランキング救済 → NG に落ちていた
+#   (9/16 09:46〜09:58: 候補 20 件中 ATR 10 / RANGE 8 がこれ)。
+#   trading/summary/mtf_local_bars.get_bars(symbol, 1) で当日の 1 分足を作り、
+#   ATR(14) と直近 5 本の高安幅を出す。足が足りなければ None (従来経路へ)。
+# ----------------------------------------------------------
+def _local_1m_bars(symbol: str):
+    try:
+        from trading.summary.mtf_local_bars import get_bars, is_stale
+        bars = get_bars(symbol, 1)
+        if bars is None or bars.empty or is_stale(bars, 1, max_age_bars=3.0):
+            return None
+        return bars
+    except Exception:
+        logger.debug("[VOL FILTER] local 1m bars failed symbol=%s", symbol, exc_info=True)
+        return None
+
+
+def _local_atr_ratio(symbol: str) -> tuple[float, float, int] | None:
+    """(atr, price, bars) を返す。14 本分の TR が取れなければ None。"""
+    bars = _local_1m_bars(symbol)
+    if bars is None or len(bars) < 15:
+        return None
+    try:
+        h = pd.to_numeric(bars["high"], errors="coerce").to_numpy()
+        l = pd.to_numeric(bars["low"], errors="coerce").to_numpy()
+        c = pd.to_numeric(bars["close"], errors="coerce").to_numpy()
+        tr = [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, len(c))]
+        atr = float(sum(tr[-14:]) / 14)
+        price = float(c[-1])
+        if atr <= 0 or price <= 0:
+            return None
+        return atr, price, len(bars)
+    except Exception:
+        return None
+
+
+def _local_range_5m_ratio(symbol: str) -> tuple[float, float, float] | None:
+    """直近 5 本 (1 分足) の (high, low, close)。5 本無ければ None。"""
+    bars = _local_1m_bars(symbol)
+    if bars is None or len(bars) < 5:
+        return None
+    try:
+        t = bars.tail(5)
+        high = float(pd.to_numeric(t["high"], errors="coerce").max())
+        low = float(pd.to_numeric(t["low"], errors="coerce").min())
+        close = float(pd.to_numeric(t["close"], errors="coerce").iloc[-1])
+        if high <= 0 or low <= 0 or close <= 0:
+            return None
+        return high, low, close
+    except Exception:
+        return None
+
+
 def _atr_1m_filter_from_entry_row(entry_row: Any, min_ratio: float = DEFAULT_ATR_1M_MIN_RATIO) -> bool:
     """
     entry_controller.py 互換用。
@@ -929,6 +985,21 @@ def _atr_1m_filter_from_entry_row(entry_row: Any, min_ratio: float = DEFAULT_ATR
         if ok:
             return True
         return _ranking_move_rescue(entry_row, min_pct=min_ratio, label="atr_entry_row_low")
+
+    # 2026-09-16: entry_row に ATR が無ければ、まずローカル push DB の 1 分足で ATR(14)
+    if symbol:
+        loc = _local_atr_ratio(symbol)
+        if loc is not None:
+            atr_l, price_l, nbars = loc
+            ratio_l = atr_l / price_l
+            ok_l = ratio_l >= float(min_ratio)
+            logger.info(
+                "[VOL FILTER] ATR local_1m symbol=%s ok=%s atr=%.6f price=%.3f ratio=%.6f min_ratio=%.6f bars=%s",
+                symbol, ok_l, atr_l, price_l, ratio_l, min_ratio, nbars,
+            )
+            if ok_l:
+                return True
+            return _ranking_move_rescue(entry_row, min_pct=min_ratio, label="atr_local_1m_low")
 
     # ATRが無ければ global_data の1分足で旧ロジックを試す
     if symbol:
@@ -1258,6 +1329,21 @@ def _range_5m_filter_from_entry_row_core(entry_row: Any, min_pct: float = _BASE_
         if ok:
             return True
         return _ranking_move_rescue(entry_row, min_pct=min_pct, label="range_entry_row_low")
+
+    # 2026-09-16: entry_row に高安が無ければ、まずローカル push DB の 1 分足 5 本で判定
+    if symbol:
+        loc = _local_range_5m_ratio(symbol)
+        if loc is not None:
+            h_l, l_l, c_l = loc
+            ratio_l = (h_l - l_l) / c_l
+            ok_l = ratio_l >= float(min_pct)
+            logger.info(
+                "[VOL FILTER] RANGE local_5x1m symbol=%s ok=%s range=%.6f price=%.3f ratio=%.6f min_pct=%.6f",
+                symbol, ok_l, h_l - l_l, c_l, ratio_l, min_pct,
+            )
+            if ok_l:
+                return True
+            return _ranking_move_rescue(entry_row, min_pct=min_pct, label="range_local_low")
 
     if symbol:
         df_5m = _get_global_summary_df(5)
