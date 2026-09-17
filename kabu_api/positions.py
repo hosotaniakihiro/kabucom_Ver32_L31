@@ -294,11 +294,22 @@ def _sync_positions_from_kabus_core():
             account     = int(p.get("AccountType") or 0)
             exchange    = int(p.get("Exchange") or 1)
 
-            try:
-                entry_time = dt.datetime.strptime(
-                    p.get("ExecutionDateTime"), "%Y/%m/%d %H:%M:%S"
-                )
-            except Exception:
+            # 2026-09-17: kabu の ExecutionDateTime は ISO 形式 ("2026-09-17T10:10:16+09:00") で来ることがあり、
+            #   strptime が失敗して now() が入っていた (6590 の entry_time が再起動時刻 12:51 に化けた)。
+            entry_time = None
+            raw_dt = p.get("ExecutionDateTime")
+            for parser in (
+                lambda v: dt.datetime.strptime(v, "%Y/%m/%d %H:%M:%S"),
+                lambda v: dt.datetime.fromisoformat(str(v)).replace(tzinfo=None),
+                lambda v: dt.datetime.strptime(v[:19], "%Y-%m-%d %H:%M:%S"),
+            ):
+                try:
+                    entry_time = parser(raw_dt)
+                    break
+                except Exception:
+                    continue
+            parsed_ok = entry_time is not None
+            if entry_time is None:
                 entry_time = dt.datetime.now()
 
             # ------------------------------
@@ -329,10 +340,16 @@ def _sync_positions_from_kabus_core():
             # 既存建玉 UPDATE
             # ------------------------------
             pos = db_map[hold_id]
-            pos.qty               = qty
-            pos.avg_price         = avg_price
+            # 2026-09-17: 決済済み (LeavesQty=0) の行の qty を 0 に潰さない。建玉数量は損益計算に使う。
+            #   entry_time も既存の値があればそれを残す (broker 側の時刻が取れた時だけ上書き)。
+            if qty > 0:
+                pos.qty           = qty
+            elif not (pos.qty or 0):
+                pos.qty           = qty
+            pos.avg_price         = avg_price if avg_price > 0 else pos.avg_price
             pos.side              = side
-            pos.entry_time        = entry_time
+            if pos.entry_time is None or parsed_ok:
+                pos.entry_time    = entry_time
             pos.status            = "OPEN" if qty > 0 else "CLOSED"
             pos.exchange          = exchange
             pos.margin_trade_type = margin_type
