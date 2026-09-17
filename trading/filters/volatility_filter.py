@@ -63,13 +63,21 @@ logger = logging.getLogger(__name__)
 #   混ざって ATR が 10〜100 倍に膨らんでいた時期 (c629825 で修正) に調整された値。
 #   実値では 1 分 ATR は 0.05〜0.15% が普通で、9/15 は 517 件がここで落ちた
 #   (662 候補 → 発注 1 件)。実値ベースに合わせて下げる。
-_BASE_ATR_1M_MIN_RATIO = 0.0012
+# 2026-09-17: 0.12% → 0.20%。0.12% だと 3,000〜4,000 円台の銘柄は ATR が 1 ティック (5 円)
+#   でも通ってしまい、6590 (ATR 5 円 = 0.137%) のような「動いていない銘柄」に入った。
+#   併せてローカル 1 分足で ATR >= 3 ティックも要求する (VOL_FILTER_LOCAL_FIRST)。
+_BASE_ATR_1M_MIN_RATIO = 0.0020
+_BASE_ATR_1M_MIN_TICKS = 3.0
+# 当日レンジ (寄りからの高安 / 株価)。ローカル 1 分足の全本から計算する。
+_BASE_DAY_RANGE_MIN_PCT = 0.010
 
 # 直近5分高安幅 / 価格。
 # 旧 0.8% → 1.2% (2026 前半)。
 # 2026-09-15: 1.2% → 0.3%。上と同じ理由 (膨らんだ足で調整した値)。9/15 は 856 件が
 #   ここで落ちて最大の却下要因だった。
-_BASE_RANGE_5M_MIN_PCT = 0.003
+# 2026-09-17: 0.3% → 0.5%。entry_row の高安が「修復」で当日高安に置き換わり (6590: 0.14% → 4.5%)
+#   実質判定されていなかったので、ローカル 1 分足の直近 5 本で先に判定する。
+_BASE_RANGE_5M_MIN_PCT = 0.005
 
 # entry_row 単体の high-low / close。
 # summary行そのものが動いていない場合に落とす。
@@ -953,6 +961,80 @@ def _local_range_5m_ratio(symbol: str) -> tuple[float, float, float] | None:
         return None
 
 
+def _local_first_enabled() -> bool:
+    return _env_bool("VOL_FILTER_LOCAL_FIRST", True)
+
+
+def _tick_size_safe(price: float) -> float:
+    try:
+        t = float(get_tick_size(price))
+        return t if t > 0 else 1.0
+    except Exception:
+        return 1.0
+
+
+def _local_atr_strict(symbol: str) -> tuple[bool, str] | None:
+    """ローカル 1 分足で ATR を見る (2026-09-17)。None = 本数不足 (判定できない)。
+    条件: ATR/価格 >= VOL_FILTER_ATR_1M_MIN_RATIO かつ ATR >= VOL_FILTER_ATR_1M_MIN_TICKS ティック。"""
+    bars = _local_1m_bars(symbol)
+    min_bars = int(_env_float("VOL_FILTER_LOCAL_MIN_BARS", 6))
+    if bars is None or len(bars) < min_bars:
+        return None
+    try:
+        h = pd.to_numeric(bars["high"], errors="coerce").to_numpy()
+        l = pd.to_numeric(bars["low"], errors="coerce").to_numpy()
+        c = pd.to_numeric(bars["close"], errors="coerce").to_numpy()
+        tr = [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, len(c))]
+        tr = tr[-14:]
+        atr = float(sum(tr) / len(tr))
+        price = float(c[-1])
+    except Exception:
+        return None
+    if price <= 0:
+        return None
+    min_ratio = _env_float("VOL_FILTER_ATR_1M_MIN_RATIO", _BASE_ATR_1M_MIN_RATIO)
+    min_ticks = _env_float("VOL_FILTER_ATR_1M_MIN_TICKS", _BASE_ATR_1M_MIN_TICKS)
+    tick = _tick_size_safe(price)
+    ratio = atr / price
+    ok = ratio >= min_ratio and atr >= tick * min_ticks
+    detail = f"atr={atr:.3f} price={price:.1f} ratio={ratio:.5f} min_ratio={min_ratio:.5f} ticks={atr / tick:.1f} min_ticks={min_ticks:.0f} bars={len(bars)}"
+    return ok, detail
+
+
+def _local_range_strict(symbol: str, row: dict | None = None) -> tuple[bool, str] | None:
+    """ローカル 1 分足で 直近 5 本レンジ と 当日レンジ を見る (2026-09-17)。None = 本数不足。
+    当日レンジはローカル足が PUSH 登録以降しか無いので、entry_row の day_high/day_low
+    (kabu の当日高安) があれば大きい方を採る。"""
+    bars = _local_1m_bars(symbol)
+    if bars is None or len(bars) < 3:
+        return None
+    try:
+        hh = pd.to_numeric(bars["high"], errors="coerce")
+        ll = pd.to_numeric(bars["low"], errors="coerce")
+        cc = pd.to_numeric(bars["close"], errors="coerce")
+        t = bars.tail(5)
+        h5 = float(pd.to_numeric(t["high"], errors="coerce").max())
+        l5 = float(pd.to_numeric(t["low"], errors="coerce").min())
+        close = float(cc.iloc[-1])
+        day_h, day_l = float(hh.max()), float(ll.min())
+    except Exception:
+        return None
+    if close <= 0 or h5 <= 0 or l5 <= 0:
+        return None
+    min_5m = _env_float("VOL_FILTER_RANGE_5M_MIN_PCT", _BASE_RANGE_5M_MIN_PCT)
+    min_day = _env_float("VOL_FILTER_DAY_RANGE_MIN_PCT", _BASE_DAY_RANGE_MIN_PCT)
+    r5 = (h5 - l5) / close
+    rday = (day_h - day_l) / close if day_h > 0 and day_l > 0 else 0.0
+    if isinstance(row, dict):
+        rh = safe_float(_first(row, ("day_high", "DayHigh", "today_high", "high_price_day"), 0.0), 0.0)
+        rl = safe_float(_first(row, ("day_low", "DayLow", "today_low", "low_price_day"), 0.0), 0.0)
+        if rh > 0 and rl > 0 and rh >= rl:
+            rday = max(rday, (rh - rl) / close)
+    ok = r5 >= min_5m and rday >= min_day
+    detail = f"range5m={r5:.5f} min_5m={min_5m:.5f} day_range={rday:.5f} min_day={min_day:.5f} h5={h5:.1f} l5={l5:.1f} day_h={day_h:.1f} day_l={day_l:.1f} close={close:.1f} bars={len(bars)}"
+    return ok, detail
+
+
 def _atr_1m_filter_from_entry_row(entry_row: Any, min_ratio: float = DEFAULT_ATR_1M_MIN_RATIO) -> bool:
     """
     entry_controller.py 互換用。
@@ -968,6 +1050,17 @@ def _atr_1m_filter_from_entry_row(entry_row: Any, min_ratio: float = DEFAULT_ATR
       ただしランキング由来でranking_snapshotの新鮮な変動率が十分なら起動直後のみ救済する。
     """
     symbol, price, _, _, atr = _extract_basic_prices(entry_row)
+
+    # 2026-09-17: まずローカル push DB の 1 分足で判定する (entry_row の ATR は古い/膨らんでいることがある)。
+    #   本数が足りなければ (登録直後) 従来の経路へ。
+    if symbol and _local_first_enabled():
+        strict = _local_atr_strict(symbol)
+        if strict is not None:
+            ok_s, det = strict
+            logger.info("[VOL FILTER] ATR local_strict symbol=%s ok=%s %s", symbol, ok_s, det)
+            if ok_s:
+                return True
+            return _ranking_move_rescue(entry_row, min_pct=min_ratio, label="atr_local_strict_low")
 
     # entry_rowにATRがあればそれで判定
     if atr > 0 and price > 0:
@@ -1293,6 +1386,19 @@ def _range_5m_filter_from_entry_row(entry_row: Any, min_pct: float = DEFAULT_RAN
     # ranking snapshot の実変動も十分なら、5m代替レンジによる二重ブロックを避ける。
     # ガード自体は緩和しない (両方満たす場合だけ通す)。
     from trading.filters import summary_ai_range_bridge as _range_bridge
+
+    # 2026-09-17: まずローカル 1 分足で 直近 5 本レンジ + 当日レンジ を判定する。
+    #   entry_row の高安は「修復」で当日高安に置き換わることがあり (6590: 0.14%→4.5%)、
+    #   bridge / repair より前にここで決める。本数不足のときだけ従来経路へ。
+    if _local_first_enabled():
+        symbol_lf = _normalize_symbol(_row_to_dict(entry_row).get("symbol"))
+        strict = _local_range_strict(symbol_lf, _row_to_dict(entry_row)) if symbol_lf else None
+        if strict is not None:
+            ok_s, det = strict
+            logger.info("[VOL FILTER] RANGE local_strict symbol=%s ok=%s %s", symbol_lf, ok_s, det)
+            if ok_s:
+                return True
+            return _ranking_move_rescue(entry_row, min_pct=min_pct, label="range_local_strict_low")
 
     if _range_bridge.allow_by_1m_range_bridge(sys.modules[__name__], entry_row):
         return True
