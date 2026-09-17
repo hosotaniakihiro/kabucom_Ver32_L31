@@ -25,7 +25,7 @@ from typing import Iterable, List
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1.0-SUMMARY-DB-LOCAL-MIRROR"
+VERSION = "V1.1-SUMMARY-DB-LOCAL-MIRROR-TODAY-SNAPSHOT"
 _lock = threading.Lock()
 _RE_YMD = re.compile(r"summary(\d{8})\.db$", re.IGNORECASE)
 
@@ -53,14 +53,56 @@ def _is_today(path: str, today: dt.date | None = None) -> bool:
     return bool(ymd) and ymd == (today or dt.date.today()).strftime("%Y%m%d")
 
 
+def _today_snapshot_enabled() -> bool:
+    v = os.getenv("SUMMARY_DB_LOCAL_MIRROR_TODAY", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def snapshot_today(src: str) -> str:
+    """当日の summary DB (WAL で書き込み中) を db + wal ごとローカルへ写して読む。
+    2026-09-17 16:02〜16:06: NAS の当日 DB が "database is locked" で 3.5 分待たされて 0 本扱いになった。
+    起動時の読み取り専用 seed なので、数秒古いスナップショットで十分。60 秒以内の写しは使い回す。"""
+    try:
+        sp = Path(src)
+        if not sp.exists():
+            return src
+        d = mirror_dir() / "today"
+        d.mkdir(parents=True, exist_ok=True)
+        dst = d / sp.name
+        with _lock:
+            try:
+                if dst.exists() and (time.time() - dst.stat().st_mtime) < 60.0 and dst.stat().st_size > 0:
+                    return str(dst)
+            except Exception:
+                pass
+            t0 = time.time()
+            for suf in ("", "-wal"):
+                s_ = Path(str(sp) + suf)
+                if s_.exists():
+                    shutil.copyfile(str(s_), str(dst) + suf)
+                elif suf and Path(str(dst) + suf).exists():
+                    Path(str(dst) + suf).unlink()
+            shm = Path(str(dst) + "-shm")
+            if shm.exists():
+                shm.unlink()
+            os.utime(str(dst), None)
+            logger.warning("[SUMMARY DB MIRROR] today snapshot %s -> %s bytes=%s elapsed=%.1fs", sp, dst, dst.stat().st_size, time.time() - t0)
+            return str(dst)
+    except Exception:
+        logger.warning("[SUMMARY DB MIRROR] today snapshot failed src=%s (NAS のまま読む)", src, exc_info=True)
+        return src
+
+
 def mirror_one(src: str, *, today: dt.date | None = None) -> str:
     """当日以外の summary DB をローカルへコピーし、ローカルのパスを返す。失敗時は元のパス。"""
     if not enabled():
         return src
     try:
         sp = Path(src)
-        if not sp.exists() or _is_today(src, today):
+        if not sp.exists():
             return src
+        if _is_today(src, today):
+            return snapshot_today(src) if _today_snapshot_enabled() else src
         # 既にローカル配下ならそのまま
         try:
             if sp.resolve().drive.upper() == "C:":
