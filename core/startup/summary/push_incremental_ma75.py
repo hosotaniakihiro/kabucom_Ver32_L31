@@ -191,6 +191,12 @@ def _resolve_summary_dbs(
         if len(out) >= max(int(lookback_days), 1):
             break
 
+    # 2026-09-17: 当日以外の DB はローカルへミラーしてから読む (tail read が 1 DB 75〜180 秒かかっていた)
+    try:
+        from trading.summary.summary_db_local_mirror import mirror_paths
+        out = mirror_paths(out)
+    except Exception:
+        logger.debug("[PUSH INCR MA75] local mirror skipped", exc_info=True)
     return out
 
 
