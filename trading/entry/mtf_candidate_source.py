@@ -11,7 +11,7 @@
 #   (+RSI/MACD) をもとにエントリー」なので、候補の出所も 3m/5m に寄せる。
 #
 # 動き:
-#   - main.py が MTF_CANDIDATE_SCAN_INTERVAL_SEC (既定 30 秒) ごとに scan() を呼ぶ
+#   - main.py が MTF_CANDIDATE_SCAN_INTERVAL_SEC (既定 60 秒) ごとに scan() を呼ぶ
 #   - 対象はローカル push DB に直近 MTF_CANDIDATE_ACTIVE_MIN 分以内のティックがある銘柄
 #     (= 今 PUSH 登録されている ≤50 銘柄)
 #   - BUY / SELL それぞれについて
@@ -26,7 +26,7 @@
 #
 # 環境変数:
 #   MTF_CANDIDATE_SOURCE_ENABLED   1/0 (既定 1)
-#   MTF_CANDIDATE_SCAN_INTERVAL_SEC 既定 30
+#   MTF_CANDIDATE_SCAN_INTERVAL_SEC 既定 60
 #   MTF_CANDIDATE_ACTIVE_MIN        既定 3  (直近何分にティックがある銘柄を対象にするか)
 #   MTF_CANDIDATE_FRESH_BARS        既定 4  (0 で鮮度条件なし)
 #   MTF_CANDIDATE_COOLDOWN_MIN      既定 10
@@ -373,7 +373,9 @@ def start_background_scanner() -> bool:
     if _THREAD_STARTED or not enabled():
         return False
     _THREAD_STARTED = True
-    interval = max(10.0, _env_float("MTF_CANDIDATE_SCAN_INTERVAL_SEC", 30.0))
+    # 2026-09-17 実測: 本番プロセス内では 1 走査 45〜75 秒 (94 銘柄、GIL 競合) で、走査中は
+    #   1 分 summary の tier1 が 2 秒→9 秒に伸びた。既定を 30→60 秒にして重なりを減らす。
+    interval = max(10.0, _env_float("MTF_CANDIDATE_SCAN_INTERVAL_SEC", 60.0))
 
     def _loop():
         # 起動直後は push DB がまだ薄いので少し待つ
