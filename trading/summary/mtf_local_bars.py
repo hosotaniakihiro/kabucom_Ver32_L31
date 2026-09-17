@@ -31,7 +31,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1.2-MTF-LOCAL-BARS-INCREMENTAL-TICKS"
+VERSION = "V1.3-MTF-LOCAL-BARS-RANKING-FALLBACK"
 
 _CACHE_TTL_SEC = 10.0
 _lock = threading.Lock()
@@ -68,20 +68,103 @@ def _norm_symbol(v) -> str:
 #   1 銘柄 130ms (fetchall + strptime) で、50 銘柄の走査が 10 秒かかっていた。
 #   最後に読んだ datetime 文字列より後だけを取り、結合して保持する。
 _tick_lock = threading.Lock()
-_tick_cache: Dict[Tuple[str, str], Tuple[str, pd.DataFrame]] = {}
+_tick_cache: Dict[Tuple[str, str, str], Tuple[str, pd.DataFrame]] = {}
 _TICK_CACHE_MAX_SYMBOLS = 400
 
 
-def _load_ticks(symbol: str, day: dt.date) -> pd.DataFrame:
+# ------------------------------------------------------------
+# 2026-09-17 (A): PUSH 未登録の銘柄はローカル ranking DB の 1 分スナップショット
+#   (ranking_snapshot_1min: 毎分・約 700 銘柄の現在値と累積出来高) から足を作る。
+#   PUSH 登録枠は 50 で、候補の大半 (9/17 午前は却下 74 件中 56 件) が「足なし」で
+#   落ちていた。高安は無いので open/high/low=close (ATR は終値ベースで控えめになる)。
+#   env: MTF_RANKING_FALLBACK_ENABLED=0 で無効。
+# ------------------------------------------------------------
+_RANKING_MIN_PUSH_TICKS = 5
+
+
+def _ranking_fallback_enabled() -> bool:
+    v = os.getenv("MTF_RANKING_FALLBACK_ENABLED", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _ranking_db_path_for(day: dt.date):
+    try:
+        from trading.ranking.ranking_db_location import ranking_db_path
+        p = ranking_db_path(day)
+        return p if p is not None and p.exists() else None
+    except Exception:
+        return None
+
+
+_ranking_index_tried: set = set()
+
+
+def _ensure_ranking_index(p) -> None:
+    """symbol, datetime の索引が無いと 1 銘柄 0.1 秒の全表走査になるので、日に 1 回だけ作る。"""
+    key = str(p)
+    if key in _ranking_index_tried:
+        return
+    _ranking_index_tried.add(key)
+    try:
+        con = sqlite3.connect(str(p), timeout=2.0)
+        try:
+            con.execute("PRAGMA busy_timeout=2000")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_rs1_symbol_datetime ON ranking_snapshot_1min(symbol, datetime)")
+            con.commit()
+        finally:
+            con.close()
+        logger.info("[MTF LOCAL BARS] ranking index ensured %s", p)
+    except Exception:
+        logger.debug("[MTF LOCAL BARS] ranking index create failed %s", p, exc_info=True)
+
+
+def _load_ranking_raw(symbol: str, day: dt.date, since: str, *, exclusive: bool) -> Optional[pd.DataFrame]:
+    """ranking_snapshot_1min を tick 風の (datetime, price, volume, _raw_dt) にして返す。失敗は None。"""
+    p = _ranking_db_path_for(day)
+    if p is None:
+        return None
+    _ensure_ranking_index(p)
+    op = ">" if exclusive else ">="
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=1.0)
+        try:
+            con.execute("PRAGMA busy_timeout=1000")
+            df = pd.read_sql_query(
+                "SELECT datetime, current_price AS price, trading_volume AS volume FROM ranking_snapshot_1min "
+                f"WHERE symbol=? AND datetime {op} ? ORDER BY datetime",
+                con, params=(symbol, since),
+            )
+        finally:
+            con.close()
+    except Exception:
+        logger.debug("[MTF LOCAL BARS] ranking read failed symbol=%s path=%s", symbol, p, exc_info=True)
+        return None
+    if df.empty:
+        return df
+    # 同じ分に rank_type ごとの行が重複するので 1 行にする
+    df = df.drop_duplicates(subset=["datetime"], keep="last")
+    df["_raw_dt"] = df["datetime"].astype(str)
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+    return df.dropna(subset=["datetime", "price"])
+
+
+def _load_incremental(symbol: str, day: dt.date, source: str) -> pd.DataFrame:
+    """(銘柄, 日, 出所) ごとに増分で読んで結合・保持する。"""
     day_key = day.strftime("%Y%m%d")
+    key = (symbol, day_key, source)
     with _tick_lock:
-        hit = _tick_cache.get((symbol, day_key))
+        hit = _tick_cache.get(key)
     if hit is None:
-        since_raw = day.strftime("%Y-%m-%dT09:00")
+        since_raw = day.strftime("%Y-%m-%dT09:00") if source == "push" else day.strftime("%Y-%m-%d 09:00")
         base = pd.DataFrame()
     else:
         since_raw, base = hit
-    new = _load_ticks_raw(symbol, day, since_raw, exclusive=hit is not None)
+    if source == "ranking":
+        new = _load_ranking_raw(symbol, day, since_raw, exclusive=hit is not None)
+    else:
+        new = _load_ticks_raw(symbol, day, since_raw, exclusive=hit is not None)
     if new is None or new.empty:
         return base
     df = pd.concat([base, new], ignore_index=True) if not base.empty else new
@@ -90,11 +173,49 @@ def _load_ticks(symbol: str, day: dt.date) -> pd.DataFrame:
     except Exception:
         last_raw = since_raw
     df = df.drop(columns=["_raw_dt"], errors="ignore")
+    try:
+        df.attrs["source"] = source
+    except Exception:
+        pass
     with _tick_lock:
         if len(_tick_cache) >= _TICK_CACHE_MAX_SYMBOLS:
             _tick_cache.clear()
-        _tick_cache[(symbol, day_key)] = (last_raw, df)
+        _tick_cache[key] = (last_raw, df)
     return df
+
+
+def _load_ticks(symbol: str, day: dt.date, now: Optional[dt.datetime] = None) -> pd.DataFrame:
+    """push のティックを使い、無い/止まっている銘柄は ranking の 1 分値にフォールバックする。
+    PUSH 登録から外れた銘柄は push の足が止まる (rotation) ので、最終ティックが
+    MTF_RANKING_FALLBACK_STALE_MIN 分 (既定 3) より古ければ ranking 側を見る。"""
+    push = _load_incremental(symbol, day, "push")
+    if not _ranking_fallback_enabled():
+        return push
+    now = now or dt.datetime.now()
+    use_ranking = False
+    if push is None or len(push) < _RANKING_MIN_PUSH_TICKS:
+        use_ranking = True
+    else:
+        try:
+            last = push["datetime"].iloc[-1]
+            last = last.to_pydatetime() if hasattr(last, "to_pydatetime") else last
+            stale_min = float(os.getenv("MTF_RANKING_FALLBACK_STALE_MIN", "3") or 3)
+            if now.date() == day and (now - last) > dt.timedelta(minutes=stale_min):
+                use_ranking = True
+        except Exception:
+            pass
+    if not use_ranking:
+        return push
+    rk = _load_incremental(symbol, day, "ranking")
+    if rk is None or len(rk) < 3:
+        return push
+    try:
+        if push is not None and len(push) >= _RANKING_MIN_PUSH_TICKS and rk["datetime"].iloc[-1] <= push["datetime"].iloc[-1]:
+            return push  # ranking も止まっているなら push のまま
+    except Exception:
+        pass
+    logger.info("[MTF LOCAL BARS] ranking fallback symbol=%s rows=%s push_ticks=%s", symbol, len(rk), 0 if push is None else len(push))
+    return rk
 
 
 def _load_ticks_raw(symbol: str, day: dt.date, since: str, *, exclusive: bool) -> Optional[pd.DataFrame]:
@@ -191,7 +312,7 @@ def get_bars(symbol, tf: int, now: Optional[dt.datetime] = None) -> pd.DataFrame
         hit = _cache.get(key)
         if hit and ts - hit[0] <= _CACHE_TTL_SEC:
             return hit[1]
-    ticks = _load_ticks(sym, now.date())
+    ticks = _load_ticks(sym, now.date(), now)
     if ticks.empty:
         bars = pd.DataFrame()
     else:
@@ -220,6 +341,10 @@ def get_bars(symbol, tf: int, now: Optional[dt.datetime] = None) -> pd.DataFrame
             bars[f"{k}_price"] = bars[k]
         bars["current_price"] = bars["close"]
         bars["completed"] = (bars["datetime"] + pd.Timedelta(minutes=tf)) <= now
+        try:
+            bars["bar_source"] = str(getattr(ticks, "attrs", {}).get("source") or "push")
+        except Exception:
+            bars["bar_source"] = "push"
     with _lock:
         _cache[key] = (ts, bars)
     return bars
