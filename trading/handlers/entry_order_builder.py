@@ -72,7 +72,15 @@ MAX_SPREAD_PCT_FOR_LIMIT = float(
 )
 
 MIN_ENTRY_QTY = 100
-SUMMARY_AGGRESSIVE_LIMIT_TICKS = int(float(os.getenv("SUMMARY_AGGRESSIVE_LIMIT_TICKS", "1")))
+SUMMARY_AGGRESSIVE_LIMIT_TICKS = int(float(os.getenv("SUMMARY_AGGRESSIVE_LIMIT_TICKS", "0")))
+# 2026-09-16 (C9): SUMMARY の初回発注は「自分側の気配」(BUY=bid / SELL=ask) に指値を置く。
+#   売り板に向けて買うと約定直後に含み損になるため、まず受け身で待ち、
+#   未約定キャンセル→再queue (summary_retry_round>=1) の時だけ従来どおり
+#   相手側気配 (BUY=ask / SELL=bid) + SUMMARY_AGGRESSIVE_LIMIT_TICKS へ寄せる。
+#   ENTRY_PASSIVE_LIMIT_ENABLED=0 で従来動作。ENTRY_PASSIVE_LIMIT_MODE=mid で
+#   仲値 (自分側に丸め) を使う。
+ENTRY_PASSIVE_LIMIT_ENABLED = os.getenv("ENTRY_PASSIVE_LIMIT_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+ENTRY_PASSIVE_LIMIT_MODE = os.getenv("ENTRY_PASSIVE_LIMIT_MODE", "near").strip().lower() or "near"
 SELL_CREDIT_LIMIT_DOWN_TICK_ENABLED = str(os.getenv("SELL_CREDIT_LIMIT_DOWN_TICK_ENABLED", "0")).lower() in {
     "1", "true", "yes", "y", "on",
 }
@@ -553,6 +561,32 @@ def _round_price(price: float, side: str) -> float:
     return math.floor(price / tick) * tick
 
 
+def _passive_limit_price(bid: float, ask: float, side: str) -> float:
+    """自分側の気配に置く指値 (BUY=bid / SELL=ask)。mode=mid なら仲値を自分側へ丸める。"""
+    side_u = str(side or "").upper()
+    b, a = float(bid), float(ask)
+    if ENTRY_PASSIVE_LIMIT_MODE == "mid" and b > 0 and a > 0:
+        mid = (b + a) / 2.0
+        tick = get_tick_size(mid)
+        # BUY は切り下げ (安い側)、SELL は切り上げ (高い側) = 自分に有利な側へ
+        return math.floor(mid / tick) * tick if side_u == "BUY" else math.ceil(mid / tick) * tick
+    near = b if side_u == "BUY" else a
+    tick = get_tick_size(near)
+    return math.floor(near / tick) * tick if side_u == "BUY" else math.ceil(near / tick) * tick
+
+
+def _passive_no_touch(entry_row: Any) -> bool:
+    """C9: 初回 (summary_retry_round==0) は相手側気配に触れない (=約定を待つ)。"""
+    return bool(ENTRY_PASSIVE_LIMIT_ENABLED and _passive_round_of(entry_row) <= 0)
+
+
+def _passive_round_of(entry_row: Any) -> int:
+    try:
+        return int(_entry_get(entry_row, "summary_retry_round", default=0) or 0)
+    except Exception:
+        return 0
+
+
 def _aggressive_limit_price(base_price: float, side: str, ticks: int = SUMMARY_AGGRESSIVE_LIMIT_TICKS) -> float:
     p = float(base_price)
     if p <= 0:
@@ -821,8 +855,37 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
                 price_source = "board_bid_ask_safe_limit"
                 if ALLOW_MARKET_IF_BAD_BOARD and spread_pct > MAX_SPREAD_PCT_FOR_LIMIT:
                     return _ng("SPREAD_TOO_WIDE", symbol=symbol, side=side, spread_pct=spread_pct, max_spread_pct=MAX_SPREAD_PCT_FOR_LIMIT, bid=bid, ask=ask)
-                price = _aggressive_limit_price(float(base_price), side)
+                retry_round = _passive_round_of(entry_row)
+                if ENTRY_PASSIVE_LIMIT_ENABLED and retry_round <= 0:
+                    # 初回は自分側の気配で待つ。未約定なら cancel watch -> retry rotation で
+                    # round が進み、次回はこの分岐を通らず相手側気配へ寄せる。
+                    base_price = ask if side == "SELL" else bid
+                    price = _passive_limit_price(float(bid), float(ask), side)
+                    price_source = f"board_passive_{ENTRY_PASSIVE_LIMIT_MODE}_limit"
+                    logger.warning(
+                        "[ENTRY PASSIVE LIMIT] symbol=%s side=%s bid=%s ask=%s spread_pct=%.3f -> price=%s mode=%s round=%s",
+                        symbol, side, bid, ask, spread_pct, price, ENTRY_PASSIVE_LIMIT_MODE, retry_round,
+                    )
+                else:
+                    price = _aggressive_limit_price(float(base_price), side)
+                    if ENTRY_PASSIVE_LIMIT_ENABLED:
+                        logger.warning(
+                            "[ENTRY PASSIVE LIMIT] retry -> aggressive symbol=%s side=%s bid=%s ask=%s price=%s round=%s",
+                            symbol, side, bid, ask, price, retry_round,
+                        )
                 order_type = "LIMIT"
+                # 発注方式(ASK+Ntick)の効果計測用: 発注時点の板とスプレッドを1行残す。
+                # source に side / aggressive_ticks / 発注価格 を埋め込み、
+                # 後で positions.avg_price(実約定単価) と突き合わせて初期含み損を算出する。
+                try:
+                    from trading.audit_logging.five_sec_market_audit import audit_spread_from_quotes
+                    audit_spread_from_quotes(
+                        symbol,
+                        board,
+                        source=f"ENTRY_SUMMARY_AI|{side}|t{SUMMARY_AGGRESSIVE_LIMIT_TICKS}|p{price}|{price_source}|r{retry_round}",
+                    )
+                except Exception:
+                    pass
         if not board:
             if ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY:
                 return _ng(
@@ -1818,6 +1881,14 @@ def _epi_improved_price(*, symbol: str, side: str, row: dict, detail: dict) -> t
 
     contrarian, contra_reason = _epi_is_contrarian(row, detail)
     strong, strong_reason = _epi_is_strong_trend(row, side)
+    # C9: 初回は相手側気配に触れない。BUY は ask-tick (ただし bid 以上)、SELL は bid+tick (ask 以下) が上限。
+    passive = _passive_no_touch(row)
+    if passive:
+        if side == "BUY":
+            price = min(bid + tick * max(0, normal_tick_offset), max(bid, ask - tick))
+            return _epi_round_to_tick(price, side="BUY"), "PASSIVE_NO_TOUCH_BID", "c9_passive_round0", {**board, "spread_pct": spread_pct, "tick": tick}
+        price = max(ask - tick * max(0, normal_tick_offset), min(ask, bid + tick))
+        return _epi_round_to_tick(price, side="SELL"), "PASSIVE_NO_TOUCH_ASK", "c9_passive_round0", {**board, "spread_pct": spread_pct, "tick": tick}
 
     if side == "BUY":
         if contrarian:
@@ -2754,12 +2825,13 @@ def _rfb_find_level_qty(levels: list[dict], price: float) -> float:
     return 0.0
 
 
-def _rfb_decide_price(board: dict, side: str) -> tuple[float, str, dict]:
+def _rfb_decide_price(board: dict, side: str, *, touch: bool | None = None) -> tuple[float, str, dict]:
     bid, ask = _rfb_safe_float(board.get("bid")), _rfb_safe_float(board.get("ask"))
     mid = (bid + ask) / 2.0
     t = _rfb_tick(mid)
     bids, asks = list(board.get("bids") or []), list(board.get("asks") or [])
-    touch = _rfb_env_bool("ENTRY_REST_FULL_BOARD_ALLOW_TOUCH_ASK_BID", True)
+    if touch is None:
+        touch = _rfb_env_bool("ENTRY_REST_FULL_BOARD_ALLOW_TOUCH_ASK_BID", True)
     if side == "BUY":
         lv = _rfb_thick(bids, bid)
         p = max(_rfb_safe_float(lv.get("price")) + t, bid + t)
@@ -2770,6 +2842,8 @@ def _rfb_decide_price(board: dict, side: str) -> tuple[float, str, dict]:
         p = min(_rfb_safe_float(lv.get("price")) - t, ask - t)
         p = max(p, bid if touch else min(ask, bid + t))
         mode = "REST_FULL_BOARD_SELL_THICK_ASK_MINUS_TICK"
+    if not touch:
+        mode += "_NO_TOUCH"
     n = int(_rfb_env_float("ENTRY_REST_FULL_BOARD_IMBALANCE_DEPTH", 5))
     return _rfb_round(p, side), mode, {"bid": bid, "ask": ask, "tick": t, "thick_level": lv, "bid_total_topN": _rfb_sum_qty(bids, n), "ask_total_topN": _rfb_sum_qty(asks, n), "depth": n}
 
@@ -2871,7 +2945,7 @@ def _rfb_double_check_ng(symbol: str, first_board: dict, side: str) -> dict | No
     return None
 
 
-def _rfb_patch_result(ret: dict, *, symbol: str, side: str, source: str) -> dict:
+def _rfb_patch_result(ret: dict, *, symbol: str, side: str, source: str, entry_row: Any = None) -> dict:
     if not isinstance(ret, dict) or not ret.get("ok") or not _rfb_source_enabled(source):
         return ret
     detail = ret.get("detail")
@@ -2906,9 +2980,15 @@ def _rfb_patch_result(ret: dict, *, symbol: str, side: str, source: str) -> dict
         detail["rest_full_board_double_check_warning"] = double_ng
 
     old = _rfb_safe_float(detail.get("price"))
-    new, mode, meta = _rfb_decide_price(board, side)
+    # C9: 初回は相手側気配に触れない (bid+tick を ask-tick で頭打ち)。再queue 後は従来どおり。
+    touch = None
+    if _passive_no_touch(entry_row):
+        touch = False
+    new, mode, meta = _rfb_decide_price(board, side, touch=touch)
     if new <= 0:
         return ret
+    detail["passive_no_touch"] = bool(touch is False)
+    detail["summary_retry_round"] = _passive_round_of(entry_row)
     detail["price_before_rest_full_board"] = old
     detail["price"] = new
     detail["base_price"] = new
@@ -2930,6 +3010,7 @@ def build_entry_order(*args, **kwargs):
             symbol=kwargs.get("symbol", ""),
             side=kwargs.get("side", ""),
             source=kwargs.get("source", ""),
+            entry_row=kwargs.get("entry_row"),
         )
     except Exception:
         logger.exception("[REST FULL BOARD] patch failed; keep original")

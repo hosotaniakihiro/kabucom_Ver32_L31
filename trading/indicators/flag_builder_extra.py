@@ -31,7 +31,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1.0-FLAG-BUILDER-EXTRA-INI-COVERAGE"
+VERSION = "V1.1-FLAG-BUILDER-EXTRA-BOARD-RANKING"
 
 # 生やすフラグ名 (ini のキーと同じ)。参照用。
 EXTRA_FLAGS: List[str] = [
@@ -60,6 +60,12 @@ EXTRA_FLAGS: List[str] = [
     "flag_macd_hist_contract", "flag_vwap_trend_down", "flag_volume_exhaustion",
     "flag_structure_lower_high", "flag_structure_lower_low", "flag_structure_break_down",
     "flag_structure_range_compression",
+    # 板 (ローカル push DB の depth がある足のみ)
+    "flag_bid_stack", "flag_ask_stack", "flag_bid_dominance", "flag_ask_dominance",
+    "flag_orderflow_imbalance", "flag_board_pressure_up", "flag_board_pressure_down",
+    # ランキング履歴 (ローカル ranking DB)
+    "flag_ranking_top10", "flag_ranking_good", "flag_ranking_persistent",
+    "flag_ranking_improving", "flag_ranking_reaccel",
 ]
 
 
@@ -217,6 +223,20 @@ def build_extra_flags(df: pd.DataFrame) -> pd.DataFrame:
     f["flag_vwap_reject"] = (c1 >= vwap1) & (c < vwap)
     f["flag_vwap_resistance"] = (c1 >= vwap1 * 0.999) & (c1 <= vwap1 * 1.003) & (c < vwap)
     f["flag_opening_range_fail"] = after_or & (c < or_lo)
+    # ---------------- 板 (ローカル push DB のティック depth がある足だけ) ----------------
+    if "bid_depth" in out.columns and "ask_depth" in out.columns:
+        bd, ad = _num(out, "bid_depth").fillna(0.0), _num(out, "ask_depth").fillna(0.0)
+        b1, a1 = _num(out, "bid1_qty").fillna(0.0), _num(out, "ask1_qty").fillna(0.0)
+        tot = (bd + ad).replace(0, np.nan)
+        imb = ((bd - ad) / tot).fillna(0.0)
+        f["flag_bid_stack"] = (bd >= ad * 2.0) & (bd > 0)
+        f["flag_ask_stack"] = (ad >= bd * 2.0) & (ad > 0)
+        f["flag_bid_dominance"] = (b1 >= a1 * 2.0) & (b1 > 0)
+        f["flag_ask_dominance"] = (a1 >= b1 * 2.0) & (a1 > 0)
+        f["flag_orderflow_imbalance"] = imb >= 0.4
+        f["flag_board_pressure_up"] = (bd > ad) & (b1 > a1)
+        f["flag_board_pressure_down"] = (ad > bd) & (a1 > b1)
+
     # ---------------- sell_bonus ----------------
     f["flag_macd_hist_contract"] = (hist < hist1) & (hist1 < 0)
     f["flag_vwap_trend_down"] = vwap_slope < 0
@@ -225,6 +245,16 @@ def build_extra_flags(df: pd.DataFrame) -> pd.DataFrame:
     f["flag_structure_lower_low"] = min5 < min5_5
     f["flag_structure_break_down"] = c < cmin20
     f["flag_structure_range_compression"] = rng20 < rng20_20 * 0.7
+
+    # ---------------- ランキング履歴 (ローカル ranking DB) ----------------
+    try:
+        rk = _ranking_flags_for(sym.unique().tolist())
+        if rk:
+            for name in ("flag_ranking_top10", "flag_ranking_good", "flag_ranking_persistent",
+                         "flag_ranking_improving", "flag_ranking_reaccel"):
+                f[name] = sym.map(lambda s_, n=name: bool(rk.get(s_, {}).get(n, False)))
+    except Exception:
+        logger.debug("[EXTRA FLAGS] ranking flags failed", exc_info=True)
 
     added = 0
     for name, ser in f.items():
@@ -240,3 +270,87 @@ def build_extra_flags(df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         pass
     return out
+
+
+# ------------------------------------------------------------
+# ランキング履歴フラグ (ローカル ranking DB の ranking_snapshot_1min)
+#   ranking_top10      : 直近スナップショットで rank <= 10 (どの rank_type でも)
+#   ranking_good       : 直近で rank <= 30
+#   ranking_persistent : 直近 10 分のうち 5 分以上ランク入り (rank <= 50)
+#   ranking_improving  : 直近の最良順位が 5 分前より上 (数字が小さい)
+#   ranking_reaccel    : 5 分前が 10 分前より悪化していて、直近が 5 分前より改善
+#   表に索引が無いので、直近 15 分だけを 60 秒に 1 回読んでキャッシュする。
+# ------------------------------------------------------------
+import datetime as _dt
+import sqlite3 as _sqlite3
+import threading as _threading
+
+_RK_LOCK = _threading.Lock()
+_RK_CACHE: Dict[str, Any] = {"ts": 0.0, "map": {}}
+
+
+def _ranking_db_path():
+    try:
+        from trading.ranking.ranking_db_location import ranking_db_path
+        p = ranking_db_path()
+        return p if p and p.exists() else None
+    except Exception:
+        return None
+
+
+def _ranking_flags_for(symbols) -> Dict[str, Dict[str, bool]]:
+    now = _dt.datetime.now()
+    with _RK_LOCK:
+        if now.timestamp() - float(_RK_CACHE.get("ts") or 0.0) <= 60.0:
+            m = _RK_CACHE.get("map") or {}
+            return {s: m[s] for s in symbols if s in m}
+    p = _ranking_db_path()
+    if p is None:
+        return {}
+    since = (now - _dt.timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        con = _sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=2.0)
+        try:
+            con.execute("PRAGMA busy_timeout=2000")
+            rows = con.execute(
+                "SELECT symbol, datetime, rank FROM ranking_snapshot_1min WHERE datetime >= ? AND rank IS NOT NULL",
+                (since,),
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        logger.debug("[EXTRA FLAGS] ranking db read failed", exc_info=True)
+        return {}
+    if not rows:
+        return {}
+    df = pd.DataFrame(rows, columns=["symbol", "datetime", "rank"])
+    df["symbol"] = df["symbol"].astype(str).str.replace(r"\.0$", "", regex=True)
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    df = df.dropna(subset=["datetime", "rank"])
+    if df.empty:
+        return {}
+    df["minute"] = df["datetime"].dt.floor("min")
+    best = df.groupby(["symbol", "minute"])["rank"].min().reset_index()
+    latest_min = best["minute"].max()
+    m: Dict[str, Dict[str, bool]] = {}
+    for s_, g in best.groupby("symbol"):
+        g = g.sort_values("minute")
+        cur = g[g["minute"] == latest_min]["rank"]
+        r_now = float(cur.iloc[0]) if len(cur) else None
+        r_5 = g[g["minute"] <= latest_min - pd.Timedelta(minutes=5)]["rank"]
+        r_5 = float(r_5.iloc[-1]) if len(r_5) else None
+        r_10 = g[g["minute"] <= latest_min - pd.Timedelta(minutes=10)]["rank"]
+        r_10 = float(r_10.iloc[-1]) if len(r_10) else None
+        recent = g[(g["minute"] > latest_min - pd.Timedelta(minutes=10)) & (g["rank"] <= 50)]
+        m[str(s_)] = {
+            "flag_ranking_top10": bool(r_now is not None and r_now <= 10),
+            "flag_ranking_good": bool(r_now is not None and r_now <= 30),
+            "flag_ranking_persistent": bool(recent["minute"].nunique() >= 5),
+            "flag_ranking_improving": bool(r_now is not None and r_5 is not None and r_now < r_5),
+            "flag_ranking_reaccel": bool(r_now is not None and r_5 is not None and r_10 is not None and r_5 > r_10 and r_now < r_5),
+        }
+    with _RK_LOCK:
+        _RK_CACHE["ts"] = now.timestamp()
+        _RK_CACHE["map"] = m
+    return {s: m[s] for s in symbols if s in m}

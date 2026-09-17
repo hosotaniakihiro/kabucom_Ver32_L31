@@ -330,6 +330,13 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     #   in-memory の古い 3m 履歴で判定していた (4075: closes [1473,1608,1618] で NG)。
     #   9/16 午前、ゲート通過後の唯一の候補をこれが落とした。既定で無効化。
     "ENTRY_MA5_THIRD_BAR_SLOPE_GUARD_ENABLED": "0",
+    # 2026-09-16 (C9): SUMMARY の初回指値は相手側気配に触れない (BUY=bid+tick を ask-tick で
+    #   頭打ち、SELL はその逆)。未約定キャンセル→再queue (round>=1) で従来の板タッチへ寄せる。
+    #   受け身で待つ分、未約定キャンセルまでの秒数を 4 → 8 に延ばす (再queue 後の
+    #   板タッチ注文は通常すぐ約定するので影響は小さい)。
+    "ENTRY_PASSIVE_LIMIT_ENABLED": "1",
+    "ENTRY_PASSIVE_LIMIT_MODE": "near",
+    "ENTRY_PASSIVE_CANCEL_AFTER_SEC": "8",
     "PULLBACK_ENTRY_ENABLED": "1",
     "PULLBACK_ENTRY_MAX_CANDIDATES": "5",
     "PULLBACK_ENTRY_LOT_RATIO": "0.5",

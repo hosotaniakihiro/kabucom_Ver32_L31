@@ -278,6 +278,39 @@ def send_kabu_close_order(
             "message": f"invalid qty: {qty}",
         }
 
+    # 2026-09-16: 同一銘柄に建玉が複数 (holds) あれば、建玉ごとに返済を送る。
+    #   kabu の ClosePositions は HoldID ごとに数量を指定するため、合算数量を 1 件の
+    #   HoldID で送ると失敗する。qty (合計) を holds の数量で頭から割り当てる。
+    holds = position.get("holds") if isinstance(position, dict) else None
+    if isinstance(holds, list) and len(holds) >= 2:
+        remaining = qty_i
+        results: list[dict[str, Any]] = []
+        for h in holds:
+            if remaining <= 0:
+                break
+            h_qty = _safe_int((h or {}).get("qty"), 0)
+            if h_qty <= 0:
+                continue
+            take = min(h_qty, remaining)
+            sub = dict(position)
+            sub["hold_id"] = (h or {}).get("hold_id") or (h or {}).get("execution_id") or sub.get("hold_id")
+            sub["execution_id"] = (h or {}).get("execution_id") or sub.get("execution_id")
+            sub.pop("holds", None)
+            sub["qty"] = take
+            r = send_kabu_close_order(symbol=symbol, close_side=close_side, qty=take, price=price,
+                                      reason=f"{reason}|hold={sub['hold_id']}", position=sub)
+            results.append(r)
+            remaining -= take
+        ok_all = bool(results) and all(bool(r.get("ok")) for r in results)
+        logger.info("[EXIT ORDER SENDER] multi-hold close symbol=%s holds=%d ok=%s order_ids=%s",
+                    symbol, len(results), ok_all, [r.get("order_id") for r in results])
+        return {
+            "ok": ok_all,
+            "order_id": ",".join(str(r.get("order_id") or "") for r in results),
+            "message": f"multi_hold:{len(results)}",
+            "results": results,
+        }
+
     pos_obj = _build_position_object(
         symbol=symbol,
         qty=qty_i,

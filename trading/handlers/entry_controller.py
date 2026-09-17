@@ -1776,6 +1776,13 @@ def _build_scored_candidates(
             if "source" not in entry_row or not entry_row.get("source"):
                 entry_row["source"] = entry.get("source")
 
+            # 2026-09-16 (C9): 未約定キャンセル→再queue の回数を entry_row に引き継ぐ。
+            #   entry_order_builder が round 0 は自分側気配 (受け身)、round>=1 は
+            #   相手側気配 (従来の攻め指値) を選ぶための材料。
+            for _rk in ("summary_retry_round", "summary_retry_prev_order_id", "retry_reprice_reason"):
+                if entry.get(_rk) is not None and entry_row.get(_rk) is None:
+                    entry_row[_rk] = entry.get(_rk)
+
             if _normalize_interval(entry_row.get("interval")) is None:
                 entry_row["interval"] = _normalize_interval(entry.get("interval"))
             else:

@@ -459,6 +459,32 @@ def read_kabu_open_positions(*, caller: str = "kabu_position_reader") -> Dict[st
                 LAST_QTY_SAMPLES.append({"symbol": symbol, "side": _pick(x, "Side", "side"), "qty_values": _qty_debug_sample(x)})
             continue
 
+        row_hold = {
+            "hold_id": _pick(x, "HoldID", "hold_id") or _pick(x, "ExecutionID", "execution_id"),
+            "execution_id": _pick(x, "ExecutionID", "execution_id"),
+            "qty": qty,
+            "price": avg_price,
+        }
+        if symbol in out:
+            # 2026-09-16: 同一銘柄に建玉が複数行ある (7013: 100+100, 5019: 100+200) と
+            #   後勝ちで qty が 1 行分になっていた。数量は合算・単価は加重平均にし、
+            #   建玉ごとの hold_id/qty を holds に残す (決済は holds を 1 件ずつ返済する)。
+            prev = out[symbol]
+            prev_qty = int(prev.get("qty") or 0)
+            new_qty = prev_qty + int(qty)
+            try:
+                prev_px = float(prev.get("avg_price") or 0.0)
+                w_px = (prev_px * prev_qty + float(avg_price) * int(qty)) / new_qty if new_qty > 0 else avg_price
+            except Exception:
+                w_px = avg_price
+            prev["qty"] = new_qty
+            prev["quantity"] = new_qty
+            prev["avg_price"] = w_px
+            prev["entry_price"] = w_px
+            prev["valuation"] = float(prev.get("valuation") or 0.0) + _pick_positive_float(x, VALUATION_KEYS, 0.0)
+            prev.setdefault("holds", []).append(row_hold)
+            continue
+
         out[symbol] = {
             "symbol": symbol,
             "symbolname": _pick(x, "SymbolName", "symbolname"),
@@ -477,6 +503,7 @@ def read_kabu_open_positions(*, caller: str = "kabu_position_reader") -> Dict[st
             "hold_id": _pick(x, "HoldID", "hold_id"),
             "execution_id": _pick(x, "ExecutionID", "execution_id"),
             "valuation": _pick_positive_float(x, VALUATION_KEYS, 0.0),
+            "holds": [row_hold],
             "_qty_source": qty_source,
             "_qty_detail": qty_detail,
             "_position_source": "KABU.positions.credit_only",

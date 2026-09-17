@@ -767,6 +767,13 @@ def main():
             _register_exit_scheduler()
         except Exception:
             logger.exception("register exit scheduler failed")
+        # 2026-09-16 (B6): 3 分足・5 分足の並びから直接候補を出す走査
+        #   (trading/entry/mtf_candidate_source.py、MTF_CANDIDATE_SOURCE_ENABLED=0 で停止)
+        try:
+            from trading.entry.mtf_candidate_source import start_background_scanner as _start_mtf_cand
+            _start_mtf_cand()
+        except Exception:
+            logger.exception("mtf candidate source start failed")
         _run_initial_summary_tick_once()
         _run_initial_ranking_tick_once()
         heartbeat("main", status="RUNNING")

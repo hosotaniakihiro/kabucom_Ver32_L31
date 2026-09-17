@@ -698,10 +698,32 @@ def init_engines() -> None:
     _Session_summary = sessionmaker(bind=_summary_engine)
 
     position_path = get_path("runtime_positions") / "positions.db"
+    # 2026-09-16: positions.db はローカルに書いて NAS/OneDrive へ複製する
+    #   (trading/position/positions_db_location.py)。NAS の SMB 劣化で開けなくなり
+    #   建玉の記録・保護・決済側の参照が落ちたため。ローカルに無ければ NAS から引き継ぐ。
+    try:
+        from trading.position import positions_db_location as _pdl
+        if _pdl.local_staging_enabled():
+            _pdl.bootstrap_local_from_nas()
+            position_path = _pdl.positions_db_path()
+            _pdl.start_background_sync()
+    except Exception:
+        logger.exception("[POSITION] local staging setup failed; use NAS path")
     _position_engine = _build_engine(position_path, Base_position, "POSITION")
     _Session_position = sessionmaker(bind=_position_engine)
 
     ranking_path = get_path("raw_ranking") / f"ranking{today}.db"
+    # 2026-09-16: ranking DB は 9/7 からローカル (LOCALAPPDATA/autostock/ranking) が正で
+    #   NAS (X:) は複製。ここだけ X: を向いたままで、起動時の build_monitor_symbols
+    #   (ranking_snapshot_1min を datetime desc で読む) が X: の遅延で 10 分以上止まり、
+    #   main.py が起動できなかった (14:16〜14:30 実測)。ローカルにあればそれを使う。
+    try:
+        from trading.ranking.ranking_db_location import ranking_db_path as _local_ranking_db_path
+        _lp = _local_ranking_db_path()
+        if _lp and _lp.exists():
+            ranking_path = _lp
+    except Exception:
+        logger.debug("[RANKING] local ranking db path resolve failed; use raw_ranking", exc_info=True)
     _ranking_engine = _build_engine(ranking_path, Base_ranking, "RANKING")
     _Session_ranking = sessionmaker(bind=_ranking_engine)
 

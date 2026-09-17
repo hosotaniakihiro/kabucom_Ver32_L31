@@ -889,6 +889,15 @@ def _register_once_with_content(symbols: Sequence[str], *, exchange: int = DEFAU
     payload = {"Symbols": make_symbol_objects(normalized, exchange=exchange)}
     ok, content = _http_json_request(url=url, method="PUT", payload=payload, api_key=api_key)
     logger.info("[SUB MANAGER] register done size=%d ok=%s content=%r", len(normalized), ok, content)
+    if not ok:
+        # 2026-09-16: 4001019 (一部の銘柄が登録できませんでした) は応答に銘柄が含まれない。
+        #   どの銘柄が弾かれたかを後から特定できるよう、送った銘柄を必ず残す
+        #   (次に成功した register の RegistList と突き合わせる)。
+        try:
+            logger.warning("[SUB MANAGER][REGISTER NG SYMBOLS] size=%d content=%r symbols=%s",
+                           len(normalized), content, sorted(normalized))
+        except Exception:
+            pass
     return ok, content
 
 

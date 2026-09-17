@@ -172,6 +172,16 @@ def reset_nas_root_cache_for_test() -> None:
 
 def default_ranking_db_path(trade_date: dt.date) -> str:
     ymd = trade_date.strftime("%Y%m%d")
+    # 2026-09-17 (A3): ranking DB は 9/7 からローカル (LOCALAPPDATA/autostock/ranking) が正で
+    #   NAS は複製。ここだけ X: を読んでいて、9/16 は ranking_job_all が場中 20〜170 秒、
+    #   引け後 900〜1200 秒 (NAS 劣化) かかっていた。ローカルにあればそれを使う。
+    try:
+        from trading.ranking.ranking_db_location import ranking_db_path
+        lp = ranking_db_path(trade_date)
+        if lp is not None and lp.exists():
+            return str(lp)
+    except Exception:
+        pass
     return _nas_root() + rf"\raw_data\kabu_station\ranking\ranking{ymd}.db"
 
 

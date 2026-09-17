@@ -31,7 +31,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1.0-MTF-LOCAL-BARS-FROM-PUSH-DB"
+VERSION = "V1.2-MTF-LOCAL-BARS-INCREMENTAL-TICKS"
 
 _CACHE_TTL_SEC = 10.0
 _lock = threading.Lock()
@@ -64,34 +64,92 @@ def _norm_symbol(v) -> str:
     return s
 
 
+# 2026-09-17: ティックは (銘柄, 日) ごとに増分で読む。全日分を毎回読み直すと
+#   1 銘柄 130ms (fetchall + strptime) で、50 銘柄の走査が 10 秒かかっていた。
+#   最後に読んだ datetime 文字列より後だけを取り、結合して保持する。
+_tick_lock = threading.Lock()
+_tick_cache: Dict[Tuple[str, str], Tuple[str, pd.DataFrame]] = {}
+_TICK_CACHE_MAX_SYMBOLS = 400
+
+
 def _load_ticks(symbol: str, day: dt.date) -> pd.DataFrame:
+    day_key = day.strftime("%Y%m%d")
+    with _tick_lock:
+        hit = _tick_cache.get((symbol, day_key))
+    if hit is None:
+        since_raw = day.strftime("%Y-%m-%dT09:00")
+        base = pd.DataFrame()
+    else:
+        since_raw, base = hit
+    new = _load_ticks_raw(symbol, day, since_raw, exclusive=hit is not None)
+    if new is None or new.empty:
+        return base
+    df = pd.concat([base, new], ignore_index=True) if not base.empty else new
+    try:
+        last_raw = str(new["_raw_dt"].iloc[-1])
+    except Exception:
+        last_raw = since_raw
+    df = df.drop(columns=["_raw_dt"], errors="ignore")
+    with _tick_lock:
+        if len(_tick_cache) >= _TICK_CACHE_MAX_SYMBOLS:
+            _tick_cache.clear()
+        _tick_cache[(symbol, day_key)] = (last_raw, df)
+    return df
+
+
+def _load_ticks_raw(symbol: str, day: dt.date, since: str, *, exclusive: bool) -> Optional[pd.DataFrame]:
+    """since より後 (exclusive=True なら「より大きい」) のティックを読む。失敗は None。"""
     p = _push_db_path(day)
     if p is None:
-        return pd.DataFrame()
-    since = day.strftime("%Y-%m-%dT09:00")
+        return None
+    op = ">" if exclusive else ">="
     try:
         con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=1.0)
         try:
             con.execute("PRAGMA busy_timeout=1000")
-            df = pd.read_sql_query(
-                "SELECT datetime, price, volume FROM stream_data_raw "
-                "WHERE symbol=? AND datetime >= ? ORDER BY datetime",
-                con, params=(symbol, since),
-            )
+            # 2026-09-16: 板の厚み (Buy1..10Qty / Sell1..10Qty) も取り、足の最終ティック時点の
+            #   気配残量を bid_depth / ask_depth / bid1_qty / ask1_qty として持たせる
+            #   (score_config.ini の bid_stack / ask_stack / board_pressure_* 用)。
+            buy_cols = ", ".join(f"Buy{i}Qty" for i in range(1, 11))
+            sell_cols = ", ".join(f"Sell{i}Qty" for i in range(1, 11))
+            try:
+                df = pd.read_sql_query(
+                    f"SELECT datetime, price, volume, {buy_cols}, {sell_cols} FROM stream_data_raw "
+                    f"WHERE symbol=? AND datetime {op} ? ORDER BY datetime",
+                    con, params=(symbol, since),
+                )
+            except Exception:
+                df = pd.read_sql_query(
+                    "SELECT datetime, price, volume FROM stream_data_raw "
+                    f"WHERE symbol=? AND datetime {op} ? ORDER BY datetime",
+                    con, params=(symbol, since),
+                )
         finally:
             con.close()
     except Exception:
         logger.debug("[MTF LOCAL BARS] tick read failed symbol=%s path=%s", symbol, p, exc_info=True)
-        return pd.DataFrame()
+        return None
     if df.empty:
         return df
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["_raw_dt"] = df["datetime"].astype(str)
+    try:
+        df["datetime"] = pd.to_datetime(df["datetime"], format="ISO8601", errors="coerce")
+    except Exception:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     try:
         df["datetime"] = df["datetime"].dt.tz_localize(None)
     except Exception:
         pass
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+    bq = [c for c in df.columns if c.startswith("Buy") and c.endswith("Qty")]
+    sq = [c for c in df.columns if c.startswith("Sell") and c.endswith("Qty")]
+    if bq and sq:
+        df["bid_depth"] = df[bq].apply(pd.to_numeric, errors="coerce").fillna(0.0).sum(axis=1)
+        df["ask_depth"] = df[sq].apply(pd.to_numeric, errors="coerce").fillna(0.0).sum(axis=1)
+        df["bid1_qty"] = pd.to_numeric(df.get("Buy1Qty"), errors="coerce").fillna(0.0)
+        df["ask1_qty"] = pd.to_numeric(df.get("Sell1Qty"), errors="coerce").fillna(0.0)
+        df = df.drop(columns=bq + sq)
     return df.dropna(subset=["datetime", "price"])
 
 
@@ -140,14 +198,18 @@ def get_bars(symbol, tf: int, now: Optional[dt.datetime] = None) -> pd.DataFrame
         t = ticks.set_index("datetime")
         slot = t.index.floor(f"{tf}min")
         g = t.groupby(slot)
-        bars = pd.DataFrame({
+        agg = {
             "open": g["price"].first(),
             "high": g["price"].max(),
             "low": g["price"].min(),
             "close": g["price"].last(),
             "cum_volume": g["volume"].max(),
             "tick_count": g["price"].count(),
-        })
+        }
+        for k in ("bid_depth", "ask_depth", "bid1_qty", "ask1_qty"):
+            if k in t.columns:
+                agg[k] = g[k].last()
+        bars = pd.DataFrame(agg)
         bars["volume"] = bars["cum_volume"].diff().fillna(bars["cum_volume"]).clip(lower=0)
         bars.index.name = "datetime"
         bars = bars.reset_index()
