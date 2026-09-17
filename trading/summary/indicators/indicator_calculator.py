@@ -1058,8 +1058,17 @@ def _read_summary_tail(db_path: str, table: str, symbols: tuple[str, ...], rows_
         return pd.DataFrame()
 
     frames: list[pd.DataFrame] = []
+    # 2026-09-17: この読みが 1 回 20〜100 秒 × 1 日 300 回 (合計 7 時間分) NAS を叩いていた。
+    #   原因は CAST(symbol AS TEXT) IN (...) + 全表の ROW_NUMBER で索引が効かず全表走査になること。
+    #   (1) 当日 DB はローカルのスナップショット (60 秒以内)、前日以前はローカルミラーを読む
+    #   (2) CAST を外して索引を使う (無ければ作る。ローカルなので安全)
     try:
-        with committing_connect(str(db_path), timeout=2.0) as conn:
+        from trading.summary.summary_db_local_mirror import mirror_one as _mirror_one
+        local_path = _mirror_one(str(db_path))
+    except Exception:
+        local_path = str(db_path)
+    try:
+        with committing_connect(str(local_path), timeout=2.0) as conn:
             conn.execute("PRAGMA busy_timeout=2000;")
             try:
                 cols = [str(r[1]) for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
@@ -1071,6 +1080,12 @@ def _read_summary_tail(db_path: str, table: str, symbols: tuple[str, ...], rows_
             dt_col = "datetime" if "datetime" in cols else ("time" if "time" in cols else None)
             if not sym_col or not dt_col:
                 return pd.DataFrame()
+            if str(local_path) != str(db_path):
+                try:
+                    conn.execute(f'CREATE INDEX IF NOT EXISTS "idx_{table}_sym_dt" ON "{table}"("{sym_col}", "{dt_col}")')
+                    conn.commit()
+                except Exception:
+                    logger.debug("[IND INTRADAY WARMUP] local index create failed table=%s", table, exc_info=True)
 
             for part in _prevday_chunks(symbols, 300):
                 placeholders = ",".join(["?"] * len(part))
@@ -1079,7 +1094,7 @@ def _read_summary_tail(db_path: str, table: str, symbols: tuple[str, ...], rows_
                     SELECT * FROM (
                         SELECT *, ROW_NUMBER() OVER(PARTITION BY "{sym_col}" ORDER BY "{dt_col}" DESC) AS __rn
                         FROM "{table}"
-                        WHERE CAST("{sym_col}" AS TEXT) IN ({placeholders})
+                        WHERE "{sym_col}" IN ({placeholders})
                     )
                     WHERE __rn <= ?
                     ORDER BY "{sym_col}", "{dt_col}"

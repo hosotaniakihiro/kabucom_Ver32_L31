@@ -54,7 +54,9 @@ def _is_today(path: str, today: dt.date | None = None) -> bool:
 
 
 def _today_snapshot_enabled() -> bool:
-    v = os.getenv("SUMMARY_DB_LOCAL_MIRROR_TODAY", "1").strip().lower()
+    # 2026-09-17 21:5x: 書き込み中の db+wal を素朴にコピーすると "database disk image is malformed" になった
+    #   (289MB/157MB の WAL が動いている最中)。当日は既定 OFF。使うなら sqlite backup API に置き換えること。
+    v = os.getenv("SUMMARY_DB_LOCAL_MIRROR_TODAY", "0").strip().lower()
     return v not in ("0", "false", "no", "off")
 
 
