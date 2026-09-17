@@ -16,7 +16,7 @@
 #     (= 今 PUSH 登録されている ≤50 銘柄)
 #   - BUY / SELL それぞれについて
 #       1) mtf_ma_gate (3m/5m の 終値>5MA>25MA + RSI + MACD、ANY)
-#       2) 鮮度: 3 分足の並びが直近 MTF_CANDIDATE_FRESH_BARS 本以内に成立した
+#       2) 鮮度: 3 分足の MACD クロス (MA 判定 ON なら並び) が直近 MTF_CANDIDATE_FRESH_BARS 本以内に成立した
 #          (ずっと成立している = 伸び切った銘柄を追わない)
 #       3) mtf_score_gate (score_config.ini の 3m/5m 点数)
 #     を通ったものを pending に入れる (source=SUMMARY_AI、既存の
@@ -172,14 +172,24 @@ def _in_cooldown(symbol: str, side: str, now_ts: float) -> bool:
 # ------------------------------------------------------------
 # 鮮度: 3 分足の並びが直近 N 本以内に成立したか
 # ------------------------------------------------------------
+def _ma_check_enabled() -> bool:
+    return _env_bool("MTF_MA_GATE_MA_CHECK_ENABLED", False)
+
+
 def _aligned(row: pd.Series, side: str) -> bool:
+    """「成立」の定義。MA 判定 ON なら 終値>5MA>25MA、OFF (2026-09-17 既定) なら MACD>シグナル。
+    ユーザー指示「終値 > 5MA > 25MA はあまり気にしないでほしい」に合わせ、鮮度は
+    MACD のクロス (BUY: macd>signal / SELL: macd<signal) が直近 N 本以内に起きたかで見る。"""
     try:
-        c, m5, m25 = float(row["close"]), float(row["ma5"]), float(row["ma25"])
+        if _ma_check_enabled():
+            c, m5, m25 = float(row["close"]), float(row["ma5"]), float(row["ma25"])
+            return c > m5 > m25 if side == "BUY" else c < m5 < m25
+        macd, sig = float(row["macd"]), float(row["signal"])
+        if macd != macd or sig != sig:
+            return False
+        return macd > sig if side == "BUY" else macd < sig
     except Exception:
         return False
-    if side == "BUY":
-        return c > m5 > m25
-    return c < m5 < m25
 
 
 def _fresh_alignment(symbol: str, side: str, now: dt.datetime, fresh_bars: int) -> Tuple[Optional[bool], str]:

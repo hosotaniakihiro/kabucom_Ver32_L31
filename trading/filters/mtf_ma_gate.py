@@ -45,7 +45,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1.4-MTF-GATE-ANY-RSI80"
+VERSION = "V1.5-MTF-GATE-RSI-MACD-ONLY"
 
 _TF_MAP = {1: "1m", 3: "3m", 5: "5m"}
 _CACHE_TTL_SEC = 5.0
@@ -198,8 +198,13 @@ def _side_ok(vals: Dict[str, float], side: str, mas, tf_s: str, *, require_order
     close = _f(vals.get("close"))
     if close <= 0:
         return None, f"{tf_s}:no_close"
+    # 2026-09-17 ユーザー指示「終値 > 5MA > 25MA はあまり気にしないでほしい」:
+    #   MA の判定 (終値 vs 各 MA、5MA/25MA の並び) は既定で見ない。RSI と MACD だけで判定する。
+    #   朝は 25MA が数本分しか無く、並びが揃う銘柄が少なくて候補が出なかった
+    #   (9/17 09:44 の走査で 160 件中 148 件が ma_gate_ng)。戻すときは env で 1。
+    ma_check = _env_bool("MTF_MA_GATE_MA_CHECK_ENABLED", False)
     checked = 0
-    for ma in mas:
+    for ma in (mas if ma_check else ()):
         mav = _f(vals.get(ma))
         if mav <= 0:
             continue
@@ -208,9 +213,9 @@ def _side_ok(vals: Dict[str, float], side: str, mas, tf_s: str, *, require_order
             return False, f"{tf_s}:{ma} c={close:.1f}<={mav:.1f}"
         if side == "SELL" and close >= mav:
             return False, f"{tf_s}:{ma} c={close:.1f}>={mav:.1f}"
-    if checked == 0:
+    if ma_check and checked == 0:
         return None, f"{tf_s}:no_ma"
-    if require_order and "ma5" in mas and "ma25" in mas:
+    if ma_check and require_order and "ma5" in mas and "ma25" in mas:
         m5, m25 = _f(vals.get("ma5")), _f(vals.get("ma25"))
         if m5 > 0 and m25 > 0:
             if side == "BUY" and m5 <= m25:
@@ -245,8 +250,16 @@ def _side_ok(vals: Dict[str, float], side: str, mas, tf_s: str, *, require_order
                 return False, f"{tf_s}:macd {macd:.2f}<=0"
             if side == "SELL" and macd >= 0:
                 return False, f"{tf_s}:macd {macd:.2f}>=0"
+    # MA 判定 OFF のときも「並びが崩れている」ことは detail に残す (注意してエントリーする材料)
+    caution = ""
+    if not ma_check:
+        m5, m25 = _f(vals.get("ma5")), _f(vals.get("ma25"))
+        if m5 > 0 and m25 > 0:
+            aligned = (close > m5 > m25) if side == "BUY" else (close < m5 < m25)
+            if not aligned:
+                caution = " ma_caution"
     return True, (
-        f"{tf_s}:ok c={close:.1f} ma5={_f(vals.get('ma5')):.1f} ma25={_f(vals.get('ma25')):.1f}"
+        f"{tf_s}:ok{caution} c={close:.1f} ma5={_f(vals.get('ma5')):.1f} ma25={_f(vals.get('ma25')):.1f}"
         f" rsi={_f(vals.get('rsi'), float('nan')):.1f} macd={_f(vals.get('macd'), float('nan')):.2f}/{_f(vals.get('signal'), float('nan')):.2f}"
     )
 

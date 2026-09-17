@@ -334,6 +334,9 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     #   頭打ち、SELL はその逆)。未約定キャンセル→再queue (round>=1) で従来の板タッチへ寄せる。
     #   受け身で待つ分、未約定キャンセルまでの秒数を 4 → 8 に延ばす (再queue 後の
     #   板タッチ注文は通常すぐ約定するので影響は小さい)。
+    # 2026-09-17 ユーザー指示「終値 > 5MA > 25MA はあまり気にしないでほしい」:
+    #   3m/5m ゲートは RSI と MACD だけで判定し、MA の並びは見ない (1 で復活)。
+    "MTF_MA_GATE_MA_CHECK_ENABLED": "0",
     "ENTRY_PASSIVE_LIMIT_ENABLED": "1",
     "ENTRY_PASSIVE_LIMIT_MODE": "near",
     "ENTRY_PASSIVE_CANCEL_AFTER_SEC": "8",
