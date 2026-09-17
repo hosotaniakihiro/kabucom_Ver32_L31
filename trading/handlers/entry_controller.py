@@ -4960,6 +4960,13 @@ def _range_5m_filter_low_move(entry_row=None, *args, **kwargs):
             return allow
         if not bool(allow):
             return False
+        # 2026-09-17: ローカル 1 分足の厳格判定 (ATR/5分/当日レンジ) を通った行は、
+        #   1 分足 1 本の高安で見る low_movement_guard を重ねない (7014 が range_too_small 0.2%<0.6% で落ちた)。
+        try:
+            if isinstance(entry_row, dict) and entry_row.get("_vol_local_strict_ok"):
+                return True
+        except Exception:
+            pass
         from trading.entry.low_movement_guard import _apply_all_entry_guards
 
         return _apply_all_entry_guards(entry_row)

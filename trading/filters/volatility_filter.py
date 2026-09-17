@@ -66,7 +66,8 @@ logger = logging.getLogger(__name__)
 # 2026-09-17: 0.12% → 0.20%。0.12% だと 3,000〜4,000 円台の銘柄は ATR が 1 ティック (5 円)
 #   でも通ってしまい、6590 (ATR 5 円 = 0.137%) のような「動いていない銘柄」に入った。
 #   併せてローカル 1 分足で ATR >= 3 ティックも要求する (VOL_FILTER_LOCAL_FIRST)。
-_BASE_ATR_1M_MIN_RATIO = 0.0020
+# 2026-09-17 13:30: 0.20% → 0.15% (後場の 4588/3907 が落ちた。6590 の 0.107% は落ちたまま)
+_BASE_ATR_1M_MIN_RATIO = 0.0015
 _BASE_ATR_1M_MIN_TICKS = 3.0
 # 当日レンジ (寄りからの高安 / 株価)。ローカル 1 分足の全本から計算する。
 _BASE_DAY_RANGE_MIN_PCT = 0.010
@@ -77,7 +78,8 @@ _BASE_DAY_RANGE_MIN_PCT = 0.010
 #   ここで落ちて最大の却下要因だった。
 # 2026-09-17: 0.3% → 0.5%。entry_row の高安が「修復」で当日高安に置き換わり (6590: 0.14% → 4.5%)
 #   実質判定されていなかったので、ローカル 1 分足の直近 5 本で先に判定する。
-_BASE_RANGE_5M_MIN_PCT = 0.005
+# 2026-09-17 13:30: 0.5% → 0.35% (同上。6590 の 0.14% は落ちたまま)
+_BASE_RANGE_5M_MIN_PCT = 0.0035
 
 # entry_row 単体の high-low / close。
 # summary行そのものが動いていない場合に落とす。
@@ -1397,6 +1399,11 @@ def _range_5m_filter_from_entry_row(entry_row: Any, min_pct: float = DEFAULT_RAN
             ok_s, det = strict
             logger.info("[VOL FILTER] RANGE local_strict symbol=%s ok=%s %s", symbol_lf, ok_s, det)
             if ok_s:
+                try:
+                    if isinstance(entry_row, dict):
+                        entry_row["_vol_local_strict_ok"] = True
+                except Exception:
+                    pass
                 return True
             return _ranking_move_rescue(entry_row, min_pct=min_pct, label="range_local_strict_low")
 
