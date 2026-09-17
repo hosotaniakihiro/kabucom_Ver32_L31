@@ -340,6 +340,15 @@ def _low_move_hard_block_core(entry_row: Dict[str, Any], *, symbol: str, source:
         return None
     if not _source_uses_low_move_guard(source):
         return None
+    # 2026-09-17: volatility_filter のローカル 1 分足判定 (ATR/5分/当日レンジ) を通った行は、
+    #   1 分足 1 本の高安で見るこのガードを重ねない (8995: ATR 1.36%・5 分 4.8% なのに
+    #   直近 1 本 0.49% < 0.5% で LOW_MOVE_RANGE_TOO_SMALL になった)。
+    try:
+        if isinstance(entry_row, dict) and entry_row.get("_vol_local_strict_ok"):
+            logger.info("[LOW MOVE HARD BLOCK] skipped (local strict volatility ok) symbol=%s source=%s", symbol, source)
+            return None
+    except Exception:
+        pass
 
     row = entry_row or {}
     close = _safe_float(_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
