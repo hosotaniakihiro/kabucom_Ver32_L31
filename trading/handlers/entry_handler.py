@@ -271,7 +271,51 @@ def _col(conn: sqlite3.Connection, table: str, names: list[str]) -> str:
     return ""
 
 
+def _recent_liquidity_values_local(symbol: str, bars: int) -> dict[str, Any] | None:
+    """ローカル push DB の 1 分足 (trading/summary/mtf_local_bars) から直近 bars 本の出来高・売買代金。
+    2026-09-17: NAS の summary DB を CAST(symbol AS TEXT)=? で全表走査していて 1 銘柄 2 分かかり、
+    さらに列検出が空で required_columns_missing になって **全発注が止まっていた** (5574, 3907)。
+    ローカルに足があればそれで判定し、無いときだけ NAS へ落ちる。"""
+    try:
+        from trading.summary.mtf_local_bars import get_bars, is_stale
+        b = get_bars(symbol, 1)
+        if b is None or b.empty or is_stale(b, 1, max_age_bars=3.0):
+            return None
+        t = b.tail(max(1, int(bars)))
+        closes = [max(0.0, _f(x, 0.0)) for x in t["close"].tolist()]
+        volumes = [max(0.0, _f(x, 0.0)) for x in t["volume"].tolist()]
+        if not closes:
+            return None
+        latest_close, latest_volume = closes[-1], volumes[-1]
+        volume_sum = float(sum(volumes))
+        turnover_calc = float(sum(c * v for c, v in zip(closes, volumes) if c > 0 and v > 0))
+        return {
+            "ok_read": True,
+            "rows": len(t),
+            "summary_db": "local_push_1m",
+            "table": "mtf_local_bars",
+            "latest_dt": str(t["datetime"].iloc[-1]),
+            "latest_close": latest_close,
+            "latest_volume": latest_volume,
+            "latest_turnover": latest_close * latest_volume,
+            "volume_sum": volume_sum,
+            "turnover_sum": turnover_calc,
+            "turnover_raw_sum": 0.0,
+            "turnover_calc": turnover_calc,
+        }
+    except Exception:
+        logger.debug("[ENTRY FINAL LIQ GUARD] local read failed symbol=%s", symbol, exc_info=True)
+        return None
+
+
 def _recent_liquidity_values(symbol: str, bars: int) -> dict[str, Any]:
+    if symbol and _env_bool("ENTRY_HANDLER_RECENT_LIQ_LOCAL_FIRST", True):
+        loc = _recent_liquidity_values_local(symbol, bars)
+        if loc is not None:
+            return loc
+        if not _env_bool("ENTRY_HANDLER_RECENT_LIQ_NAS_FALLBACK", False):
+            # ローカルに足が無い = PUSH 未登録 (板も取れない)。NAS を 2 分かけて読みに行かない。
+            return {"ok_read": False, "reason": "local_bars_missing", "summary_db": "local_push_1m"}
     path = _summary_db_path()
     table = os.getenv("ENTRY_HANDLER_RECENT_LIQ_TABLE", os.getenv("SUMMARY_AI_LIQ_SUMMARY_TABLE", "stock_summary_1min"))
     if not symbol or not Path(path).exists():
@@ -287,7 +331,8 @@ def _recent_liquidity_values(symbol: str, bars: int) -> dict[str, Any]:
             if not sym or not tm or not cl or not vo:
                 return {"ok_read": False, "reason": "required_columns_missing", "summary_db": path, "table": table, "sym_col": sym, "tm_col": tm, "close_col": cl, "volume_col": vo}
             rows = conn.execute(
-                f'SELECT {tm}, {cl}, {vo}, {tv or "0"} FROM "{table}" WHERE CAST({sym} AS TEXT)=? ORDER BY {tm} DESC LIMIT ?',
+                # CAST(symbol AS TEXT)=? は索引が効かず NAS で全表走査になる (9/14 と同じ罠)
+                f'SELECT {tm}, {cl}, {vo}, {tv or "0"} FROM "{table}" WHERE {sym}=? ORDER BY {tm} DESC LIMIT ?',
                 (_norm_symbol(symbol), max(1, int(bars))),
             ).fetchall()
         if not rows:
@@ -337,10 +382,12 @@ def _final_recent_liquidity_ok_core(symbol: str, side: str) -> tuple[bool, str, 
         return False, "FINAL_LIQ_NO_RECENT_ROWS", detail
     if _f(v.get("latest_volume"), 0.0) < min_latest_volume:
         return False, f"FINAL_LIQ_LATEST_VOLUME_LOW:{_f(v.get('latest_volume'), 0.0):.0f}<{min_latest_volume:.0f}", detail
-    if _f(v.get("volume_sum"), 0.0) < min_volume:
-        return False, f"FINAL_LIQ_VOLUME_LOW:{_f(v.get('volume_sum'), 0.0):.0f}<{min_volume:.0f}", detail
-    if _f(v.get("turnover_sum"), 0.0) < min_turnover:
-        return False, f"FINAL_LIQ_TURNOVER_LOW:{_f(v.get('turnover_sum'), 0.0):.0f}<{min_turnover:.0f}", detail
+    # 2026-09-17: 株数と売買代金は「どちらか」で足りれば通す。3,000 円台の銘柄で 5 分 3 万株 (約 1 億円) を
+    #   要求すると、売買代金 1,300 万円/5 分の 5574 でも落ちてしまう。
+    vol_ok = _f(v.get("volume_sum"), 0.0) >= min_volume
+    tv_ok = _f(v.get("turnover_sum"), 0.0) >= min_turnover
+    if not vol_ok and not tv_ok:
+        return False, f"FINAL_LIQ_LOW:vol {_f(v.get('volume_sum'), 0.0):.0f}<{min_volume:.0f} and turnover {_f(v.get('turnover_sum'), 0.0):.0f}<{min_turnover:.0f}", detail
     return True, "FINAL_LIQ_OK", detail
 
 
