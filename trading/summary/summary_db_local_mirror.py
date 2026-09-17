@@ -101,6 +101,7 @@ def mirror_one(src: str, *, today: dt.date | None = None) -> str:
 
 
 def mirror_paths(paths: Iterable[str], *, today: dt.date | None = None) -> List[str]:
+    cleanup_old()
     return [mirror_one(p, today=today) for p in paths]
 
 
