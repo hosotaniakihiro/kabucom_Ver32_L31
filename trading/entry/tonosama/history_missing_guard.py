@@ -21,7 +21,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Optional, Any, Callable
 
 import pandas as pd
 
@@ -919,8 +919,38 @@ def _tzg_normalize_one_datetime(v: Any) -> Any:
         return pd.NaT
 
 
+def _tzg_vectorized(s: pd.Series) -> Optional[pd.Series]:
+    """まとめて変換できる場合はまとめて変換する (2026-09-17)。
+    旧実装は 1 要素ずつ pd.to_datetime を呼んでいて、起動時の summary 復元 (3 日分・十数万行) で
+    メインスレッドが GIL を握ったまま数十分回り、その間 1 分 summary もエントリー判定も遅くなっていた
+    (py-spy で _guess_datetime_format_for_array ← map_array を実測)。
+    tz 付きと tz 無しが混在して失敗したときだけ None を返し、従来の 1 要素ずつに落ちる。"""
+    try:
+        if s.empty:
+            return None
+        if pd.api.types.is_datetime64_any_dtype(s):
+            out = s
+        else:
+            try:
+                out = _ORIGINAL_TO_DATETIME(s, errors="coerce", format="ISO8601")
+            except Exception:
+                out = _ORIGINAL_TO_DATETIME(s, errors="coerce")
+        if not pd.api.types.is_datetime64_any_dtype(out):
+            return None  # object dtype = 混在。従来経路へ
+        tz = getattr(out.dt, "tz", None)
+        if tz is not None:
+            out = out.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
+        return out
+    except Exception:
+        return None
+
+
 def _tzg_normalize_dt_jst_naive_series(s: Any) -> pd.Series:
     try:
+        ser = s if isinstance(s, pd.Series) else pd.Series(s)
+        fast = _tzg_vectorized(ser)
+        if fast is not None:
+            return fast
         if isinstance(s, pd.Series):
             out = s.map(_tzg_normalize_one_datetime)
             return _ORIGINAL_TO_DATETIME(out, errors="coerce")
