@@ -193,7 +193,23 @@ def _load_ticks(symbol: str, day: dt.date, now: Optional[dt.datetime] = None) ->
         return push
     now = now or dt.datetime.now()
     use_ranking = False
-    if push is None or len(push) < _RANKING_MIN_PUSH_TICKS:
+    # 2026-09-18: push の「張り始め」を時間幅で見る。PUSH は登録上限 50 の
+    #   ローテーションなので、再登録直後はティックが数本しか無い。数本だと
+    #   3m/5m の足が 1〜2 本しか作れず、rolling(min_periods=1) で ma5==ma25 に
+    #   なり RSI も中立埋め (50.0) になる。ranking には 9:00 からの 1 分値が
+    #   全部あるので、幅が足りないうちはそちらから作る。
+    push_span_short = False
+    if push is not None and not push.empty:
+        try:
+            min_span = float(os.getenv("MTF_LOCAL_BARS_MIN_PUSH_SPAN_MIN", "30") or 30)
+            if min_span > 0:
+                _first = push["datetime"].iloc[0]
+                _last = push["datetime"].iloc[-1]
+                span_min = (_last - _first).total_seconds() / 60.0
+                push_span_short = span_min < min_span
+        except Exception:
+            push_span_short = False
+    if push is None or len(push) < _RANKING_MIN_PUSH_TICKS or push_span_short:
         use_ranking = True
     else:
         try:
@@ -210,11 +226,19 @@ def _load_ticks(symbol: str, day: dt.date, now: Optional[dt.datetime] = None) ->
     if rk is None or len(rk) < 3:
         return push
     try:
-        if push is not None and len(push) >= _RANKING_MIN_PUSH_TICKS and rk["datetime"].iloc[-1] <= push["datetime"].iloc[-1]:
+        # 2026-09-18: span 不足で ranking に来たときはここで push に戻さない。
+        #   ranking は 1 分刻みなので最終時刻は push より最大 1 分古く、
+        #   この条件だけだと必ず push (痩せた足) に戻ってしまう。
+        if (
+            push is not None
+            and not push_span_short
+            and len(push) >= _RANKING_MIN_PUSH_TICKS
+            and rk["datetime"].iloc[-1] <= push["datetime"].iloc[-1]
+        ):
             return push  # ranking も止まっているなら push のまま
     except Exception:
         pass
-    logger.info("[MTF LOCAL BARS] ranking fallback symbol=%s rows=%s push_ticks=%s", symbol, len(rk), 0 if push is None else len(push))
+    logger.info("[MTF LOCAL BARS] ranking fallback symbol=%s rows=%s push_ticks=%s span_short=%s", symbol, len(rk), 0 if push is None else len(push), push_span_short)
     return rk
 
 

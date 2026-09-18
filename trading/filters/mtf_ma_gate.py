@@ -231,6 +231,15 @@ def _side_ok(vals: Dict[str, float], side: str, mas, tf_s: str, *, require_order
         rsi = _f(vals.get("rsi"), float("nan"))
         if rsi != rsi:
             return False, f"{tf_s}:rsi_nan"
+        # 2026-09-18: indicator_short_history が足の足りない行の RSI を 50.0 で
+        #   埋める (rsi_light.fillna(50.0))。BUY の下限がちょうど 50 なので、
+        #   「計算できていない」行が下限すれすれで通過していた (9/18 の通過
+        #   11 件中 5 件)。ma5 == ma25 は rolling(min_periods=1) が同値 =
+        #   足が 1〜2 本しかない証拠。これは rsi_nan と同じく fail-closed。
+        if _env_bool("MTF_GATE_REJECT_NEUTRAL_RSI", True) and abs(rsi - 50.0) <= 1e-9:
+            _m5n, _m25n = _f(vals.get("ma5")), _f(vals.get("ma25"))
+            if _m5n > 0 and _m25n > 0 and abs(_m5n - _m25n) <= 1e-9:
+                return False, f"{tf_s}:rsi_neutral_fill ma5==ma25={_m5n:.1f}"
         if side == "BUY":
             lo, hi = _env_f("MTF_GATE_RSI_BUY_MIN", 50.0), _env_f("MTF_GATE_RSI_BUY_MAX", 80.0)  # 2026-09-15 夕: 75→80
         else:
