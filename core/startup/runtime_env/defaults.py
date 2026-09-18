@@ -355,6 +355,20 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     #   伸ばす側に分けられる。ただし 16 件で決めた値なので過学習ぎみ。
     #   運用しながら 5.5〜6.0 の範囲で見直すこと。
     "BLOWOFF_TREND_HOLD_DAY_UP_PCT": "5.5",
+    # 2026-09-18: PUSH ローテーションが 38 秒周期になり、1 グループ 50 銘柄が
+    #   4.8 秒しか観測されていなかった (観測率 12.6%)。原因は登録枠の想定が
+    #   100 なのに実際の母集団が 50 しかないこと:
+    #     min_keep = min(100, max_keep) = 100
+    #     merged (50 件) < min_keep (100) が常に成立
+    #     -> 毎サイクル active_symbol_manager / dynamic_providers / DB fallback が
+    #        全部走り、summary 参照と ranking/summary DB 読み込みで 30 秒以上かかる
+    #   kabu API の登録上限は 50 で、増枠は 2027 年 3 月予定。100 を集める意味が
+    #   無いので実態に合わせる。これで
+    #     - min_keep を満たすので重いフォールバックが走らない
+    #     - max_keep=50 なので _split_ab の B 側が空になり B サイクルも消える
+    #   戻すときは 100 / 100 に。
+    "PUSH_ROTATION_TARGET_MIN_KEEP": "50",
+    "PUSH_ROTATION_TARGET_MAX_KEEP": "50",
     "ENTRY_PASSIVE_LIMIT_ENABLED": "1",
     "ENTRY_PASSIVE_LIMIT_MODE": "near",
     "ENTRY_PASSIVE_CANCEL_AFTER_SEC": "8",
