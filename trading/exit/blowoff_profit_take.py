@@ -31,6 +31,13 @@ BLOWOFF_PROFIT_TAKE_ENABLED = str(os.getenv("BLOWOFF_PROFIT_TAKE_ENABLED", "1"))
 BLOWOFF_SMALL_QTY_FULL_TAKE_PCT = float(os.getenv("BLOWOFF_SMALL_QTY_FULL_TAKE_PCT", "0.20"))
 BLOWOFF_PARTIAL_TAKE_PCT = float(os.getenv("BLOWOFF_PARTIAL_TAKE_PCT", "0.25"))
 BLOWOFF_FULL_TAKE_PCT = float(os.getenv("BLOWOFF_FULL_TAKE_PCT", "0.45"))
+# 2026-09-18: confirm (吹きの確認) が取れないときの全量利確しきい値。
+#   5 秒足が main.py 側で作れず confirm が 1 日中 no_5sec_bar だったため、
+#   実質「確認なしで +0.45% 利確」になっていた。確認できないときは伸ばす。
+#   BLOWOFF_FULL_TAKE_PCT と同じ値にすれば従来の挙動に戻る。
+BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED = float(
+    os.getenv("BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED", "1.20")
+)
 BLOWOFF_SMALL_QTY_MAX = int(float(os.getenv("BLOWOFF_SMALL_QTY_MAX", "199")))
 BLOWOFF_PARTIAL_RATIO = float(os.getenv("BLOWOFF_PARTIAL_RATIO", "0.50"))
 
@@ -278,12 +285,17 @@ def apply_blowoff_profit_take(*, symbol: str, pos: Dict[str, Any], regime: int =
 
         blowoff_ok, blowoff_detail = _confirm_blowoff(symbol, side, bar if isinstance(bar, dict) else {})
 
-        # 大きく利益が乗った場合は、出来高/slope確認を待たずに利益保護を優先する。
-        if profit >= BLOWOFF_FULL_TAKE_PCT:
-            reason = f"BLOWOFF_FULL_TAKE profit={profit:.3f}%>=trigger={BLOWOFF_FULL_TAKE_PCT:.3f}% qty={qty} blowoff_confirm={blowoff_ok} detail={blowoff_detail}"
+        # 2026-09-18: しきい値を confirm の有無で分ける。
+        #   confirm OK = 出来高スパイク + 上昇 slope が取れている = 吹いている。
+        #     天井圏の可能性があるので従来どおり浅く (0.45%) 利確する。
+        #   confirm NG = 吹きが確認できない。ここで降りると 4052 のように
+        #     その後 +6.9% 伸びるのを取り逃すので、しきい値を上げて伸ばす。
+        full_take_pct = BLOWOFF_FULL_TAKE_PCT if blowoff_ok else BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED
+        if profit >= full_take_pct:
+            reason = f"BLOWOFF_FULL_TAKE profit={profit:.3f}%>=trigger={full_take_pct:.3f}% qty={qty} blowoff_confirm={blowoff_ok} detail={blowoff_detail}"
             logger.warning(
-                "[BLOWOFF PROFIT TAKE] FULL symbol=%s side=%s qty=%s entry=%.4f price=%.4f profit=%.3f%% confirm=%s detail=%s",
-                symbol, side, qty, entry, price, profit, blowoff_ok, blowoff_detail,
+                "[BLOWOFF PROFIT TAKE] FULL symbol=%s side=%s qty=%s entry=%.4f price=%.4f profit=%.3f%% trigger=%.3f%% confirm=%s detail=%s",
+                symbol, side, qty, entry, price, profit, full_take_pct, blowoff_ok, blowoff_detail,
             )
             finalize_exit(symbol=symbol, price=price, reason=reason, cluster_id=0, regime=regime, inago_state=0, pnl=_pnl(side, entry, price), collapse_prob=0.0, ctx=None)
             return True

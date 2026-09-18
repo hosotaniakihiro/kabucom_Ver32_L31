@@ -159,6 +159,147 @@ def _extract_price_from_tick(tick: Any) -> float:
     return 0.0
 
 
+# ------------------------------------------------------------
+# 2026-09-18: push DB から 5 秒足を自前で作る。
+#   five_sec_bar_builder は push_receiver プロセスで動くので、
+#   main.py 側の GC.monitor には 5 秒足が一生入らない (no_5sec_bar が
+#   1 日 180 回)。EXIT は main.py 側なので、ここで作る。
+# ------------------------------------------------------------
+_5S_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_5S_CACHE_TTL_SEC = 2.0
+
+
+def _5s_env_float(name: str, default: float) -> float:
+    try:
+        import os
+        v = os.getenv(name)
+        return float(v) if v not in (None, "") else float(default)
+    except Exception:
+        return float(default)
+
+
+def _5s_enabled() -> bool:
+    import os
+    v = str(os.getenv("EXIT_5SEC_BAR_FROM_PUSH_DB", "1")).strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def build_five_sec_bar_from_push_db(symbol: str) -> Dict[str, Any]:
+    """ローカル push DB のティックから直近の「完成した」5 秒足を作る。
+
+    返すキーは blowoff_profit_take が読むものに合わせる:
+      open / high / low / close / volume / avg_volume / datetime
+    volume は push の累積出来高の差分。作れなければ {}。
+    """
+    if not _5s_enabled():
+        return {}
+    symbol = normalize_symbol(symbol)
+    if not symbol:
+        return {}
+    now_ts = time.time()
+    hit = _5S_CACHE.get(symbol)
+    if hit and now_ts - hit[0] <= _5S_CACHE_TTL_SEC:
+        return dict(hit[1])
+
+    bar: Dict[str, Any] = {}
+    try:
+        import sqlite3
+        from trading.summary.mtf_local_bars import _push_db_path
+        p = _push_db_path()
+        if p is None:
+            return {}
+        lookback = max(20.0, _5s_env_float("EXIT_5SEC_BAR_LOOKBACK_SEC", 90.0))
+        since = (dt.datetime.now() - dt.timedelta(seconds=lookback)).isoformat()
+        con = sqlite3.connect("file:" + str(p) + "?mode=ro", uri=True, timeout=1.0)
+        try:
+            rows = con.execute(
+                "SELECT datetime, price, volume FROM stream_data "
+                "WHERE symbol=? AND datetime>=? ORDER BY datetime",
+                (symbol, since),
+            ).fetchall()
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        if not rows or len(rows) < 2:
+            return {}
+
+        # 5 秒バケットへ集約
+        buckets: Dict[int, Dict[str, Any]] = {}
+        for raw_dt, price, vol in rows:
+            try:
+                t = dt.datetime.fromisoformat(str(raw_dt)[:26])
+                px = float(price)
+                cum = float(vol) if vol is not None else 0.0
+            except Exception:
+                continue
+            if px <= 0:
+                continue
+            key = int(t.timestamp() // 5)
+            b = buckets.get(key)
+            if b is None:
+                buckets[key] = {"open": px, "high": px, "low": px, "close": px,
+                                "cum_first": cum, "cum_last": cum, "t": t}
+            else:
+                b["high"] = max(b["high"], px)
+                b["low"] = min(b["low"], px)
+                b["close"] = px
+                b["cum_last"] = cum
+                b["t"] = t
+        if not buckets:
+            return {}
+
+        keys = sorted(buckets)
+        # 今の 5 秒枠はまだ埋まっていないので 1 つ前の完成足を使う
+        cur_key = int(dt.datetime.now().timestamp() // 5)
+        done = [k for k in keys if k < cur_key]
+        if not done:
+            return {}
+        last_key = done[-1]
+
+        # 出来高は累積の差分。前の足の cum_last との差を採る。
+        def _bar_volume(k: int) -> float:
+            b = buckets[k]
+            idx = keys.index(k)
+            if idx > 0:
+                prev = buckets[keys[idx - 1]]
+                d = float(b["cum_last"]) - float(prev["cum_last"])
+                if d >= 0:
+                    return d
+            d = float(b["cum_last"]) - float(b["cum_first"])
+            return d if d >= 0 else 0.0
+
+        n_avg = int(max(1, _5s_env_float("EXIT_5SEC_BAR_AVG_BARS", 5.0)))
+        prev_done = [k for k in done if k != last_key][-n_avg:]
+        avg_volume = 0.0
+        if prev_done:
+            vals = [_bar_volume(k) for k in prev_done]
+            if vals:
+                avg_volume = sum(vals) / len(vals)
+
+        b = buckets[last_key]
+        bar = {
+            "open": b["open"],
+            "high": b["high"],
+            "low": b["low"],
+            "close": b["close"],
+            "volume": _bar_volume(last_key),
+            "avg_volume": avg_volume,
+            "datetime": b["t"].isoformat(),
+            "_source": "push_db_5s",
+        }
+    except Exception:
+        logger.debug("[5SEC BAR] push db build failed symbol=%s", symbol, exc_info=True)
+        return {}
+
+    if bar:
+        _5S_CACHE[symbol] = (now_ts, dict(bar))
+        if len(_5S_CACHE) > 512:
+            _5S_CACHE.clear()
+    return bar
+
+
 def get_five_sec_bar_safe(symbol: str) -> Dict[str, Any]:
     symbol = normalize_symbol(symbol)
     if not symbol:
@@ -189,7 +330,9 @@ def get_five_sec_bar_safe(symbol: str) -> Dict[str, Any]:
                     pass
     except Exception:
         logger.debug("[5SEC BAR] unavailable symbol=%s", symbol, exc_info=True)
-    return {}
+    # 2026-09-18: GC.monitor は push_receiver プロセス側にしか埋まらないので、
+    #   main.py 側ではここに来る。push DB から自前で作る。
+    return build_five_sec_bar_from_push_db(symbol)
 
 
 def extract_price_from_5sec_bar(bar: Dict[str, Any]) -> float:
