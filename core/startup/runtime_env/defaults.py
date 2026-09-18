@@ -337,6 +337,17 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     # 2026-09-17 ユーザー指示「終値 > 5MA > 25MA はあまり気にしないでほしい」:
     #   3m/5m ゲートは RSI と MACD だけで判定し、MA の並びは見ない (1 で復活)。
     "MTF_MA_GATE_MA_CHECK_ENABLED": "0",
+    # 2026-09-18 ユーザー指示「利確をすぐにするのではなく、利益が伸び反転したら
+    #   利確にしたい」: BLOWOFF_FULL_TAKE の +0.45% 全量利確を実質無効化し、
+    #   トレーリング (HIGH_0P2_TRAIL、高値から 0.2%) と建値ストップ (0.35%) に任せる。
+    #   9/18 の 16 件を 1 分値でシミュレーションした結果:
+    #     実績 (FULL_TAKE 0.45%)          +13,700 円
+    #     FULL_TAKE なし + トレール 0.2%  +20,900 円  ← 最良
+    #     FULL_TAKE なし + トレール 0.5%  +20,100 円
+    #   トレール幅は広げると銘柄ごとの改善と悪化が相殺するので 0.2% のまま。
+    #   戻すときは 0.45 / 1.20 に戻す。
+    "BLOWOFF_FULL_TAKE_PCT": "99.0",
+    "BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED": "99.0",
     "ENTRY_PASSIVE_LIMIT_ENABLED": "1",
     "ENTRY_PASSIVE_LIMIT_MODE": "near",
     "ENTRY_PASSIVE_CANCEL_AFTER_SEC": "8",
