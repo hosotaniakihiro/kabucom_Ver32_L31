@@ -975,6 +975,32 @@ def _tick_size_safe(price: float) -> float:
         return 1.0
 
 
+def _midday_scale() -> tuple[float, float, str]:
+    """昼の薄い時間帯は ATR しきい値を緩める (2026-09-18)。
+
+    戻り値: (ratio 係数, ticks 係数, ログ用ラベル)。帯の外なら (1.0, 1.0, "")。
+    9/18 の後場、13:10 以降 19 分間エントリーが 0 になった。却下の最多は
+    ATR_1M_FILTER_NG で、ratio=0.00138 / 0.00108 と 0.00150 に僅差で届かない
+    銘柄が並んでいた。昼は値動きが細るので、この帯だけしきい値を下げる。
+    """
+    if _env_float("VOL_FILTER_MIDDAY_ENABLED", 1.0) <= 0:
+        return 1.0, 1.0, ""
+    try:
+        now = dt.datetime.now().time()
+        s = str(os.environ.get("VOL_FILTER_MIDDAY_START", "") or "11:00").strip()
+        e = str(os.environ.get("VOL_FILTER_MIDDAY_END", "") or "14:00").strip()
+        sh, sm = [int(x) for x in s.split(":")[:2]]
+        eh, em = [int(x) for x in e.split(":")[:2]]
+        start = dt.time(sh, sm)
+        end = dt.time(eh, em)
+    except Exception:
+        return 1.0, 1.0, ""
+    if not (start <= now < end):
+        return 1.0, 1.0, ""
+    rs = _env_float("VOL_FILTER_MIDDAY_ATR_RATIO_SCALE", 0.8)
+    ts = _env_float("VOL_FILTER_MIDDAY_ATR_TICKS_SCALE", 0.75)
+    return rs, ts, " midday=%s-%s" % (s, e)
+
 def _local_atr_strict(symbol: str) -> tuple[bool, str] | None:
     """ローカル 1 分足で ATR を見る (2026-09-17)。None = 本数不足 (判定できない)。
     条件: ATR/価格 >= VOL_FILTER_ATR_1M_MIN_RATIO かつ ATR >= VOL_FILTER_ATR_1M_MIN_TICKS ティック。"""
@@ -996,10 +1022,14 @@ def _local_atr_strict(symbol: str) -> tuple[bool, str] | None:
         return None
     min_ratio = _env_float("VOL_FILTER_ATR_1M_MIN_RATIO", _BASE_ATR_1M_MIN_RATIO)
     min_ticks = _env_float("VOL_FILTER_ATR_1M_MIN_TICKS", _BASE_ATR_1M_MIN_TICKS)
+    # 2026-09-18: 昼の薄い帯だけ緩める。詳細は _midday_scale。
+    _r_scale, _t_scale, _midday_label = _midday_scale()
+    min_ratio = min_ratio * _r_scale
+    min_ticks = min_ticks * _t_scale
     tick = _tick_size_safe(price)
     ratio = atr / price
     ok = ratio >= min_ratio and atr >= tick * min_ticks
-    detail = f"atr={atr:.3f} price={price:.1f} ratio={ratio:.5f} min_ratio={min_ratio:.5f} ticks={atr / tick:.1f} min_ticks={min_ticks:.0f} bars={len(bars)}"
+    detail = f"atr={atr:.3f} price={price:.1f} ratio={ratio:.5f} min_ratio={min_ratio:.5f} ticks={atr / tick:.1f} min_ticks={min_ticks:.2f} bars={len(bars)}{_midday_label}"
     return ok, detail
 
 
