@@ -603,6 +603,14 @@ def _supplement_active_to_target_empty_universe_relaxed(
     return active, diag
 
 
+def _momentum_priority_enabled() -> bool:
+    """PUSH 50 枠の選定で当日変化率を優先するか (2026-09-18)。0 で従来の売買代金順。"""
+    import os
+
+    v = str(os.getenv("ACTIVE_SYMBOL_MOMENTUM_PRIORITY", "1")).strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 def _active_symbol_target_fill_score(sym: str, liquidity_map: dict, flag_info: dict, protected: Set[str]) -> tuple:
     info = liquidity_map.get(sym, {}) or {}
     flags = flag_info.get(sym, {}) if isinstance(flag_info, dict) else {}
@@ -634,7 +642,17 @@ def _active_symbol_target_fill_score(sym: str, liquidity_map: dict, flag_info: d
     tick = _fval(info.get("tick_count"))
     price = _fval(info.get("current_price") or info.get("price") or info.get("close"))
     quality = int(_fok(flags.get("ats_ok"))) + int(_fok(flags.get("buy_target"))) + int(_fok(flags.get("sell_target"))) + int(_fok(flags.get("short_ok")))
-    return (1 if sym in protected else 0, value, volume, tick, price, quality, sym)
+    # 2026-09-18: 売買代金順だと大型株ばかりになり、急騰銘柄を拾えていなかった。
+    #   9/18 の急騰 134 件のうち、その瞬間にティックがあったのは 22 件 (16%)。
+    #   09:30 の候補 349 銘柄から 50 枠を選ぶシミュレーションでは
+    #     売買代金順 -> 急騰 7 件 / 変化率順 -> 19 件 (2.7 倍)
+    #   絶対値を使うのは下落側もリバウンドで急騰しやすいため
+    #   (10 日検証で当日 -2% 以下の群の急騰率 38.6%、全体平均 17.3%)。
+    #   流動性フィルタは別途効くので薄い銘柄は入らない。
+    momentum = 0.0
+    if _momentum_priority_enabled():
+        momentum = abs(_fval(info.get("change_percentage")))
+    return (1 if sym in protected else 0, momentum, value, volume, tick, price, quality, sym)
 
 
 def _apply_active_symbol_target_fill(
