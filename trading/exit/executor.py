@@ -209,10 +209,16 @@ def _load_db_open_position(symbol: str) -> Optional[dict[str, Any]]:
             .all()
         )
         closed = {"CLOSED", "CLOSE", "EXITED", "EXIT", "DONE", "CANCELED", "CANCELLED", "REJECTED", "FAILED"}
+        # 2026-09-18: status は完全一致だけでは足りない。positions.db には
+        #   "CLOSED_BROKER_NOT_OPEN" のような接尾辞付きが入っていて、これが
+        #   「未決済」として拾われ、9/14 の決済済み建玉 ID で決済しようとして
+        #   kabu API に Code=8「決済指定内容に誤りがあります」で弾かれていた。
+        closed_prefix = ("CLOSED", "CLOSE", "EXIT", "CANCEL", "REJECT", "FAIL")
+        candidates: list[tuple[str, dict[str, Any]]] = []
         best: Optional[dict[str, Any]] = None
         for p in rows or []:
             status = str(getattr(p, "status", "") or "OPEN").strip().upper()
-            if status in closed:
+            if status in closed or status.startswith(closed_prefix):
                 continue
             d = _position_to_dict(p)
             d.setdefault("symbol", symbol)
@@ -233,8 +239,12 @@ def _load_db_open_position(symbol: str) -> Optional[dict[str, Any]]:
             d.setdefault("status", status or "OPEN")
             d["_position_source"] = "DB.positions.executor_fallback"
             if d["qty"] > 0 and d["entry_price"] > 0:
-                best = d
-                break
+                # 2026-09-18: 最初に見つかった 1 件で break すると id の小さい
+                #   (= 古い) 玉を掴む。entry_time の新しい順で選び直す。
+                candidates.append((str(getattr(p, "entry_time", "") or ""), d))
+        if candidates:
+            candidates.sort(key=lambda t: t[0], reverse=True)
+            best = candidates[0][1]
         if best:
             logger.warning(
                 "[EXIT_EXECUTOR] DB open position fallback hit symbol=%s qty=%s side=%s entry=%.4f",
