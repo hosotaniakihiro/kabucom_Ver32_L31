@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 from typing import Optional
 
 from global_state import global_data
@@ -109,22 +110,48 @@ def on_entry_filled(
         #   exchange=27 / margin_trade_type=3) と同じ形にする。
         db_side = _to_db_side(side, margin_trade_type=margin_trade_type, hold_id=hold_id or execution_id)
         db_hold_id = str(hold_id or execution_id or "") or None
-        pos = Position(
-            symbol=symbol,
-            symbolname=symbolname,
-            side=db_side,
-            qty=qty,
-            avg_price=price,
-            entry_time=now,
-            status="OPEN",
-            exchange=exchange,
-            margin_trade_type=margin_trade_type,
-            account_type=account_type,
-            hold_id=db_hold_id,
-            execution_id=str(execution_id or hold_id or "") or None,
-        )
-        session.add(pos)
-        session.commit()
+        # 2026-09-18: 起動時の建玉同期が on_entry_filled を再発火させ、同じ
+        #   hold_id の行が増え続けていた (9/18 の 9984 は 11:00 / 11:21 / 11:38 の
+        #   3 行、すべて hold_id=E20260918038X5 で実玉は 1 件)。決済は
+        #   broker_credit_authoritative で通るが、日次レポートの「未決済 3 件」の
+        #   ように記録が実体と合わなくなる。同じ hold_id の未決済行があれば作らない。
+        _existing = None
+        if db_hold_id and str(os.getenv("ENTRY_FILL_DEDUPE_BY_HOLD_ID", "1")).strip().lower() not in ("0", "false", "no", "off"):
+            try:
+                _existing = (
+                    session.query(Position)
+                    .filter(Position.hold_id == db_hold_id)
+                    .filter(Position.status == "OPEN")
+                    .first()
+                )
+            except Exception:
+                logger.debug("[ENTRY FILL] hold_id 重複チェックに失敗 symbol=%s", symbol, exc_info=True)
+                _existing = None
+        if _existing is not None:
+            logger.info(
+                "[ENTRY FILL] 同じ hold_id の未決済行が既にある -> 新規作成しない "
+                "symbol=%s hold_id=%s id=%s qty=%s avg_price=%s",
+                symbol, db_hold_id, getattr(_existing, "id", None),
+                getattr(_existing, "qty", None), getattr(_existing, "avg_price", None),
+            )
+            pos = _existing
+        else:
+            pos = Position(
+                symbol=symbol,
+                symbolname=symbolname,
+                side=db_side,
+                qty=qty,
+                avg_price=price,
+                entry_time=now,
+                status="OPEN",
+                exchange=exchange,
+                margin_trade_type=margin_trade_type,
+                account_type=account_type,
+                hold_id=db_hold_id,
+                execution_id=str(execution_id or hold_id or "") or None,
+            )
+            session.add(pos)
+            session.commit()
 
         # ----------------------------------------------------
         # 2. ExitContext 生成（factory）
