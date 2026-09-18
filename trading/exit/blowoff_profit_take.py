@@ -38,6 +38,68 @@ BLOWOFF_FULL_TAKE_PCT = float(os.getenv("BLOWOFF_FULL_TAKE_PCT", "0.45"))
 BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED = float(
     os.getenv("BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED", "1.20")
 )
+# 2026-09-18: 当日これだけ上げている銘柄は「勢いがある」とみなし、FULL_TAKE を
+#   スキップしてトレーリングに任せる (= 伸ばす)。9/18 の実測では
+#   伸ばすべき群の当日上昇が平均 +7.87%、早降りすべき群が +3.38% で分かれた。
+#   0 にすると全銘柄を伸ばす、999 にすると全銘柄を早降りにできる。
+BLOWOFF_TREND_HOLD_DAY_UP_PCT = float(
+    os.getenv("BLOWOFF_TREND_HOLD_DAY_UP_PCT", "5.0")
+)
+
+# 当日始値のキャッシュ (当日始値は変わらないので TTL 不要)
+_DAY_OPEN_CACHE: Dict[str, float] = {}
+
+
+def _day_open_price(symbol: str) -> float:
+    """当日始値。ranking DB のその日最初のスナップショット。取れなければ 0.0。"""
+    sym = str(symbol or "").strip()
+    if not sym:
+        return 0.0
+    if sym in _DAY_OPEN_CACHE:
+        return _DAY_OPEN_CACHE[sym]
+    val = 0.0
+    try:
+        import sqlite3
+        from trading.ranking.ranking_db_location import ranking_db_path
+        import datetime as _dt
+        p = ranking_db_path(_dt.date.today())
+        if p:
+            con = sqlite3.connect("file:" + str(p) + "?mode=ro", uri=True, timeout=1.0)
+            try:
+                row = con.execute(
+                    "SELECT current_price FROM ranking_snapshot_1min "
+                    "WHERE symbol=? ORDER BY datetime LIMIT 1", (sym,)
+                ).fetchone()
+                if row and row[0]:
+                    val = float(row[0])
+            finally:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+    except Exception:
+        logger.debug("[BLOWOFF] day_open lookup failed symbol=%s", sym, exc_info=True)
+        val = 0.0
+    if val > 0:
+        _DAY_OPEN_CACHE[sym] = val
+        if len(_DAY_OPEN_CACHE) > 1024:
+            _DAY_OPEN_CACHE.clear()
+    return val
+
+
+def _trend_hold(symbol: str, price: float) -> Tuple[bool, float]:
+    """勢いのある銘柄か。(伸ばす?, 当日上昇率%) を返す。
+
+    当日始値が取れない場合は「判定不能」として False (= 早降り側) に倒す。
+    """
+    thr = BLOWOFF_TREND_HOLD_DAY_UP_PCT
+    if thr <= 0:
+        return True, 0.0
+    op = _day_open_price(symbol)
+    if op <= 0 or price <= 0:
+        return False, 0.0
+    up = (price - op) / op * 100.0
+    return (up >= thr), up
 BLOWOFF_SMALL_QTY_MAX = int(float(os.getenv("BLOWOFF_SMALL_QTY_MAX", "199")))
 BLOWOFF_PARTIAL_RATIO = float(os.getenv("BLOWOFF_PARTIAL_RATIO", "0.50"))
 
@@ -291,7 +353,16 @@ def apply_blowoff_profit_take(*, symbol: str, pos: Dict[str, Any], regime: int =
         #   confirm NG = 吹きが確認できない。ここで降りると 4052 のように
         #     その後 +6.9% 伸びるのを取り逃すので、しきい値を上げて伸ばす。
         full_take_pct = BLOWOFF_FULL_TAKE_PCT if blowoff_ok else BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED
-        if profit >= full_take_pct:
+        # 2026-09-18: 勢いのある銘柄 (当日上昇率が高い) は FULL_TAKE を使わず
+        #   トレーリングに任せて伸ばす。もみ合いは従来どおり早めに利確する。
+        _hold, _day_up = _trend_hold(symbol, price)
+        if _hold and profit >= full_take_pct:
+            logger.info(
+                "[BLOWOFF PROFIT TAKE] trend hold symbol=%s day_up=%+.2f%%>=%.2f%% profit=%+.3f%% "
+                "-> FULL_TAKE を見送りトレーリングに任せる",
+                symbol, _day_up, BLOWOFF_TREND_HOLD_DAY_UP_PCT, profit,
+            )
+        if (not _hold) and profit >= full_take_pct:
             reason = f"BLOWOFF_FULL_TAKE profit={profit:.3f}%>=trigger={full_take_pct:.3f}% qty={qty} blowoff_confirm={blowoff_ok} detail={blowoff_detail}"
             logger.warning(
                 "[BLOWOFF PROFIT TAKE] FULL symbol=%s side=%s qty=%s entry=%.4f price=%.4f profit=%.3f%% trigger=%.3f%% confirm=%s detail=%s",

@@ -346,8 +346,15 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     #     FULL_TAKE なし + トレール 0.5%  +20,100 円
     #   トレール幅は広げると銘柄ごとの改善と悪化が相殺するので 0.2% のまま。
     #   戻すときは 0.45 / 1.20 に戻す。
-    "BLOWOFF_FULL_TAKE_PCT": "99.0",
-    "BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED": "99.0",
+    #   2026-09-18 追記: 全銘柄一律で無効化するのはやめ、勢いのある銘柄だけ
+    #   伸ばす形にした (BLOWOFF_TREND_HOLD_DAY_UP_PCT)。しきい値は元に戻す。
+    "BLOWOFF_FULL_TAKE_PCT": "0.45",
+    "BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED": "1.20",
+    #   しきい値は 9/18 の 16 件で 3.0〜8.0 を振って決めた。5.5% が一致率
+    #   15/16 (94%) で最良。6433 (+5.25〜5.30%) を早降り側に、4052 (+5.97%) を
+    #   伸ばす側に分けられる。ただし 16 件で決めた値なので過学習ぎみ。
+    #   運用しながら 5.5〜6.0 の範囲で見直すこと。
+    "BLOWOFF_TREND_HOLD_DAY_UP_PCT": "5.5",
     "ENTRY_PASSIVE_LIMIT_ENABLED": "1",
     "ENTRY_PASSIVE_LIMIT_MODE": "near",
     "ENTRY_PASSIVE_CANCEL_AFTER_SEC": "8",
