@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import copy
+import time
 import datetime as dt
 import logging
 import os
@@ -135,6 +136,53 @@ def remember_order_for_retry(order_id: str, symbol: str, side: str, entry: Any) 
         logger.exception("[SUMMARY RETRY ROTATION] remember failed order_id=%s", order_id)
 
 
+# 2026-09-19: requeue した round は pending が新候補で上書きされると失われる。
+#   entry_order_builder が「攻め」に転じられるよう、銘柄単位でも短期間だけ覚える。
+_RECENT_ROUND: dict = {}
+
+
+def _round_memory_enabled() -> bool:
+    return str(os.getenv("ENTRY_PASSIVE_ROUND_SYMBOL_MEMORY", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _round_memory_ttl() -> float:
+    try:
+        return float(os.getenv("ENTRY_PASSIVE_ROUND_MEMORY_TTL_SEC", "120") or 120.0)
+    except Exception:
+        return 120.0
+
+
+def remember_symbol_round(symbol: str, rnd: int) -> None:
+    """requeue 時に呼ぶ。銘柄単位で round を短期記憶する。"""
+    try:
+        if not _round_memory_enabled():
+            return
+        s = _sym(symbol)
+        if not s or int(rnd) <= 0:
+            return
+        _RECENT_ROUND[s] = (int(rnd), time.time() + _round_memory_ttl())
+        if len(_RECENT_ROUND) > 512:
+            _RECENT_ROUND.clear()
+    except Exception:
+        pass
+
+
+def recent_symbol_round(symbol: str) -> int:
+    """直近に受け身で約定しなかった銘柄の round。無ければ 0。"""
+    try:
+        if not _round_memory_enabled():
+            return 0
+        v = _RECENT_ROUND.get(_sym(symbol))
+        if not v:
+            return 0
+        rnd, exp = v
+        if time.time() > exp:
+            _RECENT_ROUND.pop(_sym(symbol), None)
+            return 0
+        return int(rnd)
+    except Exception:
+        return 0
+
 def on_unfilled_order_cancelled(symbol: str, order_id: str) -> bool:
     if not _env_bool("ENTRY_SUMMARY_RETRY_ENABLED", True):
         return False
@@ -154,6 +202,7 @@ def on_unfilled_order_cancelled(symbol: str, order_id: str) -> bool:
             return False
 
         entry["summary_retry_round"] = new_round
+        remember_symbol_round(entry.get("symbol") or symbol, new_round)
         entry["summary_retry_prev_order_id"] = str(order_id)
         entry["created_at"] = dt.datetime.now()
         entry["symbol"] = _sym(entry.get("symbol") or symbol)

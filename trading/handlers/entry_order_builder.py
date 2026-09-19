@@ -591,7 +591,20 @@ def _passive_no_touch(entry_row: Any) -> bool:
 
 def _passive_round_of(entry_row: Any) -> int:
     try:
-        return int(_entry_get(entry_row, "summary_retry_round", default=0) or 0)
+        r = int(_entry_get(entry_row, "summary_retry_round", default=0) or 0)
+    except Exception:
+        r = 0
+    if r > 0:
+        return r
+    # 2026-09-19: requeue した round は pending が新候補で上書きされると消える。
+    #   9/18 は round=0 の発注が 27 件すべてで、攻めに一度も転じず
+    #   送信 25 件に対し未約定キャンセル 55 件になっていた。
+    #   銘柄単位の短期メモリ (既定 TTL 120 秒) で拾い直す。
+    try:
+        from trading.handlers.entry_retry_rotation import recent_symbol_round
+
+        sym = _entry_get(entry_row, "symbol", default="")
+        return int(recent_symbol_round(sym) or 0)
     except Exception:
         return 0
 
