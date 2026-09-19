@@ -250,6 +250,21 @@ def _tr_collect_global_data_all(dst: list[str]) -> None:
         except Exception:
             logger.debug("[PUSH ROTATION TARGET TOPUP] global_data getter failed name=%s", name, exc_info=True)
 
+def _rebuild_active_symbols_enabled() -> bool:
+    """push_receiver プロセスで active_symbols を再構築するか (2026-09-19)。
+
+    既定 0。update_active_symbols(force=True) は summary と liquidity_map を
+    まるごと作り直すため、push_receiver プロセス内で走らせると GIL を長時間
+    占有し、ローテーションスレッドが進めなくなる (9/18 は 1 サイクル 38 秒、
+    うち 33 秒が待ち)。結果を読むだけの取得は下でそのまま行うので、
+    ranking_collector が更新した内容は従来どおり拾える。
+    """
+    import os
+
+    v = str(os.getenv("PUSH_ROTATION_REBUILD_ACTIVE_SYMBOLS", "0")).strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def _tr_collect_active_symbol_manager(dst: list[str]) -> None:
     try:
         import trading.ranking.active_symbol_manager as asm
@@ -257,7 +272,7 @@ def _tr_collect_active_symbol_manager(dst: list[str]) -> None:
         return
 
     try:
-        fn = getattr(asm, "update_active_symbols", None)
+        fn = getattr(asm, "update_active_symbols", None) if _rebuild_active_symbols_enabled() else None
         if callable(fn):
             rebuilt = fn(force=True)
             _tr_add(dst, rebuilt, source="active_symbol_manager.update_active_symbols(force=True)")
