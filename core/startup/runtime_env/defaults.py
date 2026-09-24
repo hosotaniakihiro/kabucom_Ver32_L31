@@ -375,6 +375,11 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     #     5000万         捕捉143件 最低 5,580万 ロット占有 1.1%  <- 採用
     #     1億            捕捉118件 最低 1.06億  ロット占有 0.6%
     #   5000 万でも現行の売買代金順 (27 件) の 5.3 倍の捕捉を保てる。
+    # 2026-09-25: 受け身指値の round メモリ TTL。120 秒では短すぎて 9/24 は
+    #   requeue 5 回に対し round=1 の発注が 0 件だった。実測した
+    #   「requeue -> 次の発注」の間隔は 185 秒 / 2,272 秒 / 6,203 秒 で
+    #   中央値 37.9 分。TTL 120 秒だと 0%、3600 秒で 67% が間に合う。
+    "ENTRY_PASSIVE_ROUND_MEMORY_TTL_SEC": "3600",
     "ACTIVE_MIN_TRADING_VALUE": "50000000",
     "PUSH_ROTATION_TARGET_MIN_KEEP": "50",
     "PUSH_ROTATION_TARGET_MAX_KEEP": "50",
