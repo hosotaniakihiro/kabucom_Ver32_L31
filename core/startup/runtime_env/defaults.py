@@ -379,6 +379,15 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     #   requeue 5 回に対し round=1 の発注が 0 件だった。実測した
     #   「requeue -> 次の発注」の間隔は 185 秒 / 2,272 秒 / 6,203 秒 で
     #   中央値 37.9 分。TTL 120 秒だと 0%、3600 秒で 67% が間に合う。
+    # 2026-09-25: kabu Station 側の銘柄登録はシステムを止めても残る。
+    #   9/24 に W: から起動した際の 100 銘柄が残っており、起動直後から
+    #   registered_count=100 で、そこへ今日の 50 を足そうとして
+    #   Code 4001019「一部の銘柄が登録できませんでした」になっていた。
+    #   登録上限 50 を超えると /board が全銘柄 4002006 で全滅する。
+    #   register の前に unregister_all を挟んで必ず 50 に保つ。
+    #   (unregister_all -> 0.2 秒 -> register。周期 6 秒に対し 3% 程度の
+    #    ティック欠けになるが、上限超過で板が全滅するより軽い)
+    "PUSH_ROTATION_UNREGISTER_FIRST": "1",
     "ENTRY_PASSIVE_ROUND_MEMORY_TTL_SEC": "3600",
     "ACTIVE_MIN_TRADING_VALUE": "50000000",
     "PUSH_ROTATION_TARGET_MIN_KEEP": "50",
