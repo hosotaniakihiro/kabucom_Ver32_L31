@@ -125,6 +125,45 @@ def _is_symbol_trade_restricted(data: Any) -> bool:
     return False
 
 
+def _margin_type_reject_enabled() -> bool:
+    """MarginTradeType 不正を銘柄固有の制限として扱うか (2026-09-25)。"""
+    import os
+
+    v = str(os.getenv("ENTRY_MARK_MARGIN_TYPE_REJECT", "1")).strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _margin_type_restrict_sec() -> int:
+    """MarginTradeType 不正で止めておく秒数。既定 21600 (6 時間 = 当日いっぱい)。
+
+    100033 の一時的な取引制限 (TRADE_RESTRICT_SEC=1800) と違い、
+    日計り信用の対象外かどうかは当日中変わらないので長く止める。
+    """
+    import os
+
+    try:
+        return max(60, int(float(os.getenv("MARGIN_TYPE_RESTRICT_SEC", "21600") or 21600)))
+    except Exception:
+        return 21600
+
+
+def _is_margin_type_unsupported(data: Any) -> bool:
+    """日計り信用などの信用区分が使えない銘柄か (2026-09-25)。
+
+    9/25 の 4875 は margin_type=3 (日計り信用) で
+      Code=4002013 パラメータ不正：MarginTradeType
+    が返った。同じ margin_type=3 で 6904 は約定しているので設定側の誤りでは
+    なく、銘柄がデイトレ信用の対象外という固有の性質。
+    reason=ORDER_ID_EMPTY_RETRYABLE として再試行されるのを止める。
+    """
+    if not _margin_type_reject_enabled():
+        return False
+    code, message = _extract_code_message(data)
+    if code != "4002013":
+        return False
+    return "margintradetype" in str(message or "").lower()
+
+
 def _set_last_send_order_error(payload: dict, data: Any, *, status_code: Any = None) -> None:
     global _LAST_SEND_ORDER_ERROR
     code, message = _extract_code_message(data)
@@ -263,19 +302,27 @@ def _mark_symbol_trade_restricted_if_needed(payload: dict, data: Any) -> None:
     try:
         if not _is_credit_new_order_payload(payload):
             return
-        if not _is_symbol_trade_restricted(data):
+        # 2026-09-25: 100033 (一時的な取引制限) と 4002013 (MarginTradeType 不正)
+        #   の両方を拾う。後者は日計り信用の対象外という銘柄固有の性質なので
+        #   当日いっぱい止める。
+        _margin_ng = _is_margin_type_unsupported(data)
+        if not _margin_ng and not _is_symbol_trade_restricted(data):
             return
         symbol = _safe_symbol(payload)
         if not symbol:
             return
         code, message = _extract_code_message(data)
         side = _payload_side_name(payload)
-        until = dt.datetime.now() + dt.timedelta(seconds=TRADE_RESTRICT_SEC)
+        _sec = _margin_type_restrict_sec() if _margin_ng else TRADE_RESTRICT_SEC
+        until = dt.datetime.now() + dt.timedelta(seconds=_sec)
         root = _get_trade_restricted_root()
         root[symbol] = until
         logger.warning(
-            "🚫 SYMBOL_TRADE_RESTRICTED_BY_KABU_API symbol=%s side=%s code=%s until=%s message=%s",
-            symbol, side, code or "UNKNOWN", until, message,
+            "🚫 SYMBOL_TRADE_RESTRICTED_BY_KABU_API symbol=%s side=%s code=%s until=%s sec=%d "
+            "kind=%s message=%s",
+            symbol, side, code or "UNKNOWN", until, _sec,
+            "margin_type_unsupported" if _margin_ng else "trade_restricted",
+            message,
         )
     except Exception:
         logger.exception("[SEND ORDER] failed to mark symbol trade_restricted payload=%s data=%s", payload, data)
