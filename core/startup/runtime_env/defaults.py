@@ -389,6 +389,14 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     #    ティック欠けになるが、上限超過で板が全滅するより軽い)
     "PUSH_ROTATION_UNREGISTER_FIRST": "1",
     "ENTRY_PASSIVE_ROUND_MEMORY_TTL_SEC": "3600",
+    # 2026-09-25: RANKING 候補の元データの鮮度上限。既定 300 秒は発注直前の
+    #   ENTRY_EXECUTE_MAX_BAR_AGE_SEC=180 と矛盾しており、180〜300 秒の帯で
+    #   拾った候補は作られた瞬間に STALE_CANDIDATE_SKIP が確定していた。
+    #   11:13 の実測: source age=195.8s を「fresh」と判定 -> 17 秒後に
+    #   bar_age=213.0s で却下。10:55〜11:15 の却下 8 件すべてこれ。
+    #   DB 側は 60〜90 秒前まで入っており、読み直し (indexed read 1.67 秒)
+    #   は LOOP budget 30 秒に対して軽い。120 秒に下げて読み直させる。
+    "RANKING_ENTRY_SOURCE_MAX_AGE_SEC": "120",
     "ACTIVE_MIN_TRADING_VALUE": "50000000",
     "PUSH_ROTATION_TARGET_MIN_KEEP": "50",
     "PUSH_ROTATION_TARGET_MAX_KEEP": "50",
