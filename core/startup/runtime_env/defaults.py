@@ -397,6 +397,14 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     #   DB 側は 60〜90 秒前まで入っており、読み直し (indexed read 1.67 秒)
     #   は LOOP budget 30 秒に対して軽い。120 秒に下げて読み直させる。
     "RANKING_ENTRY_SOURCE_MAX_AGE_SEC": "120",
+    # 2026-09-25: RANKING 候補の元テーブルを、順位が実際に入っている 2 つに限定する。
+    #   DB フォールバックは「datetime が最も新しいテーブル」を選ぶが、
+    #   ranking_summary_1min / ranking_summary_5min は rank が全行 NULL。
+    #   5min は足の終値時刻を先に書くため一番新しく見えて選ばれてしまい、
+    #   14:05 以降 rank=999999 で PREFILTER_RANK (上限 80 位) が 200/200 却下、
+    #   RANKING 候補が 0 件になった (14:01/14:03 は 11 件)。
+    #   さらにその結果が last-good キャッシュに残り 0 件が続いた。
+    "RANKING_ENTRY_SOURCE_DB_TABLES": "ranking_snapshot_1min,ranking_raw_1min",
     "ACTIVE_MIN_TRADING_VALUE": "50000000",
     "PUSH_ROTATION_TARGET_MIN_KEEP": "50",
     "PUSH_ROTATION_TARGET_MAX_KEEP": "50",
