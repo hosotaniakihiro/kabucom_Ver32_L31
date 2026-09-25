@@ -507,6 +507,61 @@ def _extract_5s_rows(df: Any) -> Optional[Tuple[Any, Any, int]]:
     return None
 
 
+def _price_drift_max_pct() -> float:
+    """判定価格からの許容乖離 (%)。0 で無効。"""
+    try:
+        import os
+
+        return float(os.getenv("ENTRY_PRICE_DRIFT_MAX_PCT", "1.5") or 1.5)
+    except Exception:
+        return 1.5
+
+
+def _price_drift_guard(*, symbol: Any, side: Any, entry_row: Any, bid: Any, ask: Any):
+    """判定時の価格と発注時の板価格が離れすぎていたら _ng を返す (2026-09-25)。
+
+    不利な方向 (BUY なら上、SELL なら下) に max_pct 以上離れたときだけ却下する。
+    有利な方向に動いた場合は通す。判定価格が取れないときは通す (fail-open)。
+    """
+    max_pct = _price_drift_max_pct()
+    if max_pct <= 0:
+        return None
+    try:
+        judged = _epi_safe_float(
+            _epi_first(entry_row, ("close_price", "close", "price", "current_price"), 0.0), 0.0
+        )
+    except Exception:
+        judged = 0.0
+    if judged <= 0:
+        return None
+
+    side_u = str(side or "").upper()
+    try:
+        b = float(bid or 0.0)
+        a = float(ask or 0.0)
+    except Exception:
+        return None
+    # BUY は買う側の価格 (高い方) で、SELL は売る側 (低い方) で評価する。
+    # bid > ask のクロス板でも安全側になるよう max/min を使う。
+    now_px = max(b, a) if side_u == "BUY" else min(b, a)
+    if now_px <= 0:
+        return None
+
+    drift = (now_px - judged) / judged * 100.0
+    adverse = drift if side_u == "BUY" else -drift
+    if adverse <= max_pct:
+        return None
+
+    logger.warning(
+        "[ENTRY PRICE DRIFT] reject symbol=%s side=%s judged=%.1f now=%.1f drift=%+.2f%% max=%.2f%% "
+        "(判定した価格から離れすぎ。急騰の最中に遅れて飛び乗るのを防ぐ)",
+        symbol, side_u, judged, now_px, drift, max_pct,
+    )
+    return _ng(
+        "PRICE_DRIFT_TOO_LARGE", symbol=symbol, side=side_u,
+        judged_price=judged, now_price=now_px, drift_pct=round(drift, 3), max_pct=max_pct,
+    )
+
 def _five_sec_pre_entry_guard(symbol: str, side: str, source: str) -> Optional[Dict[str, Any]]:
     if not ENTRY_ORDER_5S_GUARD_ENABLED:
         return None
@@ -867,6 +922,14 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
         if board:
             bid = board.get("bid_price")
             ask = board.get("ask_price")
+            # 2026-09-25: 判定した価格から大きく離れていたら発注しない。
+            #   627A は 09:44:04 に price=1562 で全ゲートを通過し、2 秒後の
+            #   09:44:06 に 1595 (+2.1%) で発注、1592 約定、52 秒後に 1570 で
+            #   損切り。判定に使った価格はもう存在せず、急騰の最中に 2 秒遅れの
+            #   分析で飛び乗る形になっていた。
+            _drift_ng = _price_drift_guard(symbol=symbol, side=side, entry_row=entry_row, bid=bid, ask=ask)
+            if _drift_ng is not None:
+                return _drift_ng
             if not bid or not ask or bid <= 0 or ask <= 0:
                 if ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY:
                     return _ng("INVALID_BOARD", board=board, require_board=True)
