@@ -535,8 +535,33 @@ def build_protected_rotation_batches(targets: list[str]):
     logger.warning("[PUSH ROTATION STABILITY] batches fixed=%d pool=%d A=%d B=%d", len(fixed), len(pool), len(a), len(b))
     return a, b, fixed
 
+def _rotation_liq_guard_enabled() -> bool:
+    """ローテーションの直近流動性ガードを呼ぶか (2026-09-25)。既定 0 = 呼ばない。
+
+    recent_liquidity は SUMMARY_DB_PATH (NAS の summary DB) を銘柄ごとに読むため
+    9/25 後場の実測で 1 回 5〜11 分かかり、その間ローテーションが止まっていた
+    (周期 5分25秒 -> 11分08秒 と悪化。理想は約 8 秒)。
+
+    しかも結果は使われない。min_keep=50 に対し targets は常にちょうど 50 件
+    (PUSH_ROTATION_TARGET_MAX_KEEP=50) なので、絞られれば fail-open で元の 50、
+    絞られなければ同じ 50 が返る。実測でも fail-open 19 回 / 完了 24 回 (79%)。
+    構造上、返り値を変えられないので呼ばない。
+    """
+    return _b("PUSH_ROTATION_LIQ_GUARD_ENABLED", False)
+
+
 def apply_register_liquidity_guard(targets: Sequence[str], orig) -> list[str]:
     from . import rotation_symbols
+
+    if not _rotation_liq_guard_enabled():
+        out = _d(targets)
+        logger.info(
+            "[PUSH ROTATION STABILITY] liquidity guard skipped n=%d "
+            "(NAS summary DB を銘柄ごとに読むため 1 回 5〜11 分かかり、"
+            "結果は min_keep=50 の fail-open で必ず捨てられていた)",
+            len(out),
+        )
+        return out
 
     try:
         cleaned, _, _, _ = rotation_symbols.clean_symbol_list(targets)
