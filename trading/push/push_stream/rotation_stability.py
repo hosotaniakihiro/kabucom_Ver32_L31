@@ -334,6 +334,75 @@ def _tr_collect_db_fallback(dst: list[str]) -> None:
             if len(dst) >= max(100, _i("PUSH_ROTATION_TARGET_MIN_KEEP", 100)):
                 return
 
+def _momentum_sort_enabled() -> bool:
+    """PUSH 50 枠を当日変化率順で選ぶか (2026-09-25)。0 で従来どおり。"""
+    import os
+
+    v = str(os.getenv("ACTIVE_SYMBOL_MOMENTUM_PRIORITY", "1")).strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _sort_by_momentum(symbols: list[str]) -> list[str]:
+    """当日変化率の絶対値が大きい順に並べ替える。
+
+    9/18 の実測では急騰 134 件のうち、その瞬間に PUSH のティックが
+    あったのは 22 件 (16%) だけだった。50 枠の選び方を売買代金順から
+    変化率順に変えると、枠に入る急騰銘柄が 5.7〜6.8 倍になる
+    (ローカル 10 日 27->184 件 / NAS 21 日 46->262 件、21 勝 0 敗)。
+
+    絶対値を使うのは下落側もリバウンドで急騰しやすいため
+    (10 日検証で当日 -2% 以下の群の急騰率 38.6%、全体平均 17.3%)。
+    保有銘柄 (protected) は必ず先頭に残す。
+    変化率が取れない銘柄は 0 扱いで後ろに回るが、除外はしない。
+    """
+    if not symbols or not _momentum_sort_enabled():
+        return symbols
+    try:
+        from trading.ranking.active_symbols.ranking_source import build_liquidity_map
+
+        liq = build_liquidity_map() or {}
+    except Exception:
+        logger.debug("[PUSH ROTATION TARGET TOPUP] liquidity map unavailable", exc_info=True)
+        return symbols
+    if not liq:
+        return symbols
+
+    try:
+        from .protected_symbols import resolve_protected_push_symbols
+
+        protected = set(resolve_protected_push_symbols() or ())
+    except Exception:
+        protected = set()
+
+    def _key(sym: str):
+        info = liq.get(sym) or {}
+        try:
+            chg = abs(float(info.get("change_percentage") or 0.0))
+        except Exception:
+            chg = 0.0
+        try:
+            val = float(info.get("trading_value") or 0.0)
+        except Exception:
+            val = 0.0
+        return (1 if sym in protected else 0, chg, val)
+
+    try:
+        out = sorted(symbols, key=_key, reverse=True)
+    except Exception:
+        logger.debug("[PUSH ROTATION TARGET TOPUP] momentum sort failed", exc_info=True)
+        return symbols
+
+    try:
+        head = out[:5]
+        logger.info(
+            "[PUSH ROTATION TARGET TOPUP] momentum sort applied n=%d protected=%d head=%s",
+            len(out), len(protected),
+            [(s, round(abs(float((liq.get(s) or {}).get("change_percentage") or 0.0)), 2)) for s in head],
+        )
+    except Exception:
+        pass
+    return out
+
 def resolve_monitor_symbols() -> list[str]:
     from . import rotation_core, rotation_symbols
 
@@ -356,7 +425,10 @@ def resolve_monitor_symbols() -> list[str]:
     if len(merged) < min_keep:
         _tr_collect_db_fallback(merged)
 
-    merged = _d(merged)[:max_keep]
+    # 2026-09-25: 切り捨てる前に当日変化率 (絶対値) で並べ替える。
+    #   ここを通らないと ACTIVE の約 90 銘柄から 50 枠を選ぶ優先順位が
+    #   無く、set の順序任せ (= 銘柄コード順) になる。
+    merged = _sort_by_momentum(_d(merged))[:max_keep]
 
     if merged:
         level = logger.warning if len(merged) < min_keep else logger.info
