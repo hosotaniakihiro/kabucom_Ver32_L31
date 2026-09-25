@@ -512,12 +512,12 @@ def _price_drift_max_pct() -> float:
     try:
         import os
 
-        return float(os.getenv("ENTRY_PRICE_DRIFT_MAX_PCT", "1.5") or 1.5)
+        return float(os.getenv("ENTRY_PRICE_DRIFT_MAX_PCT", "0.5") or 0.5)
     except Exception:
-        return 1.5
+        return 0.5
 
 
-def _price_drift_guard(*, symbol: Any, side: Any, entry_row: Any, bid: Any, ask: Any):
+def _price_drift_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any):
     """判定時の価格と発注時の板価格が離れすぎていたら _ng を返す (2026-09-25)。
 
     不利な方向 (BUY なら上、SELL なら下) に max_pct 以上離れたときだけ却下する。
@@ -536,9 +536,16 @@ def _price_drift_guard(*, symbol: Any, side: Any, entry_row: Any, bid: Any, ask:
         return None
 
     side_u = str(side or "").upper()
+    # board は自前で取る。SUMMARY_AI 以外の経路 (RANKING など) でも効かせる。
     try:
-        b = float(bid or 0.0)
-        a = float(ask or 0.0)
+        board = _get_board_with_retry(symbol, source=str(source or ""), side=side_u)
+    except Exception:
+        board = None
+    if not isinstance(board, dict) or not board:
+        return None
+    try:
+        b = float(board.get("bid_price") or 0.0)
+        a = float(board.get("ask_price") or 0.0)
     except Exception:
         return None
     # BUY は買う側の価格 (高い方) で、SELL は売る側 (低い方) で評価する。
@@ -547,9 +554,10 @@ def _price_drift_guard(*, symbol: Any, side: Any, entry_row: Any, bid: Any, ask:
     if now_px <= 0:
         return None
 
+    # 2026-09-25: 両方向で見る。BUY で下がっていても「安く買える」のではなく
+    #   下落トレンドを拾うことになる (625A)。SELL も同様。
     drift = (now_px - judged) / judged * 100.0
-    adverse = drift if side_u == "BUY" else -drift
-    if adverse <= max_pct:
+    if abs(drift) <= max_pct:
         return None
 
     logger.warning(
@@ -917,19 +925,20 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
     if five_sec_ng is not None:
         return five_sec_ng
 
+    # 2026-09-25: 判定した価格から離れすぎていたら発注しない (全経路共通)。
+    #   627A: 判定 1562 -> 板 1595 (+2.11%) で飛び乗り、-1.38% 損切り
+    #   625A: 判定 1762 -> 板 1751 (-0.62%) で下落を拾い、-0.91% 損切り
+    #   当初は SUMMARY_AI ブロック内・不利方向のみだったため 625A
+    #   (source=RANKING / 下落方向) を防げなかった。両方向・全経路にする。
+    _drift_ng = _price_drift_guard(symbol=symbol, side=side, source=source, entry_row=entry_row)
+    if _drift_ng is not None:
+        return _drift_ng
+
     if source == "SUMMARY_AI":
         board = _get_board_with_retry(symbol, source=source, side=side)
         if board:
             bid = board.get("bid_price")
             ask = board.get("ask_price")
-            # 2026-09-25: 判定した価格から大きく離れていたら発注しない。
-            #   627A は 09:44:04 に price=1562 で全ゲートを通過し、2 秒後の
-            #   09:44:06 に 1595 (+2.1%) で発注、1592 約定、52 秒後に 1570 で
-            #   損切り。判定に使った価格はもう存在せず、急騰の最中に 2 秒遅れの
-            #   分析で飛び乗る形になっていた。
-            _drift_ng = _price_drift_guard(symbol=symbol, side=side, entry_row=entry_row, bid=bid, ask=ask)
-            if _drift_ng is not None:
-                return _drift_ng
             if not bid or not ask or bid <= 0 or ask <= 0:
                 if ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY:
                     return _ng("INVALID_BOARD", board=board, require_board=True)
