@@ -507,6 +507,105 @@ def _extract_5s_rows(df: Any) -> Optional[Tuple[Any, Any, int]]:
     return None
 
 
+_DAY_CHANGE_MAP_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
+
+
+def _day_change_liquidity_map() -> dict:
+    """ranking 由来の当日騰落率マップ。実測 1.17 秒なので 30 秒キャッシュする。"""
+    import os
+    import time
+
+    try:
+        ttl = float(os.getenv("ENTRY_DAY_CHANGE_MAP_TTL_SEC", "30") or 30)
+    except Exception:
+        ttl = 30.0
+    now = time.time()
+    if now - float(_DAY_CHANGE_MAP_CACHE.get("at") or 0.0) < ttl:
+        return _DAY_CHANGE_MAP_CACHE.get("map") or {}
+    try:
+        from trading.ranking.active_symbols.ranking_source import build_liquidity_map
+
+        m = build_liquidity_map() or {}
+    except Exception:
+        logger.debug("[ENTRY DAY CHANGE] liquidity map unavailable", exc_info=True)
+        m = {}
+    _DAY_CHANGE_MAP_CACHE["at"] = now
+    _DAY_CHANGE_MAP_CACHE["map"] = m
+    return m
+
+
+def _day_change_pct(symbol: Any, entry_row: Any):
+    """当日騰落率 (%)。取れなければ None を返す (呼び出し側は通す)。"""
+    for key in ("day_change_pct", "change_percentage"):
+        try:
+            v = _epi_first(entry_row, (key,), None)
+        except Exception:
+            v = None
+        if v is None or v == "":
+            continue
+        try:
+            return float(v)
+        except Exception:
+            continue
+
+    try:
+        info = (_day_change_liquidity_map() or {}).get(str(symbol or "").strip()) or {}
+        v = info.get("change_percentage")
+        if v is None or v == "":
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _day_change_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any):
+    """当日すでに大きく動いた側へ乗るのを止める (2026-09-25)。
+
+    過去 11 日 37 万サンプルの 15 分後リターン:
+      +10〜+15%  平均 -0.411%  下 0.3% 割れ 40.4%
+      +15%以上   平均 -0.314%  上 0.3% 超は 22.0% しかない
+    一方 -5% 以下は平均 +0.128% で上向き。つまり上がりきった所での BUY と
+    下がりきった所での SELL が不利。方向別に止める (絶対値では止めない)。
+    """
+    import os
+
+    try:
+        buy_max = float(os.getenv("ENTRY_DAY_CHANGE_BUY_MAX_PCT", "10.0") or 10.0)
+    except Exception:
+        buy_max = 10.0
+    try:
+        sell_min = float(os.getenv("ENTRY_DAY_CHANGE_SELL_MIN_PCT", "-10.0") or -10.0)
+    except Exception:
+        sell_min = -10.0
+
+    side_u = str(side or "").upper()
+    if side_u == "BUY" and buy_max <= 0:
+        return None
+    if side_u == "SELL" and sell_min >= 0:
+        return None
+
+    day = _day_change_pct(symbol, entry_row)
+    if day is None:
+        return None
+
+    if side_u == "BUY" and day >= buy_max:
+        limit = buy_max
+    elif side_u == "SELL" and day <= sell_min:
+        limit = sell_min
+    else:
+        return None
+
+    logger.warning(
+        "[ENTRY DAY CHANGE] reject symbol=%s side=%s source=%s day_change=%+.2f%% limit=%+.2f%% "
+        "(当日すでに動きすぎた側へ乗るのを止める。過去 11 日の実測で +10%% 超の BUY は"
+        " 15 分後 平均 -0.41%%、損切り幅 0.3%% に当たる確率 40%%)",
+        symbol, side_u, source, day, limit,
+    )
+    return _ng(
+        "DAY_CHANGE_TOO_LARGE", symbol=symbol, side=side_u,
+        day_change_pct=round(day, 3), limit_pct=limit,
+    )
+
 def _price_drift_max_pct() -> float:
     """判定価格からの許容乖離 (%)。0 で無効。"""
     try:
@@ -933,6 +1032,14 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
     _drift_ng = _price_drift_guard(symbol=symbol, side=side, source=source, entry_row=entry_row)
     if _drift_ng is not None:
         return _drift_ng
+
+    # 2026-09-25: 当日すでに上がりきった所での BUY を止める (全経路共通)。
+    #   9/25 の負け 4 件のうち 627A(+18.3%) / 6904(+18.8%) / 625A(+9.2%) は
+    #   すべて上がりきった後の買い。4 件とも source=SUMMARY_AI で、当日騰落の
+    #   ガードは RANKING 経路 (MAX_DAY_CHANGE_PCT=12) にしか無かった。
+    _day_ng = _day_change_guard(symbol=symbol, side=side, source=source, entry_row=entry_row)
+    if _day_ng is not None:
+        return _day_ng
 
     if source == "SUMMARY_AI":
         board = _get_board_with_retry(symbol, source=source, side=side)
