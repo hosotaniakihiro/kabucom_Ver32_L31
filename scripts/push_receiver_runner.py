@@ -56,6 +56,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# 2026-09-25: summary DB の列突き合わせを engine 作成前に無効化する。
+#   NAS (X:) 上の summary DB に対して PRAGMA table_info を引くため
+#   1 テーブル 66〜82 秒かかり、起動が 10 分になっていた。その間
+#   WebSocket を張らないので PUSH が全断し、[PUSH STALL] が出続ける。
+#   結果は "table schema ok" = 追加列 0 件で、何も変えていない。
+#   main.py は _install_main_runtime_patches で同じ関数を呼んでいるが
+#   scripts/*_runner.py は呼んでいなかった (env だけではフラグが立たない)。
+#   列の補完が必要なときは FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP=0。
+try:
+    from database.session import apply_fast_startup_schema_skip as _autostock_fs_skip
+
+    _autostock_fs_skip()
+except Exception as _autostock_fs_err:  # noqa: BLE001
+    print("[FAST STARTUP] summary schema skip を適用できなかった: %r" % (_autostock_fs_err,))
+
 from data_collectors.logging_setup import setup_logging
 from data_collectors.push_runtime import run_forever
 
