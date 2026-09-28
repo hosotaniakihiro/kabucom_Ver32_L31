@@ -696,6 +696,11 @@ def _build_symbol_indicators(g: pd.DataFrame, symbol: str) -> pd.DataFrame:
 # ============================================================
 
 _PREVDAY_WARMUP_COL = "__prevday_indicator_warmup"
+# 2026-09-28: 当日イントラデイ用の目印は別列にする。
+#   同じ列を共有していたため、先に走る当日ウォームアップが印を付けた時点で
+#   前営業日ウォームアップが必ず即 return し、3分足/5分足は一度も前日を
+#   読めていなかった (RSI が計算できず rsi_neutral_fill になる)。
+_INTRADAY_WARMUP_COL = "__intraday_indicator_warmup"
 _PREVDAY_ENV_TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled"}
 
 
@@ -1136,7 +1141,7 @@ def _with_intraday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
         return df
     if not isinstance(df, pd.DataFrame) or df.empty:
         return df
-    if _PREVDAY_WARMUP_COL in df.columns:
+    if _INTRADAY_WARMUP_COL in df.columns:
         return df
     if "datetime" not in df.columns or "symbol" not in df.columns:
         return df
@@ -1193,8 +1198,8 @@ def _with_intraday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
         if warm.empty:
             return df
 
-        warm[_PREVDAY_WARMUP_COL] = True
-        cur[_PREVDAY_WARMUP_COL] = False
+        warm[_INTRADAY_WARMUP_COL] = True
+        cur[_INTRADAY_WARMUP_COL] = False
 
         out = pd.concat([warm, cur], ignore_index=True, sort=False)
         out["symbol"] = out["symbol"].astype(str).str.strip()
@@ -1260,6 +1265,21 @@ def _with_prevday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
         cur = cur.dropna(subset=["datetime"])
         if warm.empty or cur.empty:
             return df
+        # 2026-09-28: 上のコメントどおりのフィルタが実装されていなかった。
+        #   9/25 のプロセスが 66 時間動き続けた結果 summary20260925.db に
+        #   9/28 08:41 までの行が入っており、loader は datetime desc で読むので
+        #   「前営業日」ではなく今朝の行が返る。当日行の二重投入を防ぐ。
+        if _prevday_env_bool("PREVDAY_WARMUP_STRICT_OLDER", True):
+            _cur_min = cur["datetime"].min()
+            _before = len(warm)
+            warm = warm.loc[warm["datetime"] < _cur_min].copy()
+            if len(warm) != _before:
+                logger.warning(
+                    "[IND PREVDAY WARMUP] dropped non-older warmup rows interval=%s before=%s after=%s cur_min=%s",
+                    _normalize_interval_name(interval), _before, len(warm), _cur_min,
+                )
+            if warm.empty:
+                return df
         out = pd.concat([warm, cur], ignore_index=True, sort=False)
         logger.warning(
             "[IND PREVDAY WARMUP] applied interval=%s db=%s table=%s symbols=%s warm_rows=%s current_rows=%s bars=%s save=0",
@@ -1279,11 +1299,17 @@ def _with_prevday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
 
 def _drop_prevday_warmup_rows(out: Any) -> Any:
     try:
-        if isinstance(out, pd.DataFrame) and _PREVDAY_WARMUP_COL in out.columns:
+        # 2026-09-28: 当日イントラデイと前営業日で別の列になったので両方見る。
+        #   どちらかの印が付いた行を落とす (従来も当日行は落としていた)。
+        _cols = [c for c in (_PREVDAY_WARMUP_COL, _INTRADAY_WARMUP_COL) if isinstance(out, pd.DataFrame) and c in out.columns]
+        if _cols:
             before = len(out)
-            keep = ~out[_PREVDAY_WARMUP_COL].fillna(False).astype(bool)
+            keep = None
+            for _c in _cols:
+                _flag = out[_c].fillna(False).astype(bool)
+                keep = ~_flag if keep is None else (keep & ~_flag)
             out = out.loc[keep].copy()
-            out = out.drop(columns=[_PREVDAY_WARMUP_COL], errors="ignore")
+            out = out.drop(columns=_cols, errors="ignore")
             dropped = before - len(out)
             if dropped > 0:
                 logger.warning("[IND PREVDAY WARMUP] dropped warmup rows after calculation dropped=%s output_rows=%s save=0", dropped, len(out))
