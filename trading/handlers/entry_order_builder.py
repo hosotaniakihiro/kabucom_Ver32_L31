@@ -606,6 +606,36 @@ def _day_change_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any):
         day_change_pct=round(day, 3), limit_pct=limit,
     )
 
+def _entry_max_qty() -> int:
+    """1 回の発注で許す最大株数 (2026-09-28)。0 で無効。
+
+    9/28 は 7883 (518円) へ 700 株、6768 (935円) へ 700 株を成行で出した。
+    低位株は同じ金額でも株数が増えるため板を食う量が桁違いになる。
+    唯一勝った 9984 は 6,280円 x 100 株だった。
+    """
+    import os
+
+    try:
+        return max(0, int(float(os.getenv("ENTRY_MAX_QTY", "400") or 400)))
+    except Exception:
+        return 400
+
+
+def _entry_min_trading_value_hard() -> float:
+    """これ未満の当日売買代金では発注しない (2026-09-28)。0 で無効。
+
+    既存の `trading_value < 8_000_000 -> MIN_ENTRY_QTY` は「800 万未満でも
+    最小ロットなら入る」という緩い扱いで、7883 (当日 4.6 億) が通っていた。
+    9/28 の実測では 4.6 億が明確に薄く、34 億以上はスリッページが
+    1 株あたり 1 円未満だった。間を取って 10 億にする。
+    """
+    import os
+
+    try:
+        return max(0.0, float(os.getenv("ENTRY_MIN_TRADING_VALUE_HARD", "1000000000") or 0.0))
+    except Exception:
+        return 1_000_000_000.0
+
 def _price_drift_max_pct() -> float:
     """判定価格からの許容乖離 (%)。0 で無効。"""
     try:
@@ -1126,6 +1156,19 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
     if trading_value < 3_000_000:
         return _ng("LOW_LIQUIDITY", trading_value=trading_value, price=effective_price, volume=volume)
 
+    # 2026-09-28: 薄い銘柄は最小ロットでも発注しない。
+    #   7883 は当日売買代金 4.6 億で 700 株を成行売りし -4,000 円。
+    #   既存の 800 万未満 -> MIN_ENTRY_QTY では全く止まらなかった。
+    _min_tv_hard = _entry_min_trading_value_hard()
+    if _min_tv_hard > 0 and 0 < float(trading_value or 0.0) < _min_tv_hard:
+        logger.warning(
+            "[ENTRY LIQUIDITY HARD] reject symbol=%s side=%s trading_value=%.0f min=%.0f "
+            "(薄い銘柄は決済の滑りで値幅を失う。9/28 の 7883 は 4.6 億で -4,000 円)",
+            symbol, side, float(trading_value or 0.0), _min_tv_hard,
+        )
+        return _ng("LOW_LIQUIDITY_HARD", symbol=symbol, side=side,
+                   trading_value=float(trading_value or 0.0), min_trading_value=_min_tv_hard)
+
     forced_min_qty = False
     if qty_override is not None:
         qty = int(qty_override)
@@ -1140,6 +1183,18 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
             if qty <= 0 and side == "BUY":
                 qty = MIN_ENTRY_QTY
                 forced_min_qty = True
+
+    # 2026-09-28: 株数の上限。低位株で株数が膨らむのを抑える。
+    #   100 株単位に丸め、0 になるなら発注しない。
+    _max_qty = _entry_max_qty()
+    if _max_qty > 0 and int(qty or 0) > _max_qty:
+        _before = int(qty)
+        qty = (_max_qty // 100) * 100
+        logger.warning(
+            "[ENTRY QTY CAP] symbol=%s side=%s price=%.1f qty %d -> %d (max=%d) "
+            "(低位株の大量株数は板を食う。9/28 の 7883 は 518円x700株で -4,000 円)",
+            symbol, side, float(effective_price or 0.0), _before, int(qty), _max_qty,
+        )
     if qty <= 0:
         return _ng("QTY_ZERO", side=side, price=price, base_price=base_price, spread_pct=spread_pct, trading_value=trading_value)
 
