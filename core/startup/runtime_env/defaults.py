@@ -361,6 +361,19 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     #   結論して失敗したので、無効化まで行かず中間の 0.80 で実データを積む。
     #   戻すときは 0.45。
     "BLOWOFF_FULL_TAKE_PCT": "0.80",
+    # 2026-09-28: 引け間際の意図しない持ち越しを防ぐ。
+    #   ENTRY_DAYTRADE_CUTOFF_TIME=15:00 以降の新規は日計り信用が使えず
+    #   制度信用 (MarginTradeType=1) へ自動で切り替わる。ところが
+    #   15:24:30 の強制決済は DAYTRADE_FORCE_CLOSE_ONLY_MARGIN_TYPE="3" で
+    #   日計り信用だけを対象にしているため、15:00〜15:20 (ENTRY_NO_NEW_AFTER)
+    #   に入った建玉は強制決済されず翌日へ持ち越されうる。
+    #   実際に 9/15 15:03 の 6723 が制度信用で建っていた (6 分後に通常の
+    #   決済条件で閉じたので結果的に助かっただけ)。positions.db には
+    #   margin_trade_type=1 の建玉が 33 件ある。
+    #   1) 日計り信用が使えない時刻には新規を入れない
+    #   2) 強制決済は信用区分を問わず全建玉に効かせる (すり抜けの保険)
+    "ENTRY_NO_NEW_AFTER": "15:00",
+    "DAYTRADE_FORCE_CLOSE_ONLY_MARGIN_TYPE": "0",
     "BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED": "1.20",
     #   しきい値は 9/18 の 16 件で 3.0〜8.0 を振って決めた。5.5% が一致率
     #   15/16 (94%) で最良。6433 (+5.25〜5.30%) を早降り側に、4052 (+5.97%) を

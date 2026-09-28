@@ -148,16 +148,34 @@ def _f(v, d=0.0) -> float:
 
 
 def executions(order: dict) -> list[tuple[float, float]]:
-    """その注文の約定 (数量, 単価) を返す。約定していなければ空。"""
+    """その注文の約定 (数量, 単価) を返す。約定していなければ空。
+
+    2026-09-28: 実際の /orders では約定明細は RecType=8 で、数量と単価は
+    ExecutionQty / ExecutionPrice ではなく **Qty / Price** に入っている
+    (ExecutionID が付くのが約定行の印)。kabu_api/info.py が古い形式の
+    ままだったのでそれを参考にして全部 None を拾い、合計 0 円になっていた。
+    """
     out = []
     for d in order.get("Details") or []:
-        # RecType 8 = 約定。環境によって入らないこともあるので
-        # ExecutionQty / ExecutionPrice が両方ある明細を採用する。
-        q = _f(d.get("ExecutionQty"), 0.0)
-        px = _f(d.get("ExecutionPrice"), 0.0)
+        try:
+            rec = int(_f(d.get("RecType"), 0))
+        except Exception:
+            rec = 0
+        if rec != 8 and not d.get("ExecutionID"):
+            continue
+        q = _f(d.get("Qty"), 0.0) or _f(d.get("ExecutionQty"), 0.0)
+        px = _f(d.get("Price"), 0.0) or _f(d.get("ExecutionPrice"), 0.0)
         if q > 0 and px > 0:
             out.append((q, px))
     return out
+
+
+def fees(order: dict) -> float:
+    """手数料と消費税の実額 (Details の Commission / CommissionTax)。"""
+    t = 0.0
+    for d in order.get("Details") or []:
+        t += _f(d.get("Commission"), 0.0) + _f(d.get("CommissionTax"), 0.0)
+    return t
 
 
 def avg_fill(order: dict) -> tuple[float, float]:
@@ -232,7 +250,7 @@ def build_report(orders: list[dict], ymd: str, annual_pct: float) -> str:
         if cm == CASH_MARGIN_NEW:
             news.setdefault(sym, []).append((q, px))
         elif cm == CASH_MARGIN_CLOSE:
-            closes.setdefault(sym, []).append((str(o.get("OrderId") or ""), q, px))
+            closes.setdefault(sym, []).append((str(o.get("ID") or o.get("OrderId") or ""), q, px))
 
     lines = []
     lines.append("# 実約定による損益照合 %s-%s-%s" % (ymd[:4], ymd[4:6], ymd[6:]))
