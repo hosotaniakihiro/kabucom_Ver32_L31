@@ -36,15 +36,51 @@ if not Password:
 
 # ============================================================
 # /orders → 約定検索（配列レスポンス対応）
+# ------------------------------------------------------------
+# 2026-09-29: 旧実装は一度も約定を拾えていなかった (当日の返済 9 件すべて
+# 「EXIT 未約定（未検出）」)。
+#   ・/orders の注文番号キーは "ID"。"OrderId" は存在しない
+#   ・絞り込みパラメータは "id"。"orderId" は無視されて全注文が返る
+#   ・Details[0] は受付明細 (RecType=1, Price=0)。約定は RecType=8
+# このため毎回 10 秒待って exec_price=None を返し、損益は判定価格のまま
+# 記録されていた。約定明細 (RecType=8) を数量加重で平均する。
 # ============================================================
+def summarize_executions(order: dict):
+    """/orders の 1 注文から約定 (RecType=8) を集計する。約定が無ければ None。"""
+    if not isinstance(order, dict):
+        return None
+    qty_sum = 0.0
+    amount = 0.0
+    last_time = None
+    for d in order.get("Details") or []:
+        if not isinstance(d, dict):
+            continue
+        try:
+            if int(d.get("RecType") or 0) != 8:
+                continue
+        except Exception:
+            continue
+        p = _cf(d.get("Price"), 0.0)
+        q = _cf(d.get("Qty"), 0.0)
+        if p <= 0 or q <= 0:
+            continue
+        qty_sum += q
+        amount += p * q
+        last_time = d.get("ExecutionDay") or d.get("TransactTime") or last_time
+    if qty_sum <= 0:
+        return None
+    return {"price": amount / qty_sum, "qty": qty_sum, "exec_time": last_time}
+
+
 def _find_execution(order_id: str, token: str):
+    """全数量が約定していれば集計を返す。部分約定・未約定は None。"""
 
     url = f"{API_URL}/orders"
     try:
         res = requests.get(
             url,
             headers={"X-API-KEY": token},
-            params={"orderId": order_id},
+            params={"id": order_id},
             timeout=5,
         )
     except Exception as e:
@@ -60,19 +96,18 @@ def _find_execution(order_id: str, token: str):
         return None
 
     for od in arr:
-        if str(od.get("OrderId")) != str(order_id):
+        if not isinstance(od, dict):
+            continue
+        if str(od.get("ID") or od.get("OrderId") or "") != str(order_id):
             continue
 
-        details = od.get("Details") or []
-        if not details:
-            continue
-
-        d = details[0]
-        return {
-            "price": d.get("Price"),
-            "qty": d.get("Qty"),
-            "exec_time": d.get("ExecutionDay"),
-        }
+        ex = summarize_executions(od)
+        if not ex:
+            return None
+        order_qty = _cf(od.get("OrderQty"), 0.0)
+        if order_qty > 0 and ex["qty"] < order_qty:
+            return None
+        return ex
 
     return None
 

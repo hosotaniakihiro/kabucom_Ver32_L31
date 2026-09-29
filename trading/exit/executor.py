@@ -800,6 +800,14 @@ EXIT_LIMIT_PENDING_CLOSE_ENABLED = _exit_board_env_bool("EXIT_LIMIT_PENDING_CLOS
 EXIT_MARK_CLOSED_ON_ORDER_ACCEPT = _exit_board_env_bool("EXIT_MARK_CLOSED_ON_ORDER_ACCEPT", False)
 
 
+# 2026-09-29: positions テーブルには order_id / exit_order_id / pnl 列が無い
+# (database.models.Position)。下の setattr は hasattr で黙って飛ばされ、
+# 返済注文番号は一度も DB に残っていなかった。そのため約定確認は毎回
+# 「同じ銘柄の返済注文の先頭」に当たり、別の注文の約定で行を閉じていた。
+# 行 id -> 返済注文番号をプロセス内で持つ (再起動後は当日分の fallback)。
+_EXIT_ORDER_ID_BY_ROW: dict[int, str] = {}
+
+
 def _mark_db_position_closing(*, symbol: str, exit_price: float, pnl: float, reason: str, order_id: str) -> bool:
     """旧 exit_limit_pending_close_runtime_patch._mark_db_closing 相当。
 
@@ -836,6 +844,8 @@ def _mark_db_position_closing(*, symbol: str, exit_price: float, pnl: float, rea
             except Exception:
                 pass
         session.commit()
+        if order_id and getattr(db_pos, "id", None) is not None:
+            _EXIT_ORDER_ID_BY_ROW[int(db_pos.id)] = str(order_id)
         logger.warning(
             "[EXIT LIMIT PENDING CLOSE] DB marked CLOSING symbol=%s exit_price=%.4f pnl=%.4f order_id=%s reason=%s",
             symbol, _safe_float(exit_price), _safe_float(pnl), order_id, reason,
@@ -1066,41 +1076,71 @@ def _exit_fill_confirm_find_order(orders: list[dict], wanted_order_id: str, symb
         if wanted_order_id and oid == wanted_order_id:
             return o
     # order_idが空/欠落した古いDB行向けの補助。返済注文だけを拾う。
+    # 2026-09-29: order_id を持つ行はここへ来させない。/orders は前日以前の
+    # 注文も返すので、6904 の行が 9/25 の返済注文で CLOSED 確定されていた。
+    # 当日受付の注文に限る。
+    if wanted_order_id:
+        return None
+    today = dt.date.today().isoformat()
+    best = None
     for o in orders or []:
         if not isinstance(o, dict):
             continue
         if _normalize_symbol(o.get("Symbol")) != symbol:
             continue
+        recv = str(o.get("RecvTime") or "")
+        if not recv.startswith(today):
+            continue
         try:
-            if int(float(o.get("CashMargin") or 0)) == 3:
-                return o
+            if int(float(o.get("CashMargin") or 0)) != 3:
+                continue
         except Exception:
-            pass
-    return None
+            continue
+        # 同じ銘柄を何度も返済する日があるので最新の返済注文を使う
+        if best is None or recv > str(best.get("RecvTime") or ""):
+            best = o
+    return best
 
 
-def _exit_fill_confirm_close_db_and_memory(symbol: str, order_id: str, order: dict) -> bool:
+def _exit_fill_confirm_exec_price(order: dict) -> float:
+    """約定明細 (RecType=8) の数量加重平均。成行の order["Price"] は 0。"""
+    try:
+        from kabu_api.close import summarize_executions
+
+        ex = summarize_executions(order)
+        if ex:
+            return _safe_float(ex.get("price"), 0.0)
+    except Exception:
+        logger.debug("[EXIT FILL CONFIRM] summarize_executions failed", exc_info=True)
+    return _safe_float(order.get("Price"), 0.0)
+
+
+def _exit_fill_confirm_close_db_and_memory(symbol: str, order_id: str, order: dict, row_id: Any = None) -> bool:
     symbol = _normalize_symbol(symbol)
     session = None
     try:
         session = Session_position()
-        row = (
-            session.query(Position)
-            .filter(Position.symbol == symbol)
-            .filter(Position.status == "CLOSING")
-            .first()
-        )
+        # 2026-09-29: 同じ銘柄の CLOSING 行が複数あると .first() が別の行を
+        # 閉じていた (5301 の 13:48 の約定で 12:40 の行が +1,820 円で確定)。
+        # 約定確認した行そのものを閉じる。
+        q = session.query(Position).filter(Position.status == "CLOSING")
+        if row_id is not None:
+            q = q.filter(Position.id == row_id)
+        else:
+            q = q.filter(Position.symbol == symbol)
+        row = q.first()
         if not row:
             session.rollback()
             return False
         now = dt.datetime.now()
         avg_price = _safe_float(getattr(row, "avg_price", 0) or getattr(row, "entry_price", 0) or getattr(row, "price", 0), 0.0)
         qty = _safe_float(getattr(row, "qty", 0), 0.0)
-        exit_price = _safe_float(order.get("Price"), 0.0) or _safe_float(getattr(row, "exit_price", 0), 0.0)
+        exit_price = _exit_fill_confirm_exec_price(order) or _safe_float(getattr(row, "exit_price", 0), 0.0)
         side = str(getattr(row, "side", "") or "").upper()
         pnl = 0.0
         if qty > 0 and avg_price > 0 and exit_price > 0:
-            pnl = (exit_price - avg_price) * qty if side == "BUY" else (avg_price - exit_price) * qty
+            # side は "BUY_CREDIT" / "SELL_CREDIT" でも入る
+            pnl = (exit_price - avg_price) * qty if side.startswith("BUY") else (avg_price - exit_price) * qty
         row.status = "CLOSED"
         for attr, value in [
             ("exit_price", exit_price),
@@ -1118,6 +1158,7 @@ def _exit_fill_confirm_close_db_and_memory(symbol: str, order_id: str, order: di
             except Exception:
                 pass
         session.commit()
+        _EXIT_ORDER_ID_BY_ROW.pop(int(getattr(row, "id", 0) or 0), None)
         try:
             positions = getattr(global_data, "open_positions", None)
             if isinstance(positions, dict):
@@ -1150,9 +1191,13 @@ def _exit_fill_confirm_closing_rows() -> list[dict]:
         rows = session.query(Position).filter(Position.status == "CLOSING").all()
         for r in rows or []:
             sym = _normalize_symbol(getattr(r, "symbol", ""))
-            oid = _exit_fill_confirm_order_id(getattr(r, "exit_order_id", "") or getattr(r, "order_id", ""))
+            oid = _exit_fill_confirm_order_id(
+                getattr(r, "exit_order_id", "")
+                or getattr(r, "order_id", "")
+                or _EXIT_ORDER_ID_BY_ROW.get(int(getattr(r, "id", 0) or 0), "")
+            )
             if sym:
-                out.append({"symbol": sym, "order_id": oid})
+                out.append({"symbol": sym, "order_id": oid, "row_id": getattr(r, "id", None)})
     except Exception:
         logger.debug("[EXIT FILL CONFIRM] load CLOSING rows failed", exc_info=True)
     finally:
@@ -1188,7 +1233,12 @@ def _exit_fill_confirm_loop() -> None:
                 oid = row.get("order_id") or ""
                 order = _exit_fill_confirm_find_order(orders, oid, sym)
                 if order and _exit_fill_confirm_is_filled(order):
-                    _exit_fill_confirm_close_db_and_memory(sym, oid or _exit_fill_confirm_order_id(order.get("OrderId") or order.get("ID")), order)
+                    _exit_fill_confirm_close_db_and_memory(
+                        sym,
+                        oid or _exit_fill_confirm_order_id(order.get("OrderId") or order.get("ID")),
+                        order,
+                        row_id=row.get("row_id"),
+                    )
                 elif order:
                     qty, cum, leaves = _exit_fill_confirm_remaining(order)
                     logger.info("[EXIT FILL CONFIRM] still closing symbol=%s order_id=%s cum=%.0f leaves=%.0f qty=%.0f", sym, oid, cum, leaves, qty)
