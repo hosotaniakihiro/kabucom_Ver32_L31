@@ -1199,6 +1199,28 @@ def _db_fallback_target() -> int:
         return 100
 
 
+def _db_fallback_min_symbols() -> int:
+    """選定結果がこの件数以上あれば「生きている」と見なし、差し替えない。
+
+    2026-09-29: ここが原因で監視銘柄が 1〜2 分ごとに 2 つのリストを往復していた。
+    旧条件は `len(symbols) >= target (=TARGET_ACTIVE_SYMBOLS=100)` で、
+    それ未満なら DB フォールバックで**全部差し替え**ていた (return fb)。
+    設計の「最大100銘柄」は上限であって必須件数ではなく、実測では選定が健全に
+    50 銘柄を返していたのに毎回 100 件の別リストに置き換わっていた。
+    10:46〜11:10 の実測で 50 銘柄のうち 44〜47 銘柄が入れ替わって元に戻る往復を
+    16 回。PUSH の登録替えが走るたびに 3分/5分足の履歴が途切れるので、MTF ゲート
+    に渡る足が 28〜77 銘柄しか揃わず dropped_stale が出ていた。
+
+    このフォールバックの本来の目的はコメントどおり「today_ranking が 0 件に
+    なっても復元する」ことなので、ほぼ空のときだけ差し替える。
+    """
+    try:
+        v = os.environ.get("ACTIVE_DB_FALLBACK_MIN_SYMBOLS")
+        return max(0, int(float(str(v).strip()))) if v not in (None, "") else 20
+    except Exception:
+        return 20
+
+
 def update_active_symbols(force: bool = False) -> List[str]:
     symbols: List[str] = []
     try:
@@ -1211,13 +1233,34 @@ def update_active_symbols(force: bool = False) -> List[str]:
     if len(symbols) >= target:
         return symbols
 
+    min_ok = _db_fallback_min_symbols()
+    if len(symbols) >= min_ok > 0:
+        # 選定は生きている。足りない分を**後ろに足すだけ**にして、上位の並び
+        # (PUSH に回る先頭 50) を壊さない。
+        fb = _db_fallback_symbols(target=target)
+        if not fb:
+            return symbols
+        have = set(symbols)
+        add = [s for s in fb if s not in have][: max(0, target - len(symbols))]
+        if add:
+            logger.warning(
+                "[ACTIVE DB FALLBACK] filled (差し替えではなく追加) selected=%d "
+                "added=%d after=%d target=%d min_ok=%d head_selected=%s",
+                len(symbols), len(add), len(symbols) + len(add), target, min_ok,
+                symbols[:20],
+            )
+            return symbols + add
+        return symbols
+
     fb = _db_fallback_symbols(target=target)
     if fb:
         logger.warning(
-            "[ACTIVE DB FALLBACK] recovered active symbols before=%d after=%d target=%d head=%s",
+            "[ACTIVE DB FALLBACK] recovered active symbols before=%d after=%d "
+            "target=%d min_ok=%d head=%s (選定がほぼ空なので差し替えた)",
             len(symbols),
             len(fb),
             target,
+            min_ok,
             fb[:20],
         )
         return fb
