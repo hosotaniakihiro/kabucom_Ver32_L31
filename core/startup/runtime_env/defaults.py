@@ -457,6 +457,24 @@ SUMMARY_YAHOO_DEFAULTS: Dict[str, str] = {
     #   代償: 3分/5分の RSI が当日足だけになる (0a6f222 の効果は寄り後 1 時間
     #   ほど落ちる。3分足は 09:45 頃、5分足は 10:10 頃に 14 本そろう)。
     #   "1min" だけに戻せば 3分/5分の前日ウォームアップは復活する。
+    # 2026-09-29: ranking_summary_3min/5min の指標が 50 分古いままだったのを直す。
+    #   RANKING_COLLECTOR_ENABLE_FULL_TICK の既定が False で full tick が一度も
+    #   走らず、update_ranking_summary_cache() が毎分スキップされていた
+    #   ([RANKING FAST] skipped update_ranking_summary_cache が 26 回/26 分)。
+    #   ランキング自体は毎分 1,400 銘柄取れているのに、3分/5分の指標だけ
+    #   13:42 で止まっていた (now 14:31)。
+    #
+    #   その結果 MTF ゲートは 1,295 銘柄分ある DB を使えず、PUSH 由来の
+    #   81 銘柄だけを見ていた (3分足 attach 17/67)。MTF_MA_GATE_NG が
+    #   最多却下理由になっていた上流がここ。
+    #
+    #   full tick は ranking_collector_runner (別プロセス) で走るので
+    #   発注する main.py を止めない。ただし同じ schedule ループ上の
+    #   fast tick (毎分) を遅らせうるので、周期は 3 分にして様子を見る。
+    #   [RANKING TECH STAGE] の実測は 18〜56 秒。
+    #   RANKING_COLLECTOR_ENABLE_FULL_TICK=0 で従来動作に戻る。
+    "RANKING_COLLECTOR_ENABLE_FULL_TICK": "1",
+    "RANKING_COLLECTOR_FULL_EVERY_MINUTES": "3",
     "PREVDAY_WARMUP_SKIP_INTERVALS": "1min,3min,5min",
     "AUTOSTOCK_MAIN_SKIP_SUMMARY_DB_SAVE": "1",
     "AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT": "1",
