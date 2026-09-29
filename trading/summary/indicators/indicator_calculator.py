@@ -1230,8 +1230,34 @@ def _with_intraday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
         return df
 
 
+def _prevday_warmup_skip_intervals() -> frozenset[str]:
+    """前日ウォームアップを走らせない interval。既定は 1 分足。
+
+    2026-09-29: 0a6f222 で目印列を分離した副作用で 1 分足も前日ウォームアップ
+    が走るようになり、1 銘柄 90 本 (当日) + 120 本 (前日) になった。
+    push_runner が平均 34s / 最大 49s (予算 45s) で毎回破棄され、summary が
+    800 秒古いまま [SUMMARY STALE DROP] after=0 になって発注が全滅した。
+    1 分足は intraday ウォームアップ 90 本で MA75 まで足りるので前日分は冗長。
+    3 分/5 分は当日の足が中央値 5 本 / 3 本しかないので必ず残す。
+    """
+    raw = os.getenv("PREVDAY_WARMUP_SKIP_INTERVALS", "1min")
+    out = set()
+    for part in str(raw or "").replace(";", ",").split(","):
+        s = part.strip().lower()
+        if s:
+            out.add(_normalize_interval_name(s))
+    return frozenset(out)
+
+
 def _with_prevday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
     if not _prevday_env_bool("PREVDAY_INDICATOR_WARMUP_ENABLED", True):
+        return df
+    _iv_name = _normalize_interval_name(interval)
+    if _iv_name in _prevday_warmup_skip_intervals():
+        logger.debug(
+            "[IND PREVDAY WARMUP] skipped interval=%s (PREVDAY_WARMUP_SKIP_INTERVALS)",
+            _iv_name,
+        )
         return df
     if not isinstance(df, pd.DataFrame) or df.empty:
         return df

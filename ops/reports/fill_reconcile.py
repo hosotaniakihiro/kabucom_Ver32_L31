@@ -178,6 +178,20 @@ def fees(order: dict) -> float:
     return t
 
 
+def order_day(order: dict) -> str:
+    """注文 ID の先頭 8 桁 (YYYYMMDD)。読めなければ空。
+
+    2026-09-28: /orders は当日注文だけのはずだが、過去日の注文 (同日に決済まで
+    終わったもの) も返ってくる。9/28 の 621A には 9/24 の建玉
+    (ID=20260924A02N44633380) が混ざっており、銘柄でまとめると 800 株・
+    新規平均 1478.59 になって 9/24 分を 9/28 の損益として数えてしまった。
+    """
+    s = str(order.get("ID") or order.get("OrderId") or "").strip()
+    if len(s) >= 8 and s[:8].isdigit():
+        return s[:8]
+    return ""
+
+
 def avg_fill(order: dict) -> tuple[float, float]:
     """(約定数量, 平均約定単価)。"""
     ex = executions(order)
@@ -232,16 +246,22 @@ def system_pnl_from_logs(ymd: str) -> dict[str, float]:
     return out
 
 
-def build_report(orders: list[dict], ymd: str, annual_pct: float) -> str:
+def build_report(orders: list[dict], ymd: str, annual_pct: float, only_day: bool = True) -> str:
     entries = entry_price_map(ymd)
     sys_pnl = system_pnl_from_logs(ymd)
 
     # 新規 (CashMargin=2) と返済 (CashMargin=3) に分ける
     news: dict[str, list[tuple[float, float]]] = {}
     closes: dict[str, list[tuple[str, float, float]]] = {}
+    skipped_other_day = 0
     for o in orders:
         sym = str(o.get("Symbol") or "").strip()
         if not sym:
+            continue
+        # 2026-09-28: 過去日の注文が混ざるので対象日だけに絞る。
+        od = order_day(o)
+        if only_day and od and od != ymd:
+            skipped_other_day += 1
             continue
         cm = int(_f(o.get("CashMargin"), 0))
         q, px = avg_fill(o)
@@ -260,6 +280,10 @@ def build_report(orders: list[dict], ymd: str, annual_pct: float) -> str:
     lines.append("")
     lines.append("金利は年率 %.2f%% (建玉金額 x %.5f%%/日) で計算。" % (
         annual_pct, annual_pct / 365.0))
+    if only_day:
+        lines.append("")
+        lines.append("注文 ID の先頭 8 桁で対象日を絞っている "
+                     "(除外 %d 件)。/orders には過去日の注文も混ざるため。" % skipped_other_day)
     lines.append("")
 
     total_gross = 0.0
@@ -336,6 +360,8 @@ def main() -> int:
                     help="稼働中でも実行する (トークンを奪うので通常は使わない)")
     ap.add_argument("--annual-interest-pct", type=float,
                     default=DEFAULT_ANNUAL_INTEREST_PCT)
+    ap.add_argument("--all-days", action="store_true",
+                    help="注文 ID の日付で絞らず全部集計する (過去分もまとめて見るとき)")
     a = ap.parse_args()
 
     ymd = a.date
@@ -361,7 +387,7 @@ def main() -> int:
         p = save_raw(orders, ymd)
         print("生データを保存: %s (%d 件)" % (p, len(orders)))
 
-    md = build_report(orders, ymd, a.annual_interest_pct)
+    md = build_report(orders, ymd, a.annual_interest_pct, only_day=not a.all_days)
     out = _reports_dir() / ("fill_reconcile_%s.md" % ymd)
     out.write_text(md, encoding="utf-8")
     print()
