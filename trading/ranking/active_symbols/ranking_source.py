@@ -30,6 +30,7 @@ from .config import (
     GROWTH_MARKET_CODES,
     MARKET_COLUMNS,
     RANK_COLUMNS,
+    env_int as _cfg_env_int,
     ACTIVE_LOSERS_BY_VALUE_N,
     ACTIVE_TICK_SUPPLEMENT_N,
     ACTIVE_USE_CATEGORY_QUOTA_SELECTION,
@@ -339,6 +340,71 @@ def _concat_kind(frames: Dict[str, List[pd.DataFrame]], kind: str) -> pd.DataFra
         return pd.DataFrame()
 
 
+_FLAGS_CACHE: dict[str, Any] = {"ts": 0.0, "eligible": None}
+
+
+def _quota_flags_filter_enabled() -> bool:
+    v = os.environ.get("ACTIVE_QUOTA_FLAGS_FILTER_ENABLED")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "ng", "disabled")
+
+
+def _blocked_symbols_cached() -> Set[str]:
+    """symbol_flags に載っていて**明示的に対象外**の銘柄。空集合なら絞り込まない。
+
+    2026-09-29: 設計どおりに急騰株を選ぶと、その多くが新規上場株 (627A / 625A /
+    634A / 646A / 593A / 621A / 604A ...) で、信用取引できないため後段の
+    [ACTIVE FLAGS] で 13 銘柄が除外されていた。さらに流動性フィルタで 82->61 と
+    削られ、total が 73〜76 にしか届かず DB フォールバックが先頭 50 の半分近くを
+    埋めていた。フォールバックの中身は毎回変わるので監視銘柄が往復し、PUSH の
+    登録替えで 3分/5分足の履歴が途切れていた。
+
+    そこで「上位50位に切る前」に信用可能銘柄へ絞る。こうすると急騰株のうち
+    実際に発注できるものだけが上位 50 に入り、フォールバックを呼ばずに済む。
+    ACTIVE_QUOTA_FLAGS_FILTER_ENABLED=0 で従来動作に戻る。
+
+    load_symbol_flags_eligible_symbols() は ACTIVE_REQUIRE_SYMBOL_FLAGS=0 /
+    DB 無し / テーブル無しのとき空集合を返す。その場合は絞り込まない (fail-open)。
+    flags DB は NAS 上なので TTL キャッシュする。
+    """
+    if not _quota_flags_filter_enabled():
+        return set()
+    import time
+
+    now = time.time()
+    ttl = float(max(10, _cfg_env_int("ACTIVE_QUOTA_FLAGS_CACHE_SEC", 300)))
+    cached = _FLAGS_CACHE.get("eligible")
+    if cached is not None and now - float(_FLAGS_CACHE.get("ts") or 0.0) < ttl:
+        return cached
+    blocked: Set[str] = set()
+    try:
+        from .symbol_flags import (
+            load_symbol_flags_eligible_symbols,
+            load_symbol_flags_known_symbols,
+        )
+
+        got, _info = load_symbol_flags_eligible_symbols()
+        eligible = {str(x) for x in (got or ())}
+        known = {str(x) for x in (load_symbol_flags_known_symbols() or ())}
+        # DB に載っていて対象外のものだけを落とす。載っていない銘柄は
+        # 「登録が無いだけ」なので通す (DB は 2026-03 で止まっている)。
+        blocked = (known - eligible) if (eligible and known) else set()
+    except Exception:
+        logger.debug("[ACTIVE CATEGORY QUOTA] symbol_flags load failed", exc_info=True)
+        blocked = set()
+    _FLAGS_CACHE["eligible"] = blocked
+    _FLAGS_CACHE["ts"] = now
+    return blocked
+
+
+def _drop_blocked(df: pd.DataFrame, blocked: Set[str]) -> pd.DataFrame:
+    """明示的に対象外の銘柄だけ落とす。blocked が空なら何もしない (fail-open)。"""
+    if df is None or df.empty or not blocked or "symbol" not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    return df.loc[~df["symbol"].astype(str).isin(blocked)].copy()
+
+
 def _top_rank(df: pd.DataFrame, n: int, *, metric_col: str, ascending: bool = False) -> pd.DataFrame:
     """そのランキングの上位 n 位だけに絞る (設計の「上位50位」)。
 
@@ -436,6 +502,15 @@ def category_quota_ranking_symbols(now: Optional[dt.datetime] = None) -> List[st
 
     slice_n = int(ACTIVE_RANK_SLICE_N or 0)
 
+    # --- 信用可能銘柄へ絞る (上位50に切る前) ------------------------
+    blocked = _blocked_symbols_cached()
+    _before_flags = (len(gainers_all_raw), len(losers_raw), len(value_raw), len(tick_raw))
+    if blocked:
+        gainers_all_raw = _drop_blocked(gainers_all_raw, blocked)
+        losers_raw = _drop_blocked(losers_raw, blocked)
+        value_raw = _drop_blocked(value_raw, blocked)
+        tick_raw = _drop_blocked(tick_raw, blocked)
+
     # --- 全市場分 ---------------------------------------------------
     # 市場列で ALL を選べるならそれを使う。使えない (列が無い / ALL が無い)
     # ときは全部をそのまま母集団にする。
@@ -481,10 +556,13 @@ def category_quota_ranking_symbols(now: Optional[dt.datetime] = None) -> List[st
     _append_unique(selected, growth_pick, max_total=TARGET_ACTIVE_SYMBOLS)
 
     logger.warning(
-        "[ACTIVE CATEGORY QUOTA] selected=%d slice_n=%d "
+        "[ACTIVE CATEGORY QUOTA] selected=%d slice_n=%d flags_blocked=%d "
+        "flags_pool=%s->%s "
         "pool(all)=gainers %d->%d losers %d->%d value %d->%d tick %d->%d "
         "growth=%d quota=%d/%d/%d/%d/%d/%d min_price=%.1f max_price=%.1f head=%s",
-        len(selected), slice_n,
+        len(selected), slice_n, len(blocked),
+        _before_flags,
+        (len(gainers_all_raw), len(losers_raw), len(value_raw), len(tick_raw)),
         len(gainers_all_raw), len(gainers), len(losers_raw), len(losers),
         len(value_raw), len(value), len(tick_raw), len(tick),
         len(growth),

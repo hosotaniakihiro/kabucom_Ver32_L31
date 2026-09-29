@@ -164,6 +164,57 @@ def _is_margin_type_unsupported(data: Any) -> bool:
     return "margintradetype" in str(message or "").lower()
 
 
+def _margin_type_fallback_enabled() -> bool:
+    """日計り信用が使えない銘柄を制度信用で建て直すか (2026-09-29)。既定 ON。
+
+    9/25 の 4875、9/29 の新規上場株群 (627A / 625A / 634A / 646A / 593A /
+    621A / 604A ...) は margin_type=3 で Code=4002013 MarginTradeType が返る。
+    これらは値上がり率上位に頻出するので、6 時間止めると当日いっぱい触れない。
+    制度信用 (MarginTradeType=1) なら建てられる。
+
+    持ち越しの安全性は確認済み: DAYTRADE_FORCE_CLOSE_ONLY_MARGIN_TYPE="0" なので
+    15:24:30 の強制決済は MarginTradeType=1 も対象にする (kabu_api/daytrade_credit.py
+    _is_target_position)。新規は ENTRY_NO_NEW_AFTER=15:00 で止まる。
+
+    注意: 日計り信用は証券会社側も当日中に強制返済するが、制度信用は 6 か月
+    なので**自前の強制決済だけが持ち越しを防ぐ**。停止時はここが効かない。
+
+    ENTRY_MARGIN_TYPE_FALLBACK_ENABLED=0 で従来動作 (6 時間ブロック) に戻る。
+    """
+    import os
+
+    v = str(os.getenv("ENTRY_MARGIN_TYPE_FALLBACK_ENABLED", "1")).strip().lower()
+    return v not in ("0", "false", "no", "off", "ng", "disabled")
+
+
+def _margin_type_fallback_value() -> int:
+    """フォールバック先の信用区分。既定 1 (制度信用)。"""
+    import os
+
+    try:
+        return int(float(os.getenv("ENTRY_MARGIN_TYPE_FALLBACK", "1") or 1))
+    except Exception:
+        return 1
+
+
+def _margin_type_fallback_applicable(payload: dict, data: Any) -> bool:
+    """この拒否を制度信用で再送してよいか。"""
+    if not _margin_type_fallback_enabled():
+        return False
+    if not _is_margin_type_unsupported(data):
+        return False
+    try:
+        if int(float(payload.get("CashMargin") or 0)) != 2:
+            return False  # 新規の信用建て以外は触らない
+        cur = int(float(payload.get("MarginTradeType") or 0))
+    except Exception:
+        return False
+    nxt = _margin_type_fallback_value()
+    if nxt <= 0 or nxt == cur:
+        return False
+    return True
+
+
 def _set_last_send_order_error(payload: dict, data: Any, *, status_code: Any = None) -> None:
     global _LAST_SEND_ORDER_ERROR
     code, message = _extract_code_message(data)
@@ -355,7 +406,23 @@ def _log_send_attempt(payload: dict) -> None:
 # 🌐 統一注文 API（常に dict を返す）
 # ============================================================
 
-def send_order_common(payload: dict):
+def _retry_with_fallback_margin(payload: dict, data: Any, *, status_code: Any = None):
+    """日計り信用が使えない銘柄を制度信用で 1 回だけ建て直す。"""
+    nxt = _margin_type_fallback_value()
+    code, message = _extract_code_message(data)
+    new_payload = dict(payload)
+    new_payload["MarginTradeType"] = nxt
+    logger.warning(
+        "[SEND ORDER MARGIN FALLBACK] symbol=%s side=%s margin_type=%s -> %s "
+        "code=%s message=%s status=%s (日計り信用の対象外なので制度信用で再送。"
+        "15:24:30 の強制決済は MarginTradeType=%s も対象)",
+        _safe_symbol(payload), _payload_side_name(payload),
+        payload.get("MarginTradeType"), nxt, code, message, status_code, nxt,
+    )
+    return send_order_common(new_payload, _margin_fallback_done=True)
+
+
+def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
     if not isinstance(payload, dict):
         logger.error("❌ send_order_common: payload is not dict type=%s payload=%s", type(payload).__name__, payload)
         return None
@@ -388,6 +455,8 @@ def send_order_common(payload: dict):
                 data = res.json()
             except Exception:
                 data = res.text
+            if not _margin_fallback_done and _margin_type_fallback_applicable(payload, data):
+                return _retry_with_fallback_margin(payload, data, status_code=res.status_code)
             _handle_reject_response(payload, data, status_code=res.status_code)
             code, message = _extract_code_message(data)
             logger.error(
@@ -405,6 +474,9 @@ def send_order_common(payload: dict):
 
         order_id = data.get("OrderId") if isinstance(data, dict) else None
         if not order_id:
+            if not _margin_fallback_done and _margin_type_fallback_applicable(payload, data):
+                return _retry_with_fallback_margin(
+                    payload, data, status_code=getattr(res, "status_code", None))
             _handle_reject_response(payload, data, status_code=getattr(res, "status_code", None))
             code, message = _extract_code_message(data)
             logger.error(
