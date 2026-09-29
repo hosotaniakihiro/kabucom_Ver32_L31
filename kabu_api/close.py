@@ -80,8 +80,117 @@ def _find_execution(order_id: str, token: str):
 # ============================================================
 # 信用返済（ClosePositions）
 # ============================================================
+# ============================================================
+# 2026-09-29: Code=8「決済指定内容に誤りがあります」への対処
+# ------------------------------------------------------------
+# 5301 で 13:35:53〜13:48:14 の 13 分間・24 回連続で返済が失敗した。
+# エントリーは 200 株 1 件で約定したが、証券会社側は 100 株 x 2 件の建玉
+# として保持していた。ClosePositions に HoldID 1 件へ 200 株を指定していた
+# ため数量が合わず拒否されていた。13 分で 2340 -> 2324 まで下がり、損失が
+# 約 -440 円から -1,820 円に拡大した。引け間際に起きると持ち越しになる。
+#
+# 失敗したときだけ /positions の実データで ClosePositions を組み直して
+# 1 回再送する。成功している既存経路は変えない。
+# EXIT_CLOSE_SPLIT_RETRY_ENABLED=0 で無効化。
+# ============================================================
+def _close_split_retry_enabled() -> bool:
+    import os
+
+    v = str(os.getenv("EXIT_CLOSE_SPLIT_RETRY_ENABLED", "1")).strip().lower()
+    return v not in ("0", "false", "no", "off", "ng", "disabled")
+
+
+def _resp_code(text) -> str:
+    """レスポンスから Code を取り出す。取れなければ空文字。"""
+    try:
+        if isinstance(text, dict):
+            return str(text.get("Code") or "")
+        d = json.loads(str(text))
+        return str(d.get("Code") or "")
+    except Exception:
+        return ""
+
+
+def _cf(v, d=0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return d
+
+
+def _actual_close_positions(symbol, side, margin_type, want_qty):
+    """建玉の実 HoldID / LeavesQty から ClosePositions を組む。
+
+    side は返済側 (1=売返済 -> 買建 Side=2 を探す)。
+    古い建玉から順に want_qty を満たすまで積む。組めなければ None。
+    """
+    try:
+        from kabu_api.positions import get_positions
+
+        rows = get_positions() or []
+    except Exception:
+        logger.exception("[EXIT CLOSE SPLIT] /positions 取得に失敗")
+        return None
+    if not isinstance(rows, list):
+        return None
+    try:
+        want_side = 2 if int(side) == 1 else 1
+    except Exception:
+        return None
+    sym = str(symbol)
+    cands = []
+    for p in rows:
+        if not isinstance(p, dict):
+            continue
+        if str(p.get("Symbol") or "") != sym:
+            continue
+        try:
+            if int(_cf(p.get("Side"), 0)) != want_side:
+                continue
+        except Exception:
+            continue
+        mt = int(_cf(p.get("MarginTradeType"), 0))
+        if mt <= 0:
+            continue
+        try:
+            if margin_type and mt != int(margin_type):
+                continue
+        except Exception:
+            pass
+        q = _cf(p.get("LeavesQty"), 0.0) or _cf(p.get("HoldQty"), 0.0)
+        hid = str(p.get("HoldID") or p.get("ExecutionID") or "").strip()
+        if q <= 0 or not hid:
+            continue
+        cands.append((str(p.get("ExecutionDay") or ""), hid, int(q)))
+    if not cands:
+        logger.warning(
+            "[EXIT CLOSE SPLIT] 該当建玉が見つからない symbol=%s side=%s margin_type=%s",
+            symbol, side, margin_type,
+        )
+        return None
+    cands.sort(key=lambda x: (x[0], x[1]))
+    out = []
+    remain = int(want_qty)
+    for _day, hid, q in cands:
+        if remain <= 0:
+            break
+        take = min(remain, q)
+        out.append({"HoldID": hid, "Qty": int(take)})
+        remain -= take
+    total = sum(int(x["Qty"]) for x in out)
+    logger.warning(
+        "[EXIT CLOSE SPLIT] 実建玉から組み直した symbol=%s want=%s built=%s "
+        "remain=%s holds=%s",
+        symbol, want_qty, total, remain, out,
+    )
+    if total <= 0:
+        return None
+    return out
+
+
 def _send_credit_close_order_core(
-    symbol, qty, hold_id, side, exchange, margin_type, account_type
+    symbol, qty, hold_id, side, exchange, margin_type, account_type,
+    _close_positions=None, _split_retry_done=False,
 ):
 
     token = get_valid_token()
@@ -121,9 +230,10 @@ def _send_credit_close_order_core(
         "FrontOrderType": 10,          # 成行返済
         "Price": 0,
         "ExpireDay": 0,
-        "ClosePositions": [
-            {"HoldID": hold_id, "Qty": int(qty)}
-        ],
+        "ClosePositions": (
+            list(_close_positions) if _close_positions
+            else [{"HoldID": hold_id, "Qty": int(qty)}]
+        ),
     }
 
     print("\n===== SENDORDER(EXIT-CREDIT) =====")
@@ -138,6 +248,34 @@ def _send_credit_close_order_core(
 
     if res.status_code != 200:
         logger.error(f"❌ EXIT注文エラー {res.status_code}: {res.text}")
+        if (
+            not _split_retry_done
+            and _close_split_retry_enabled()
+            and _resp_code(res.text) == "8"
+        ):
+            cps = _actual_close_positions(symbol, side, margin_type, qty)
+            same = bool(
+                cps
+                and len(cps) == 1
+                and str(cps[0].get("HoldID")) == str(hold_id)
+                and int(cps[0].get("Qty") or 0) == int(qty)
+            )
+            if cps and not same:
+                logger.warning(
+                    "[EXIT CLOSE SPLIT] Code=8 だったので実建玉の内訳で再送する "
+                    "symbol=%s qty=%s 旧=[{HoldID:%s,Qty:%s}] 新=%s",
+                    symbol, qty, hold_id, qty, cps,
+                )
+                return _send_credit_close_order_core(
+                    symbol, qty, hold_id, side, exchange, margin_type,
+                    account_type,
+                    _close_positions=cps, _split_retry_done=True,
+                )
+            logger.warning(
+                "[EXIT CLOSE SPLIT] 組み直せなかった/同じ内容なので再送しない "
+                "symbol=%s cps=%s",
+                symbol, cps,
+            )
         return None
 
     js = res.json()
