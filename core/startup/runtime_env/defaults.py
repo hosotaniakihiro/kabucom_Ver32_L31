@@ -448,6 +448,16 @@ ENTRY_DEFAULTS: Dict[str, str] = {
 }
 
 SUMMARY_YAHOO_DEFAULTS: Dict[str, str] = {
+    # 2026-09-29: 前日ウォームアップを全 interval で止める。
+    #   main.py が 1,156 銘柄 x 3 時間枠 = 175,341 行/サイクルを計算して
+    #   1 分足フレームが 6 分遅れになり、STALE で全行破棄されて発注ゼロだった。
+    #   前日ウォームアップだけで 3分足 75,860 行 + 5分足 52,688 行を足していた。
+    #   エントリージョブも前回が終わらず tonosama 25 回 / ranking 12 回スキップ。
+    #   実売買できるのは PUSH 登録中の約 50 銘柄だけ (候補 49 件中 10 件が登録中)。
+    #   代償: 3分/5分の RSI が当日足だけになる (0a6f222 の効果は寄り後 1 時間
+    #   ほど落ちる。3分足は 09:45 頃、5分足は 10:10 頃に 14 本そろう)。
+    #   "1min" だけに戻せば 3分/5分の前日ウォームアップは復活する。
+    "PREVDAY_WARMUP_SKIP_INTERVALS": "1min,3min,5min",
     "AUTOSTOCK_MAIN_SKIP_SUMMARY_DB_SAVE": "1",
     "AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT": "1",
     "YAHOO_COMPLEMENT_RUN_IN_MAIN": "0",

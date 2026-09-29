@@ -23,6 +23,13 @@ import pandas as pd
 from global_state import global_data
 from .config import (
     ACTIVE_GAINERS_BY_VALUE_N,
+    ACTIVE_GROWTH_GAINERS_N,
+    ACTIVE_RANK_SLICE_N,
+    ACTIVE_TICK_BY_GAINERS_N,
+    ALL_MARKET_CODES,
+    GROWTH_MARKET_CODES,
+    MARKET_COLUMNS,
+    RANK_COLUMNS,
     ACTIVE_LOSERS_BY_VALUE_N,
     ACTIVE_TICK_SUPPLEMENT_N,
     ACTIVE_USE_CATEGORY_QUOTA_SELECTION,
@@ -104,6 +111,8 @@ def _read_latest_ranking_from_db(limit_per_type: int = 250) -> Dict[Any, pd.Data
                     change_col = "change_percentage" if "change_percentage" in cols else ("change_rate" if "change_rate" in cols else "0")
                     symbolname_col = "symbolname" if "symbolname" in cols else "''"
                     rank_col = "rank" if "rank" in cols else "0"
+                    market_col = ("market" if "market" in cols
+                                  else ("exchange" if "exchange" in cols else "''"))
                     where = f"date({dt_col}) = date('now','localtime')" if dt_col in cols else "1=1"
                     sql = f"""
                     SELECT symbol,
@@ -115,7 +124,8 @@ def _read_latest_ranking_from_db(limit_per_type: int = 250) -> Dict[Any, pd.Data
                            {val_col} AS trading_value,
                            {tick_col} AS tick_count,
                            {change_col} AS change_percentage,
-                           {rank_col} AS rank
+                           {rank_col} AS rank,
+                           {market_col} AS market
                     FROM {table}
                     WHERE {where}
                     ORDER BY {dt_col} DESC
@@ -258,6 +268,19 @@ def normalize_ranking_df(df: pd.DataFrame, *, rank_key: Any = None) -> pd.DataFr
     out["tick_count"] = safe_numeric_series(out, "tick_count")
     out["volume_speed"] = safe_numeric_series(out, "volume_speed")
     out["change_percentage"] = safe_numeric_series(out, "change_percentage")
+
+    # 2026-09-29: 設計の「各ランキング上位50位」と「グロース市場専用枠」を
+    # 実装するため、順位と市場を落とさずに残す。
+    if "rank" not in out.columns:
+        c = first_existing_col(out, RANK_COLUMNS)
+        if c:
+            out["rank"] = out[c]
+    out["rank"] = safe_numeric_series(out, "rank") if "rank" in out.columns else 0.0
+    if "market" not in out.columns:
+        c = first_existing_col(out, MARKET_COLUMNS)
+        out["market"] = out[c].astype(str) if c else ""
+    else:
+        out["market"] = out["market"].astype(str)
     return out
 
 
@@ -316,6 +339,56 @@ def _concat_kind(frames: Dict[str, List[pd.DataFrame]], kind: str) -> pd.DataFra
         return pd.DataFrame()
 
 
+def _top_rank(df: pd.DataFrame, n: int, *, metric_col: str, ascending: bool = False) -> pd.DataFrame:
+    """そのランキングの上位 n 位だけに絞る (設計の「上位50位」)。
+
+    rank 列が使えるならそれで切る。NULL/0 ばかりの場合は、そのランキングの
+    並び順を決めている指標 (値上がり率なら change_percentage、売買代金なら
+    trading_value、TICK なら tick_count) の上位 n 件で代用する。
+    ranking_summary_* は rank が NULL になることがあるため代用経路が必要。
+    """
+    if df is None or df.empty or n <= 0:
+        return df if df is not None else pd.DataFrame()
+    out = df.copy()
+    if "rank" in out.columns:
+        r = pd.to_numeric(out["rank"], errors="coerce")
+        usable = r.notna() & (r >= 1)
+        if int(usable.sum()) >= max(1, int(0.5 * len(out))):
+            # 半分以上で順位が取れるならそれを使う。取れない行は落とす。
+            return out.loc[usable & (r <= float(n))].copy()
+    if metric_col in out.columns:
+        try:
+            out = out.sort_values(metric_col, ascending=ascending)
+        except Exception:
+            pass
+    return out.head(int(n)).copy()
+
+
+def _by_market(df: pd.DataFrame, codes) -> pd.DataFrame:
+    """market / exchange がこの集合のものだけ。市場列が無ければそのまま返す。"""
+    if df is None or df.empty or "market" not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    want = {str(x).strip().upper() for x in (codes or ())}
+    if not want:
+        return df
+    m = df["market"].astype(str).str.strip().str.upper()
+    out = df.loc[m.isin(want)].copy()
+    return out
+
+
+def _split_up_down(value: pd.DataFrame):
+    """売買代金ランキングを上昇組 / 下落組に分ける。"""
+    if value is None or value.empty or "change_percentage" not in value.columns:
+        return pd.DataFrame(), pd.DataFrame()
+    ch = pd.to_numeric(value["change_percentage"], errors="coerce").fillna(0.0)
+    up = value.loc[ch >= 0].copy()
+    down = value.loc[ch < 0].copy()
+    if not down.empty:
+        down["_abs_change"] = pd.to_numeric(
+            down["change_percentage"], errors="coerce").abs().fillna(0.0)
+    return up, down
+
+
 def _pick_symbols(df: pd.DataFrame, *, n: int, sort_col: str, ascending: bool = False) -> List[str]:
     if df is None or df.empty or "symbol" not in df.columns:
         return []
@@ -342,37 +415,83 @@ def _append_unique(dst: List[str], src: List[str], *, max_total: int = TARGET_AC
 
 
 def category_quota_ranking_symbols(now: Optional[dt.datetime] = None) -> List[str]:
+    """設計どおりに監視母集団を組む (2026-09-29 修正)。
+
+    全市場・値上がり率 上位50 -> 売買代金 上位35
+    全市場・値下がり率 上位50 -> 売買代金 上位25
+    全市場・売買代金   上位50 -> 上昇率 上位30 / 下落率 上位20
+    全市場・TICK回数   上位50 -> 上昇率 上位30
+    グロース・値上がり率 上位30
+    -> 重複排除して最大 TARGET_ACTIVE_SYMBOLS 銘柄
+
+    ACTIVE_RANK_SLICE_N=0 にすると上位スライスを掛けない従来動作に戻る。
+    """
     frames = _ranking_frames_by_kind(today_only=True, now=now)
-    gainers = _concat_kind(frames, "gainers")
-    losers = _concat_kind(frames, "losers")
-    value = _concat_kind(frames, "value")
-    tick = _concat_kind(frames, "tick")
-    if tick.empty:
-        tick = _concat_kind(frames, "volume_speed")
+    gainers_all_raw = _concat_kind(frames, "gainers")
+    losers_raw = _concat_kind(frames, "losers")
+    value_raw = _concat_kind(frames, "value")
+    tick_raw = _concat_kind(frames, "tick")
+    if tick_raw.empty:
+        tick_raw = _concat_kind(frames, "volume_speed")
+
+    slice_n = int(ACTIVE_RANK_SLICE_N or 0)
+
+    # --- 全市場分 ---------------------------------------------------
+    # 市場列で ALL を選べるならそれを使う。使えない (列が無い / ALL が無い)
+    # ときは全部をそのまま母集団にする。
+    def _all_market(df: pd.DataFrame) -> pd.DataFrame:
+        picked = _by_market(df, ALL_MARKET_CODES)
+        return picked if not picked.empty else df
+
+    gainers = _top_rank(_all_market(gainers_all_raw), slice_n,
+                        metric_col="change_percentage", ascending=False)
+    losers = _top_rank(_all_market(losers_raw), slice_n,
+                       metric_col="change_percentage", ascending=True)
+    value = _top_rank(_all_market(value_raw), slice_n,
+                      metric_col="trading_value", ascending=False)
+    tick = _top_rank(_all_market(tick_raw), slice_n,
+                     metric_col="tick_count", ascending=False)
+
+    v_up, v_down = _split_up_down(value)
+
+    # --- グロース市場・値上がり率 -----------------------------------
+    growth = _by_market(gainers_all_raw, GROWTH_MARKET_CODES)
+    growth_pick = _pick_symbols(
+        _top_rank(growth, ACTIVE_GROWTH_GAINERS_N,
+                  metric_col="change_percentage", ascending=False),
+        n=ACTIVE_GROWTH_GAINERS_N, sort_col="change_percentage", ascending=False)
 
     selected: List[str] = []
-    _append_unique(selected, _pick_symbols(gainers, n=ACTIVE_GAINERS_BY_VALUE_N, sort_col="trading_value", ascending=False))
-    _append_unique(selected, _pick_symbols(losers, n=ACTIVE_LOSERS_BY_VALUE_N, sort_col="trading_value", ascending=False))
-    if not value.empty:
-        v_up = value[value.get("change_percentage", 0) >= 0].copy() if "change_percentage" in value.columns else value.copy()
-    else:
-        v_up = pd.DataFrame()
-    _append_unique(selected, _pick_symbols(v_up, n=ACTIVE_VALUE_BY_GAINERS_N, sort_col="change_percentage", ascending=False))
-    if not value.empty:
-        v_down = value[value.get("change_percentage", 0) < 0].copy() if "change_percentage" in value.columns else value.copy()
-        try:
-            v_down["_abs_change"] = v_down["change_percentage"].abs()
-        except Exception:
-            v_down["_abs_change"] = 0.0
-    else:
-        v_down = pd.DataFrame()
-    _append_unique(selected, _pick_symbols(v_down, n=ACTIVE_VALUE_BY_LOSERS_N, sort_col="_abs_change", ascending=False))
-    tick_pick = _pick_symbols(tick, n=ACTIVE_TICK_SUPPLEMENT_N, sort_col="tick_count", ascending=False)
-    _append_unique(selected, tick_pick, max_total=TARGET_ACTIVE_SYMBOLS)
+    # 1. 値上がり率上位50 の中から売買代金上位35
+    _append_unique(selected, _pick_symbols(
+        gainers, n=ACTIVE_GAINERS_BY_VALUE_N, sort_col="trading_value", ascending=False))
+    # 2. 値下がり率上位50 の中から売買代金上位25
+    _append_unique(selected, _pick_symbols(
+        losers, n=ACTIVE_LOSERS_BY_VALUE_N, sort_col="trading_value", ascending=False))
+    # 3. 売買代金上位50 の中から上昇率上位30
+    _append_unique(selected, _pick_symbols(
+        v_up, n=ACTIVE_VALUE_BY_GAINERS_N, sort_col="change_percentage", ascending=False))
+    # 4. 売買代金上位50 の中から下落率上位20
+    _append_unique(selected, _pick_symbols(
+        v_down, n=ACTIVE_VALUE_BY_LOSERS_N, sort_col="_abs_change", ascending=False))
+    # 5. TICK上位50 の中から上昇率上位30
+    _append_unique(selected, _pick_symbols(
+        tick, n=ACTIVE_TICK_BY_GAINERS_N, sort_col="change_percentage", ascending=False))
+    # 6. グロース市場・値上がり率上位30
+    _append_unique(selected, growth_pick, max_total=TARGET_ACTIVE_SYMBOLS)
 
     logger.warning(
-        "[ACTIVE CATEGORY QUOTA] selected=%d gainers=%d losers=%d value=%d tick=%d min_price=%.1f max_price=%.1f head=%s",
-        len(selected), len(gainers), len(losers), len(value), len(tick), MIN_PRICE, MAX_PRICE, selected[:20],
+        "[ACTIVE CATEGORY QUOTA] selected=%d slice_n=%d "
+        "pool(all)=gainers %d->%d losers %d->%d value %d->%d tick %d->%d "
+        "growth=%d quota=%d/%d/%d/%d/%d/%d min_price=%.1f max_price=%.1f head=%s",
+        len(selected), slice_n,
+        len(gainers_all_raw), len(gainers), len(losers_raw), len(losers),
+        len(value_raw), len(value), len(tick_raw), len(tick),
+        len(growth),
+        ACTIVE_GAINERS_BY_VALUE_N, ACTIVE_LOSERS_BY_VALUE_N,
+        ACTIVE_VALUE_BY_GAINERS_N, ACTIVE_VALUE_BY_LOSERS_N,
+        ACTIVE_TICK_BY_GAINERS_N, ACTIVE_GROWTH_GAINERS_N,
+        MIN_PRICE, MAX_PRICE, selected[:20],
     )
     return selected[:TARGET_ACTIVE_SYMBOLS]
 

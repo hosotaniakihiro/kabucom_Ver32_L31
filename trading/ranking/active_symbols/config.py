@@ -41,19 +41,49 @@ RANKING_EXPIRE_MINUTES = env_int("ACTIVE_RANKING_EXPIRE_MINUTES", 20)
 VOLUME_SPEED_TOP_N = env_int("ACTIVE_VOLUME_SPEED_TOP_N", 10)
 
 # ------------------------------------------------------------
-# 今日ランキングカテゴリ配分
+# 今日ランキングカテゴリ配分  (2026-09-29 設計どおりに修正)
 # ------------------------------------------------------------
-# 1. 値上がり率ランキング内で売買代金上位30
-# 2. 値下がり率ランキング内で売買代金上位10
-# 3. 売買代金ランキング内で上昇率上位30
-# 4. 売買代金ランキング内で下落率上位10
-# 5. 残りはTICK上位で100まで補充
+# ユーザー指定の設計:
+#   1. 全市場・値上がり率 上位50   -> その中から 売買代金 上位35
+#   2. 全市場・値下がり率 上位50   -> その中から 売買代金 上位25
+#   3. 全市場・売買代金   上位50   -> その中から 上昇率 上位30 / 下落率 上位20
+#   4. 全市場・TICK回数   上位50   -> その中から 上昇率 上位30
+#   5. グロース市場・値上がり率 上位30
+#   -> 重複排除して最大 100 銘柄
+#
+# 2026-09-29 まで、各ランキングを「上位50」に切る処理が無く、上位250位
+# (limit_per_type=250) をまるごと母集団にしていた。実測 gainers=207 /
+# losers=214 / value=342 / tick=201。
+# 「値上がり率 207 銘柄の中で売買代金が最大の 30 銘柄」を選ぶと、わずかに
+# 上がっただけの大型株 (7203 トヨタ / 8306 三菱UFJ / 8058 三菱商事 /
+# 6758 ソニー / 6501 日立 ...) が並ぶ。値動きが小さいので ATR_1M_FILTER_NG
+# で全部落ち、実際に急騰している小型株 (259A / 625A / 621A / 4980 ...) は
+# 監視対象に入らない。エントリー候補と PUSH 登録銘柄の重なりは 20% だった。
 ACTIVE_USE_CATEGORY_QUOTA_SELECTION = env_bool("ACTIVE_USE_CATEGORY_QUOTA_SELECTION", True)
-ACTIVE_GAINERS_BY_VALUE_N = env_int("ACTIVE_GAINERS_BY_VALUE_N", 30)
-ACTIVE_LOSERS_BY_VALUE_N = env_int("ACTIVE_LOSERS_BY_VALUE_N", 10)
+
+# 各ランキングの母集団をこの順位までに切る (設計の「上位50位」)。
+# 0 にすると従来どおり切らない。
+ACTIVE_RANK_SLICE_N = env_int("ACTIVE_RANK_SLICE_N", 50)
+
+ACTIVE_GAINERS_BY_VALUE_N = env_int("ACTIVE_GAINERS_BY_VALUE_N", 35)
+ACTIVE_LOSERS_BY_VALUE_N = env_int("ACTIVE_LOSERS_BY_VALUE_N", 25)
 ACTIVE_VALUE_BY_GAINERS_N = env_int("ACTIVE_VALUE_BY_GAINERS_N", 30)
-ACTIVE_VALUE_BY_LOSERS_N = env_int("ACTIVE_VALUE_BY_LOSERS_N", 10)
+ACTIVE_VALUE_BY_LOSERS_N = env_int("ACTIVE_VALUE_BY_LOSERS_N", 20)
+
+# TICK 上位50 の中から上昇率上位30。
+# 旧実装は ACTIVE_TICK_SUPPLEMENT_N=100 で「TICK 上位から 100 まで補充」
+# (上昇率の条件が無かった)。
+ACTIVE_TICK_BY_GAINERS_N = env_int("ACTIVE_TICK_BY_GAINERS_N", 30)
 ACTIVE_TICK_SUPPLEMENT_N = env_int("ACTIVE_TICK_SUPPLEMENT_N", 100)
+
+# グロース市場・値上がり率 上位30 (専用枠)。
+ACTIVE_GROWTH_GAINERS_N = env_int("ACTIVE_GROWTH_GAINERS_N", 30)
+GROWTH_MARKET_CODES = ("TG", "GROWTH", "グロース", "東証グロース", "G")
+ALL_MARKET_CODES = ("ALL", "", "全市場")
+
+# 順位 / 市場の列名候補。
+RANK_COLUMNS = ("rank", "rank_position", "順位", "ranking", "best_rank")
+MARKET_COLUMNS = ("market", "exchange", "ExchangeDivision", "市場", "exchange_division")
 
 DEFAULT_SYMBOL_FLAGS_DB = nas_path(r"Basic\symbol_flags.db")
 SYMBOL_FLAGS_DB = os.environ.get("SYMBOL_FLAGS_DB_PATH", DEFAULT_SYMBOL_FLAGS_DB)
