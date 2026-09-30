@@ -323,6 +323,123 @@ def _add_indicators(bars: pd.DataFrame) -> pd.DataFrame:
     return bars
 
 
+# ============================================================
+# 2026-09-30: 前営業日の 3/5 分足を指標計算の前に連結する
+# ------------------------------------------------------------
+# MTF MA ゲート (close > 5MA > 25MA) はここで作る当日ティック由来の足だけで
+# ma を出しており、rolling(min_periods=1) なので寄り直後の「25MA」は手元の
+# 数本の平均だった (3 分足で本当の 25 本平均になるのは 10:15、5 分足 11:05)。
+# 前営業日の summary DB (stock_summary_3min / _5min) から銘柄ごと直近 120 本を
+# 起動後に 1 回だけ裏で読み、ma / rsi / macd の計算にだけ使って捨てる。
+# vwap と slope は当日分だけで計算し直す (前日を混ぜない)。
+# 読み込みが終わるまでは従来どおり当日分だけで計算する (待たない)。
+# MTF_LOCAL_BARS_PREVDAY_ENABLED=0 で無効。
+# ============================================================
+_PREV_LOCK = threading.Lock()
+# (tf, day) -> {symbol: 前日足}。読み終えた銘柄は (空でも) キーを持つ
+_PREV_BARS: Dict[Tuple[int, str], Dict[str, pd.DataFrame]] = {}
+_PREV_PENDING: set = set()          # (tf, day_iso, symbol)
+_PREV_WORKER_STARTED = False
+_PREV_BARS_PER_SYMBOL = 120
+
+
+def _prevday_enabled() -> bool:
+    v = str(os.getenv("MTF_LOCAL_BARS_PREVDAY_ENABLED", "1") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _prev_load_batch(tf: int, day: dt.date, syms: tuple) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {s_: pd.DataFrame() for s_ in syms}
+    from trading.summary.indicators import indicator_calculator as IC
+
+    db = IC._find_prev_summary_db(day.strftime("%Y%m%d"))
+    if not db:
+        return out
+    df = IC._load_prevday_warmup_per_symbol(db, f"stock_summary_{int(tf)}min", syms, _PREV_BARS_PER_SYMBOL)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return out
+    w = pd.DataFrame({
+        "symbol": df["symbol"].map(_norm_symbol),
+        "datetime": pd.to_datetime(df["datetime"], errors="coerce"),
+    })
+    for k in ("open", "high", "low", "close"):
+        src = f"{k}_price" if f"{k}_price" in df.columns else k
+        w[k] = pd.to_numeric(df[src], errors="coerce") if src in df.columns else np.nan
+    w["volume"] = pd.to_numeric(df["volume"], errors="coerce") if "volume" in df.columns else 0.0
+    w = w.dropna(subset=["datetime", "close"])
+    w = w[(w["datetime"] < pd.Timestamp(day)) & (w["close"] > 0)]
+    for sym, g in w.groupby("symbol", sort=False):
+        out[str(sym)] = g.sort_values("datetime").reset_index(drop=True)
+    return out
+
+
+def _prev_worker() -> None:
+    """要求された銘柄を 1 秒ごとにまとめて前日 DB から読む。"""
+    while True:
+        try:
+            with _PREV_LOCK:
+                pending = list(_PREV_PENDING)
+                _PREV_PENDING.clear()
+            groups: Dict[Tuple[int, str], list] = {}
+            for tf, day_iso, sym in pending:
+                groups.setdefault((tf, day_iso), []).append(sym)
+            for (tf, day_iso), syms in groups.items():
+                t0 = dt.datetime.now()
+                try:
+                    got = _prev_load_batch(tf, dt.date.fromisoformat(day_iso), tuple(sorted(set(syms))))
+                except Exception:
+                    logger.warning("[MTF LOCAL BARS PREVDAY] load failed tf=%s", tf, exc_info=True)
+                    got = {s_: pd.DataFrame() for s_ in syms}
+                with _PREV_LOCK:
+                    _PREV_BARS.setdefault((tf, day_iso), {}).update(got)
+                logger.info(
+                    "[MTF LOCAL BARS PREVDAY] loaded tf=%s symbols=%s hit=%s elapsed=%.2fs",
+                    tf, len(got), sum(1 for v in got.values() if not v.empty),
+                    (dt.datetime.now() - t0).total_seconds(),
+                )
+        except Exception:
+            logger.debug("[MTF LOCAL BARS PREVDAY] worker error", exc_info=True)
+        import time as _t
+        _t.sleep(1.0)
+
+
+def _prev_bars_for(sym: str, tf: int, day: dt.date) -> Optional[pd.DataFrame]:
+    global _PREV_WORKER_STARTED
+    if tf not in (3, 5) or not _prevday_enabled():
+        return None
+    key = (int(tf), day.isoformat())
+    with _PREV_LOCK:
+        per = _PREV_BARS.get(key) or {}
+        if sym in per:
+            return per[sym]
+        _PREV_PENDING.add((int(tf), day.isoformat(), sym))
+        if not _PREV_WORKER_STARTED:
+            _PREV_WORKER_STARTED = True
+            threading.Thread(target=_prev_worker, name="mtf-prevday", daemon=True).start()
+    # 読み終わるまでは当日分だけで計算する (待たない)
+    return None
+
+
+def _add_indicators_with_prevday(bars: pd.DataFrame, prev: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if prev is None or prev.empty or bars.empty:
+        return _add_indicators(bars)
+    p = prev[prev["datetime"] < bars["datetime"].min()]
+    if p.empty:
+        return _add_indicators(bars)
+    p = p.copy()
+    p["__prevday"] = True
+    cur = bars.copy()
+    cur["__prevday"] = False
+    comb = pd.concat([p, cur], ignore_index=True, sort=False)
+    comb = _add_indicators(comb)
+    out = comb[~comb["__prevday"].astype(bool)].drop(columns=["__prevday"]).reset_index(drop=True)
+    # vwap / slope は当日分だけで (前日との窓明けギャップを混ぜない)
+    today_only = _add_indicators(bars.copy())
+    out["vwap"] = today_only["vwap"].values
+    out["slope"] = today_only["slope"].values
+    return out
+
+
 def get_bars(symbol, tf: int, now: Optional[dt.datetime] = None) -> pd.DataFrame:
     """当日の tf 分足 (指標付き)。列: symbol, datetime(足の開始), open, high, low, close,
     volume, tick_count, ma5, ma25, ma75, rsi, macd, signal, hist, vwap, slope, completed。
@@ -359,7 +476,7 @@ def get_bars(symbol, tf: int, now: Optional[dt.datetime] = None) -> pd.DataFrame
         bars.index.name = "datetime"
         bars = bars.reset_index()
         bars["symbol"] = sym
-        bars = _add_indicators(bars)
+        bars = _add_indicators_with_prevday(bars, _prev_bars_for(sym, tf, now.date()))
         # 旧 conditions_long/short のヘルパー (_is_bull 等) は *_price 列名を見る
         for k in ("open", "high", "low", "close"):
             bars[f"{k}_price"] = bars[k]

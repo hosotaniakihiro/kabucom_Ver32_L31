@@ -475,7 +475,15 @@ SUMMARY_YAHOO_DEFAULTS: Dict[str, str] = {
     #   RANKING_COLLECTOR_ENABLE_FULL_TICK=0 で従来動作に戻る。
     "RANKING_COLLECTOR_ENABLE_FULL_TICK": "1",
     "RANKING_COLLECTOR_FULL_EVERY_MINUTES": "3",
-    "PREVDAY_WARMUP_SKIP_INTERVALS": "1min,3min,5min",
+    # 2026-09-30: 前日の 1/3/5 分足 summary を指標計算の前に連結する (設計どおり)。
+    #   9/29 10:01 に全 interval で止めていたため、寄り直後は当日の数本だけで
+    #   RSI/MACD/5MA/25MA を計算していた (3 分足の本当の 25MA は 10:15、5 分足は 11:05)。
+    #   止めた理由の重さは、ranking summary の監視銘柄化 (約 100 銘柄) と
+    #   前日ウォームアップの銘柄単位キャッシュ (indicator_calculator) で解消。
+    #   100 銘柄の実測: 当日最初の足で ma25/rsi が 97-99/100 埋まる。
+    #   追加コストは初回だけ NAS 読み 0.8-8.8 秒、以降 +0.1-0.3 秒。
+    #   "none" はどの interval とも一致しない = 全 interval で前日を読む。
+    "PREVDAY_WARMUP_SKIP_INTERVALS": "none",
     "AUTOSTOCK_MAIN_SKIP_SUMMARY_DB_SAVE": "1",
     "AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT": "1",
     "YAHOO_COMPLEMENT_RUN_IN_MAIN": "0",

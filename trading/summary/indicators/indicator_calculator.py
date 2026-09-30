@@ -1249,6 +1249,55 @@ def _prevday_warmup_skip_intervals() -> frozenset[str]:
     return frozenset(out)
 
 
+# ============================================================
+# 2026-09-30: 前日ウォームアップを銘柄単位でキャッシュする
+# ------------------------------------------------------------
+# _load_prevday_warmup_cached は「銘柄の組 (tuple) そのもの」がキーの
+# lru_cache で、監視銘柄が入れ替わるたびに NAS の前日 DB を読み直していた
+# (100 銘柄で 1 分足 8.8 秒 / 3 分足 4.3 秒 / 5 分足 3.7 秒)。9/29 に 1 分足で
+# 前日ウォームアップを有効にしたとき push_runner の予算 45 秒を超えて summary が
+# 全部捨てられたのはこれが効いていた。前日 DB は日中に変わらないので、
+# (db, table, 本数) ごとに銘柄単位で持ち、未取得の銘柄だけを読む。
+# ============================================================
+_PREVDAY_SYMBOL_CACHE: dict[tuple, dict[str, "pd.DataFrame"]] = {}
+_PREVDAY_SYMBOL_CACHE_LOCK = threading.Lock()
+
+
+def _load_prevday_warmup_per_symbol(db_path: str, table: str, symbols: tuple[str, ...], rows_per_symbol: int) -> pd.DataFrame:
+    if not db_path or not symbols or rows_per_symbol <= 0:
+        return pd.DataFrame()
+    key = (str(db_path), str(table), int(rows_per_symbol))
+    with _PREVDAY_SYMBOL_CACHE_LOCK:
+        if len(_PREVDAY_SYMBOL_CACHE) > 16:
+            _PREVDAY_SYMBOL_CACHE.clear()
+        per = _PREVDAY_SYMBOL_CACHE.setdefault(key, {})
+        missing = tuple(sorted({str(x) for x in symbols} - set(per)))
+    if missing:
+        t0 = time.perf_counter()
+        loaded = _load_prevday_warmup_cached.__wrapped__(db_path, table, missing, rows_per_symbol)
+        got: dict[str, pd.DataFrame] = {}
+        if isinstance(loaded, pd.DataFrame) and not loaded.empty:
+            sc = "symbol" if "symbol" in loaded.columns else ("Symbol" if "Symbol" in loaded.columns else None)
+            if sc is not None:
+                for sym, g in loaded.groupby(loaded[sc].astype(str), sort=False):
+                    got[str(sym)] = g
+        with _PREVDAY_SYMBOL_CACHE_LOCK:
+            per = _PREVDAY_SYMBOL_CACHE.setdefault(key, {})
+            for sym in missing:
+                # 前日 DB に無い銘柄も空で覚えて、毎回読みに行かない
+                per[sym] = got.get(sym, pd.DataFrame())
+        logger.info(
+            "[IND PREVDAY WARMUP] loaded new symbols table=%s n=%s hit=%s elapsed=%.2fs db=%s",
+            table, len(missing), len(got), time.perf_counter() - t0, db_path,
+        )
+    with _PREVDAY_SYMBOL_CACHE_LOCK:
+        per = _PREVDAY_SYMBOL_CACHE.get(key, {})
+        frames = [per[str(x)] for x in symbols if str(x) in per and not per[str(x)].empty]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
 def _with_prevday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
     if not _prevday_env_bool("PREVDAY_INDICATOR_WARMUP_ENABLED", True):
         return df
@@ -1276,7 +1325,7 @@ def _with_prevday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
     if not db_path:
         return df
     table = _table_for_interval(interval)
-    warm = _load_prevday_warmup_cached(db_path, table, symbols, rows_per_symbol)
+    warm = _load_prevday_warmup_per_symbol(db_path, table, symbols, rows_per_symbol)
     if warm.empty:
         return df
     try:
