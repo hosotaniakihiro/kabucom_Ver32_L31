@@ -138,12 +138,37 @@ def run_mtf_history_bootstrap_safe(*, market_open_now: bool) -> None:
             bool(market_open_now),
         )
 
+        # 2026-09-30: 監視銘柄だけで作る。全ランキング銘柄 (約 1,000) だと
+        #   指標とスコアリングに 9-15 分かかり、その間 main.py の CPU を
+        #   取り切って PUSH の読み取りが時間切れになり summary が古くなる
+        #   (12:49-13:04 実測。午後に再起動するほど足が多く重い)。
+        #   監視銘柄が 10 未満/取得失敗なら従来どおり全銘柄。
+        #   MTF_HISTORY_BOOTSTRAP_ACTIVE_ONLY=0 で全銘柄。
+        _boot_symbols = None
+        try:
+            import os as _os
+
+            if str(_os.getenv("MTF_HISTORY_BOOTSTRAP_ACTIVE_ONLY", "1")).strip().lower() not in ("0", "false", "no", "off"):
+                from trading.ranking.active_symbols.manager import get_active_symbols
+
+                _syms = [str(x).strip() for x in (get_active_symbols() or []) if str(x).strip()]
+                if len(_syms) >= 10:
+                    _boot_symbols = _syms
+            logger.warning(
+                "[MTF HISTORY BOOTSTRAP] target symbols=%s",
+                "all" if _boot_symbols is None else len(_boot_symbols),
+            )
+        except Exception:
+            logger.warning("[MTF HISTORY BOOTSTRAP] active symbols 取得失敗 -> 全銘柄", exc_info=True)
+            _boot_symbols = None
+
         result = run_mtf_history_bootstrap(
             intervals=(1, 3, 5),
             max_rows_per_symbol_1m=420,
             lookback_days=3,
             persist=True,
             update_cache=True,
+            symbols=_boot_symbols,
         )
 
         compact = compact_mtf_history_bootstrap_result(result)
