@@ -1320,6 +1320,17 @@ def _with_prevday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
     rows_per_symbol = max(0, _prevday_env_int("PREVDAY_INDICATOR_WARMUP_BARS", 120))
     if rows_per_symbol <= 0:
         return df
+    # 2026-09-30: 全銘柄一括の呼び出し (起動時の ranking summary bootstrap
+    #   31,560 行 / 約 800 銘柄) では前日を読まない。1 分足 120 本 x 800 銘柄を
+    #   NAS から一度に読みに行った直後に main.py が 0xC0000005 で落ちた
+    #   (11:55:01、原因は未確定)。監視銘柄 (約 100) の計算には前日を使う。
+    _max_syms = _prevday_env_int("PREVDAY_WARMUP_MAX_SYMBOLS", 200)
+    if _max_syms > 0 and len(symbols) > _max_syms:
+        logger.info(
+            "[IND PREVDAY WARMUP] skipped symbols=%s > max=%s interval=%s",
+            len(symbols), _max_syms, _iv_name,
+        )
+        return df
     target_ymd = _prevday_target_date_yyyymmdd(df)
     db_path = _find_prev_summary_db(target_ymd)
     if not db_path:
