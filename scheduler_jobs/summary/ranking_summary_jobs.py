@@ -227,9 +227,22 @@ def _long_tf_active_only_enabled() -> bool:
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _1m_active_only_enabled() -> bool:
+    """1 分足も監視銘柄だけで作る。RANKING_SUMMARY_1M_ACTIVE_ONLY=0 で全銘柄。"""
+    v = os.getenv("RANKING_SUMMARY_1M_ACTIVE_ONLY")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _long_tf_symbols(interval: int):
-    """3/5 分足の計算対象。None は全銘柄 (従来動作)。"""
-    if int(interval) not in (3, 5) or not _long_tf_active_only_enabled():
+    """1/3/5 分足の計算対象。None は全銘柄 (従来動作)。"""
+    iv = int(interval)
+    if iv in (3, 5) and not _long_tf_active_only_enabled():
+        return None
+    if iv == 1 and not _1m_active_only_enabled():
+        return None
+    if iv not in (1, 3, 5):
         return None
     try:
         from trading.ranking.active_symbols.manager import get_active_symbols
@@ -312,7 +325,7 @@ def _run_interval(
         _symbols = _long_tf_symbols(interval)
         if _symbols is not None:
             logger.info(
-                "[RANKING SUMMARY JOB] long tf active-only interval=%s symbols=%s",
+                "[RANKING SUMMARY JOB] active-only interval=%s symbols=%s",
                 interval, len(_symbols),
             )
 
@@ -397,17 +410,15 @@ def _run_interval(
             pass
 
 
-# 2026-09-30: 1 分足の ranking summary (全ランキング銘柄) を止める (ユーザー判断)。
-#   毎分 30-70 秒かかり、その日の最初の足から毎回作り直すので朝は時間とともに
-#   重くなる (09:03 29 秒 -> 09:11 51 秒)。main.py の CPU の約 25%。
-#   ranking entry (entry_from_ranking) は ranking_snapshot から自前で指標を付け、
-#   監視銘柄の ranking_score は ranking 順位から付くのでこれを使っていない。
-#   止まるのは 1 分足 ranking summary の AI hook (source=RANKING, interval=1)。
-#   RANKING_SUMMARY_1M_ENABLED=1 で従来どおり作る。
+# 2026-09-30: 1 分足の ranking summary は全ランキング銘柄 (約 770) では作らず、
+#   3/5 分足と同じく監視銘柄だけで作る (ユーザー判断。_long_tf_symbols 参照)。
+#   全銘柄では毎分 30-70 秒かかり、その日の最初の足から毎回作り直すので朝は
+#   時間とともに重くなっていた (09:03 29 秒 -> 09:11 51 秒)。main.py の CPU の約 25%。
+#   RANKING_SUMMARY_1M_ENABLED=0 で 1 分足そのものを止める。
 def _ranking_summary_1m_enabled() -> bool:
     v = os.getenv("RANKING_SUMMARY_1M_ENABLED")
     if v is None or str(v).strip() == "":
-        return False
+        return True
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
