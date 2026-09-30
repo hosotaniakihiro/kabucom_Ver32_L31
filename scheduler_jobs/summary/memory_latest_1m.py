@@ -1147,6 +1147,39 @@ _push_db_lock = threading.Lock()
 _push_db_cache_df: Optional[pd.DataFrame] = None
 _push_db_cache_at: float = 0.0
 _push_db_last_rowid: Optional[int] = None
+
+
+# 2026-09-30: 増分 cursor が実時間から 20 分以上遅れ、エントリーが 0 件に
+#   なっていた。1 回 LIMIT 5000 行 (約 1.5 分分) しか進まない上、tick の
+#   残り予算で打ち切られて成功は数分に 1 回。PUSH の書き込みに追いつけず、
+#   direct 1m は「latest が 90 秒より古い」で全部捨てていた。
+#   9/29 は 9 回の再起動で cursor が末尾へ seed し直されて表面化しなかった。
+#   1 分足に要るのは直近の tick なので、遅れが閾値を超えたら追いかけずに
+#   cursor を捨てて末尾から seed し直す (起動時と同じ経路)。
+def _push_db_max_lag_sec() -> float:
+    """0 以下で無効。SUMMARY_MAIN_PUSH_DB_MAX_LAG_SEC。"""
+    return _env_float("SUMMARY_MAIN_PUSH_DB_MAX_LAG_SEC", 120.0)
+
+
+def _push_db_reseed_if_lagging(latest, *, where: str) -> None:
+    global _push_db_last_rowid
+    max_lag = _push_db_max_lag_sec()
+    if max_lag <= 0 or latest is None:
+        return
+    try:
+        lag = (pd.Timestamp(dt.datetime.now()) - pd.Timestamp(latest)).total_seconds()
+    except Exception:
+        return
+    if lag <= max_lag:
+        return
+    with _push_db_lock:
+        old = _push_db_last_rowid
+        _push_db_last_rowid = None
+    logger.warning(
+        "[SUMMARY MAIN PUSH DB REFRESH] cursor が %.0f 秒遅れている (上限 %.0f 秒) "
+        "-> 次回は末尾から seed し直す where=%s latest=%s old_cursor=%s",
+        lag, max_lag, where, latest, old,
+    )
 _push_db_cache_table: str = ""
 _push_db_cache_path: str = ""
 
@@ -1462,6 +1495,11 @@ def _read_push_db_recent() -> pd.DataFrame:
                 )
                 with _push_db_lock:
                     cached = _push_db_cache_df
+                if cached is not None and not cached.empty:
+                    try:
+                        _push_db_reseed_if_lagging(_latest_dt(cached), where="aborted")
+                    except Exception:
+                        pass
                 return cached.copy(deep=False) if cached is not None else pd.DataFrame()
 
             st.mark("query_fetch", table=table, mode=mode, rows=0 if df is None else len(df))
@@ -1523,6 +1561,9 @@ def _read_push_db_recent() -> pd.DataFrame:
             st.emit(table=table, mode=mode, new_rows=new_rows, ring_rows=len(out),
                     latest=latest, last_rowid=_push_db_last_rowid,
                     cols=len(kept_cols) if kept_cols else "exclude_list")
+            # ring 全体の latest ではなく、今回読んだ分の位置で遅れを測る
+            if mode == "incremental" and new_rows:
+                _push_db_reseed_if_lagging(_latest_dt(df), where="loaded")
             logger.warning(
                 "[SUMMARY MAIN PUSH DB REFRESH] loaded table=%s mode=%s new_rows=%s ring_rows=%s "
                 "latest=%s last_rowid=%s sel_cols=%s dropped=%s path=%s version=%s",
