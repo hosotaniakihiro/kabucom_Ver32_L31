@@ -988,7 +988,9 @@ def _midday_scale() -> tuple[float, float, str]:
     try:
         now = dt.datetime.now().time()
         s = str(os.environ.get("VOL_FILTER_MIDDAY_START", "") or "11:00").strip()
-        e = str(os.environ.get("VOL_FILTER_MIDDAY_END", "") or "14:00").strip()
+        # 2026-09-30: 14:00 で打ち切ると後場の薄い時間帯に基準が戻り、
+        #   14 時台の 5 分値幅の通過率が 66% まで落ちた。大引けまで延長 (ユーザー判断)。
+        e = str(os.environ.get("VOL_FILTER_MIDDAY_END", "") or "15:30").strip()
         sh, sm = [int(x) for x in s.split(":")[:2]]
         eh, em = [int(x) for x in e.split(":")[:2]]
         start = dt.time(sh, sm)
@@ -1000,6 +1002,19 @@ def _midday_scale() -> tuple[float, float, str]:
     rs = _env_float("VOL_FILTER_MIDDAY_ATR_RATIO_SCALE", 0.8)
     ts = _env_float("VOL_FILTER_MIDDAY_ATR_TICKS_SCALE", 0.75)
     return rs, ts, " midday=%s-%s" % (s, e)
+
+def _midday_range_scale() -> tuple[float, str]:
+    """昼〜大引けの 5 分値幅しきい値の係数 (2026-09-30)。帯の外なら (1.0, "")。
+
+    ATR と同じ帯 (_midday_scale) で 5 分値幅の下限も下げる。後場は商いが細り
+    9/30 の 14 時台は候補の 5 分値幅 p25=0.27% で 0.35% に届かない銘柄が並んだ。
+    VOL_FILTER_MIDDAY_RANGE_5M_SCALE (既定 0.8 = 0.35% -> 0.28%)。
+    """
+    _r, _t, label = _midday_scale()
+    if not label:
+        return 1.0, ""
+    return _env_float("VOL_FILTER_MIDDAY_RANGE_5M_SCALE", 0.8), label
+
 
 def _local_atr_strict(symbol: str) -> tuple[bool, str] | None:
     """ローカル 1 分足で ATR を見る (2026-09-17)。None = 本数不足 (判定できない)。
@@ -1053,7 +1068,8 @@ def _local_range_strict(symbol: str, row: dict | None = None) -> tuple[bool, str
         return None
     if close <= 0 or h5 <= 0 or l5 <= 0:
         return None
-    min_5m = _env_float("VOL_FILTER_RANGE_5M_MIN_PCT", _BASE_RANGE_5M_MIN_PCT)
+    _rg_scale, _rg_label = _midday_range_scale()
+    min_5m = _env_float("VOL_FILTER_RANGE_5M_MIN_PCT", _BASE_RANGE_5M_MIN_PCT) * _rg_scale
     min_day = _env_float("VOL_FILTER_DAY_RANGE_MIN_PCT", _BASE_DAY_RANGE_MIN_PCT)
     r5 = (h5 - l5) / close
     rday = (day_h - day_l) / close if day_h > 0 and day_l > 0 else 0.0
@@ -1063,7 +1079,7 @@ def _local_range_strict(symbol: str, row: dict | None = None) -> tuple[bool, str
         if rh > 0 and rl > 0 and rh >= rl:
             rday = max(rday, (rh - rl) / close)
     ok = r5 >= min_5m and rday >= min_day
-    detail = f"range5m={r5:.5f} min_5m={min_5m:.5f} day_range={rday:.5f} min_day={min_day:.5f} h5={h5:.1f} l5={l5:.1f} day_h={day_h:.1f} day_l={day_l:.1f} close={close:.1f} bars={len(bars)}"
+    detail = f"range5m={r5:.5f} min_5m={min_5m:.5f} day_range={rday:.5f} min_day={min_day:.5f} h5={h5:.1f} l5={l5:.1f} day_h={day_h:.1f} day_l={day_l:.1f} close={close:.1f} bars={len(bars)}{_rg_label}"
     return ok, detail
 
 
@@ -1443,6 +1459,8 @@ def _range_5m_filter_from_entry_row(entry_row: Any, min_pct: float = DEFAULT_RAN
     entry_row = _range5m_repair_summary_ai_row(entry_row)
     if min_pct == DEFAULT_RANGE_5M_MIN_PCT and _looks_ranking_entry(entry_row):
         min_pct = _env_float("RANKING_ENTRY_RANGE_5M_MIN_PCT", 0.006)
+    # 2026-09-30: 昼〜大引けは entry_row 経路の下限も同じ係数で下げる
+    min_pct = float(min_pct) * _midday_range_scale()[0]
 
     if _range_5m_filter_from_entry_row_core(entry_row, min_pct=min_pct):
         return True
