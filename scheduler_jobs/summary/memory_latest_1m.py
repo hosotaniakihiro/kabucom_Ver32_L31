@@ -1353,7 +1353,57 @@ def push_db_probe(*, max_age_sec: float = 1.0) -> dict:
     return out
 
 
-def _read_push_db_recent() -> pd.DataFrame:
+# ============================================================
+# 2026-09-30: PUSH DB を 2 秒ごとに小さく読む専用スレッド
+# ------------------------------------------------------------
+# 読み取りは summary tick (約 1 分に 1 回) からしか呼ばれず、1 回で 1 分分
+# (3,000-5,000 行) を読む必要があった。main.py は ranking summary が CPU の
+# 68% を使っていて (py-spy 20 秒: ranking_summary_jobs._task 43% /
+# _ranking_bg_task 25%)、GIL の取り合いで fetchall が行数に比例して遅くなる
+# (790 行 0.04 秒 / 4,132 行 5.7 秒)。そのうえ tick の残り予算で打ち切られ、
+# 末尾からの seed (1,500 行) すら中断され続けて 7 分遅れのまま止まっていた。
+#
+# 専用スレッドが 2 秒ごとに増分 (100 行前後) を読んで共有キャッシュを
+# 新しく保つ。このスレッドには tick の中断期限を付けない (hard deadline
+# のみ)。summary tick 側は TTL 内の共有キャッシュを受け取るだけになる。
+# SUMMARY_MAIN_PUSH_DB_POLL_SEC=0 で無効 (従来どおり tick からだけ読む)。
+# ============================================================
+_push_db_poller_started = False
+_push_db_poller_lock = threading.Lock()
+
+
+def _push_db_poll_sec() -> float:
+    return _env_float("SUMMARY_MAIN_PUSH_DB_POLL_SEC", 2.0)
+
+
+def _push_db_poller_loop(interval: float) -> None:
+    logger.warning("[SUMMARY MAIN PUSH DB POLLER] start interval=%.1fs version=%s", interval, VERSION)
+    while True:
+        try:
+            _read_push_db_recent(_from_poller=True)
+        except Exception:
+            logger.debug("[SUMMARY MAIN PUSH DB POLLER] read failed", exc_info=True)
+        time.sleep(interval)
+
+
+def _ensure_push_db_poller() -> None:
+    global _push_db_poller_started
+    if _push_db_poller_started:
+        return
+    interval = _push_db_poll_sec()
+    if interval <= 0:
+        return
+    with _push_db_poller_lock:
+        if _push_db_poller_started:
+            return
+        _push_db_poller_started = True
+        threading.Thread(
+            target=_push_db_poller_loop, args=(max(0.5, interval),),
+            name="push-db-poller", daemon=True,
+        ).start()
+
+
+def _read_push_db_recent(_from_poller: bool = False) -> pd.DataFrame:
     """PUSH DB の直近 tick を返す。
 
     Ver2.0 (2026-09-02 P0):
@@ -1372,8 +1422,11 @@ def _read_push_db_recent() -> pd.DataFrame:
         logger.warning("[SUMMARY MAIN PUSH DB REFRESH] db missing path=%s version=%s", path, VERSION)
         return pd.DataFrame()
 
+    if not _from_poller:
+        _ensure_push_db_poller()
+
     # ---- P0-4: 同一 tick 内の重複 open を避ける ----
-    ttl = _push_db_share_ttl()
+    ttl = 0.0 if _from_poller else _push_db_share_ttl()
     with _push_db_lock:
         cached = _push_db_cache_df
         cached_at = _push_db_cache_at
@@ -1564,7 +1617,7 @@ def _read_push_db_recent() -> pd.DataFrame:
             # ring 全体の latest ではなく、今回読んだ分の位置で遅れを測る
             if mode == "incremental" and new_rows:
                 _push_db_reseed_if_lagging(_latest_dt(df), where="loaded")
-            logger.warning(
+            (logger.info if _from_poller else logger.warning)(
                 "[SUMMARY MAIN PUSH DB REFRESH] loaded table=%s mode=%s new_rows=%s ring_rows=%s "
                 "latest=%s last_rowid=%s sel_cols=%s dropped=%s path=%s version=%s",
                 table, mode, new_rows, len(out), latest, _push_db_last_rowid,
