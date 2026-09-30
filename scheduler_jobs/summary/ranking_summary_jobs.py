@@ -206,6 +206,47 @@ def _run_ranking_ai_hook_v20(*, interval: int, now: dt.datetime, df: pd.DataFram
         return False
 
 
+# ============================================================
+# 2026-09-30: 3/5 分足の ranking summary を監視銘柄だけで作る
+# ------------------------------------------------------------
+# main.py の CPU の 68% が ranking summary だった (py-spy 20 秒:
+# ranking_summary_jobs._task 43% / _ranking_bg_task 25%)。3 分足は
+# ランキング全銘柄 (約 530 銘柄 / 10,447 行) の指標計算に 12-165 秒かかり、
+# スロットごとにほぼ切れ目なく走って GIL を取り続け、PUSH の読み取りが
+# 時間切れで止まっていた (エントリー 0 件の上流)。
+#
+# 3/5 分足は監視銘柄 (約 100) だけで作る。監視銘柄外のランキング候補は
+# 3/5 分足の値が無くなり MTF ゲートで落ちる側に変わる (ユーザー判断で採用)。
+# 1 分足は従来どおり全銘柄。監視銘柄が取れないときは従来どおり全銘柄。
+# RANKING_SUMMARY_LONG_TF_ACTIVE_ONLY=0 で従来動作。
+# ============================================================
+def _long_tf_active_only_enabled() -> bool:
+    v = os.getenv("RANKING_SUMMARY_LONG_TF_ACTIVE_ONLY")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _long_tf_symbols(interval: int):
+    """3/5 分足の計算対象。None は全銘柄 (従来動作)。"""
+    if int(interval) not in (3, 5) or not _long_tf_active_only_enabled():
+        return None
+    try:
+        from trading.ranking.active_symbols.manager import get_active_symbols
+
+        syms = [str(x).strip() for x in (get_active_symbols() or []) if str(x).strip()]
+    except Exception:
+        logger.warning("[RANKING SUMMARY JOB] active symbols 取得失敗 -> 全銘柄で計算", exc_info=True)
+        return None
+    if len(syms) < 10:
+        logger.warning(
+            "[RANKING SUMMARY JOB] active symbols が少ない n=%s -> 全銘柄で計算 interval=%s",
+            len(syms), interval,
+        )
+        return None
+    return syms
+
+
 def _run_interval(
     *,
     interval: int,
@@ -268,10 +309,18 @@ def _run_interval(
 
         from trading.ranking.summary.runner import run_ranking_summary_once
 
+        _symbols = _long_tf_symbols(interval)
+        if _symbols is not None:
+            logger.info(
+                "[RANKING SUMMARY JOB] long tf active-only interval=%s symbols=%s",
+                interval, len(_symbols),
+            )
+
         _t_runner = time.perf_counter()
         df = run_ranking_summary_once(
             trade_date=trade_date,
             interval=interval,
+            symbols=_symbols,
             lookback_minutes=lookback_minutes,
             use_yahoo_fill=use_yahoo_fill,
             persist=persist,
