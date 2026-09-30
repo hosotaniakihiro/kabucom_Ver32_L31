@@ -772,6 +772,19 @@ def _send_close_order(*, symbol: str, side: str, close_side: str, qty: float, ex
     return _send_kabu_close_order_builtin(symbol=symbol, side=side, close_side=close_side, qty=qty, exit_price=exit_price, reason=reason, position=position)
 
 
+def _exec_price_from_order_message(message: Any) -> float:
+    """返済結果 message ({'order_id': ..., 'exec_price': 3245.0, ...} の文字列) から約定価格。無ければ 0。"""
+    try:
+        if isinstance(message, dict):
+            return _safe_float(message.get("exec_price"), 0.0)
+        import re as _re
+
+        m = _re.search(r"'exec_price':\s*([0-9.]+)", str(message or ""))
+        return float(m.group(1)) if m else 0.0
+    except Exception:
+        return 0.0
+
+
 def _calculate_pnl(*, side: str, qty: float, avg_price: float, exit_price: float) -> float:
     side = _normalize_side(side)
     if side == "BUY":
@@ -994,6 +1007,15 @@ def execute_exit(symbol: str, reason: str, exit_price: float) -> bool:
                 _restore_open_status(symbol, pos)
                 return False
 
+            # 2026-09-30: 約定が取れていれば判定価格ではなく約定価格で損益を出す。
+            #   3110 は再発注価格 3255 で +1,350 円と記録され、実約定は 3245 の -650 円だった。
+            _exec_px = _exec_price_from_order_message(order_message)
+            if _exec_px > 0 and abs(_exec_px - exit_price) > 1e-9:
+                logger.warning(
+                    "[EXIT_EXECUTOR] pnl uses executed price symbol=%s decided=%.4f executed=%.4f",
+                    symbol, exit_price, _exec_px,
+                )
+                exit_price = _exec_px
             pnl = _calculate_pnl(side=side, qty=qty, avg_price=avg_price, exit_price=exit_price)
             db_ok = _close_db_position(symbol=symbol, exit_price=exit_price, pnl=pnl, reason=reason, order_id=order_id)
             if not db_ok:
