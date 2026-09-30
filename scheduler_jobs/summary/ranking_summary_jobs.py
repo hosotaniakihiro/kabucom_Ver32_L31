@@ -397,6 +397,20 @@ def _run_interval(
             pass
 
 
+# 2026-09-30: 1 分足の ranking summary (全ランキング銘柄) を止める (ユーザー判断)。
+#   毎分 30-70 秒かかり、その日の最初の足から毎回作り直すので朝は時間とともに
+#   重くなる (09:03 29 秒 -> 09:11 51 秒)。main.py の CPU の約 25%。
+#   ranking entry (entry_from_ranking) は ranking_snapshot から自前で指標を付け、
+#   監視銘柄の ranking_score は ranking 順位から付くのでこれを使っていない。
+#   止まるのは 1 分足 ranking summary の AI hook (source=RANKING, interval=1)。
+#   RANKING_SUMMARY_1M_ENABLED=1 で従来どおり作る。
+def _ranking_summary_1m_enabled() -> bool:
+    v = os.getenv("RANKING_SUMMARY_1M_ENABLED")
+    if v is None or str(v).strip() == "":
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def job_ranking_summary_1m(
     *,
     force: bool = False,
@@ -408,6 +422,9 @@ def job_ranking_summary_1m(
     top_n: int = 20,
     run_entry: bool = True,
 ) -> pd.DataFrame:
+    if not _ranking_summary_1m_enabled():
+        logger.info("[RANKING SUMMARY JOB] 1m skipped (RANKING_SUMMARY_1M_ENABLED=0)")
+        return pd.DataFrame()
     return _run_interval(
         interval=1,
         force=force,
