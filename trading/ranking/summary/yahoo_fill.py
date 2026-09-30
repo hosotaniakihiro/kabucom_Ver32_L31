@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from typing import Iterable, Optional
 
+import numpy as np
 import pandas as pd
 
 from trading.ranking.summary.constants import DATETIME_CANDIDATES
@@ -131,7 +133,12 @@ def try_load_yahoo_1min(
         if end_dt is not None:
             y = y[y["datetime"] <= end_dt].copy()
 
-        return y[["symbol", "datetime", "close"]].reset_index(drop=True)
+        keep = ["symbol", "datetime", "close"]
+        for c in ("open", "high", "low"):
+            if c in y.columns:
+                y[c] = pd.to_numeric(y[c], errors="coerce")
+                keep.append(c)
+        return y[keep].reset_index(drop=True)
 
     except Exception:
         logger.exception("[RANKING SUMMARY RUNNER] yahoo normalize failed")
@@ -174,7 +181,8 @@ def apply_yahoo_fill(
     x = base_df.copy()
 
     try:
-        yahoo = yahoo.rename(columns={"close": "__yahoo_close__"})
+        yahoo = yahoo.rename(columns={"close": "__yahoo_close__", "open": "__yahoo_open__",
+                                      "high": "__yahoo_high__", "low": "__yahoo_low__"})
 
         x = x.merge(
             yahoo,
@@ -191,12 +199,34 @@ def apply_yahoo_fill(
         )
 
         x["close"] = x["close"].fillna(x["__yahoo_close__"])
+
+        # 2026-09-30: Yahoo に足がある分 (約 20 分遅れで確定済みの分) は
+        #   ranking スナップショットの瞬間値ではなく Yahoo の本物の OHLC を使う。
+        #   スナップショット由来は open=high=low=close で ATR が小さく出ていた。
+        #   RANKING_SUMMARY_YAHOO_OHLC=0 で従来 (close の欠損埋めだけ)。
+        if str(os.getenv("RANKING_SUMMARY_YAHOO_OHLC", "1")).strip().lower() not in ("0", "false", "no", "off"):
+            has_y = x["__yahoo_close__"].notna() & (x["__yahoo_close__"] > 0)
+            if bool(has_y.any()):
+                x.loc[has_y, "close"] = x.loc[has_y, "__yahoo_close__"]
+                if "current_price" in x.columns:
+                    x.loc[has_y, "current_price"] = x.loc[has_y, "__yahoo_close__"]
+                for c in ("open", "high", "low"):
+                    yk = f"__yahoo_{c}__"
+                    if yk not in x.columns:
+                        continue
+                    yc = pd.to_numeric(x[yk], errors="coerce")
+                    ok = has_y & yc.notna() & (yc > 0)
+                    if c not in x.columns:
+                        x[c] = np.nan
+                    x[c] = pd.to_numeric(x[c], errors="coerce")
+                    x.loc[ok, c] = yc[ok]
+                logger.info("[RANKING SUMMARY RUNNER] yahoo OHLC applied rows=%s/%s", int(has_y.sum()), len(x))
         x["current_price"] = pd.to_numeric(
             x.get("current_price", x["close"]),
             errors="coerce",
         ).fillna(x["close"])
 
-        x = x.drop(columns=["__yahoo_close__"], errors="ignore")
+        x = x.drop(columns=["__yahoo_close__", "__yahoo_open__", "__yahoo_high__", "__yahoo_low__"], errors="ignore")
 
         after_na = int(x["close"].isna().sum())
 

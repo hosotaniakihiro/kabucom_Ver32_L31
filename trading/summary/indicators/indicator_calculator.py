@@ -1263,6 +1263,147 @@ _PREVDAY_SYMBOL_CACHE: dict[tuple, dict[str, "pd.DataFrame"]] = {}
 _PREVDAY_SYMBOL_CACHE_LOCK = threading.Lock()
 
 
+# ============================================================
+# 2026-09-30: 前日の足を 3 つの出所から合わせる
+# ------------------------------------------------------------
+# 前日 summary DB だけでは足がまばら (監視銘柄 100 のうち 3 分足で 25 本未満が
+# 19 銘柄、5 分足は全銘柄 75 本未満)。前日の Yahoo 1 分足 (本物の OHLC、
+# 約 20 分遅れで取得したものが引けまで揃う) と前日の ranking スナップショット
+# (毎分の現在値) も同じ (銘柄, 足) で重ね、summary > yahoo > ranking の順で採る。
+# どれも同じ前営業日 (summary DB のファイル日付) のもの。
+# PREVDAY_WARMUP_EXTRA_SOURCES=0 で summary DB だけ (従来)。
+# ============================================================
+def _prevday_extra_sources_enabled() -> bool:
+    return _prevday_env_bool("PREVDAY_WARMUP_EXTRA_SOURCES", True)
+
+
+def _interval_minutes_from_table(table: str) -> int:
+    m = re.search(r"(\d+)min", str(table))
+    return int(m.group(1)) if m else 1
+
+
+def _prevday_resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """1 分足 (symbol, datetime, open, high, low, close, volume) を minutes 分足へ。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
+    d = d.dropna(subset=["datetime", "close"])
+    if d.empty:
+        return pd.DataFrame()
+    if minutes <= 1:
+        return d[["symbol", "datetime", "open", "high", "low", "close", "volume"]]
+    d["slot"] = d["datetime"].dt.floor(f"{minutes}min")
+    g = d.sort_values(["symbol", "datetime"]).groupby(["symbol", "slot"], sort=False)
+    out = pd.DataFrame({
+        "open": g["open"].first(), "high": g["high"].max(), "low": g["low"].min(),
+        "close": g["close"].last(), "volume": g["volume"].sum(),
+    }).reset_index().rename(columns={"slot": "datetime"})
+    return out
+
+
+def _prevday_load_yahoo(ymd: str, symbols: tuple, minutes: int) -> pd.DataFrame:
+    try:
+        path = Path(nas_root()) / "raw_data" / "yahoo" / "intraday" / f"yahoo_1min_{ymd}.db"
+        if not path.exists():
+            return pd.DataFrame()
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            frames = []
+            for part in _prevday_chunks(symbols, 300):
+                ph = ",".join("?" * len(part))
+                frames.append(pd.read_sql_query(
+                    f'SELECT symbol, datetime, open, high, low, close, volume FROM yahoo_1min WHERE symbol IN ({ph})',
+                    conn, params=list(part)))
+        finally:
+            conn.close()
+        d = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if d.empty:
+            return d
+        d["symbol"] = d["symbol"].astype(str)
+        for c in ("open", "high", "low", "close", "volume"):
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        return _prevday_resample(d[d["close"] > 0], minutes)
+    except Exception:
+        logger.debug("[IND PREVDAY WARMUP] yahoo load failed ymd=%s", ymd, exc_info=True)
+        return pd.DataFrame()
+
+
+def _prevday_load_ranking(ymd: str, symbols: tuple, minutes: int) -> pd.DataFrame:
+    try:
+        from trading.ranking.ranking_db_location import ranking_db_path
+
+        path = ranking_db_path(dt.datetime.strptime(ymd, "%Y%m%d").date())
+        if path is None or not Path(path).exists():
+            return pd.DataFrame()
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            frames = []
+            for part in _prevday_chunks(symbols, 300):
+                ph = ",".join("?" * len(part))
+                frames.append(pd.read_sql_query(
+                    f'SELECT symbol, datetime, COALESCE(NULLIF(current_price, 0), price) AS close, volume '
+                    f'FROM ranking_snapshot_1min WHERE symbol IN ({ph})',
+                    conn, params=list(part)))
+        finally:
+            conn.close()
+        d = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if d.empty:
+            return d
+        d["symbol"] = d["symbol"].astype(str)
+        d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
+        d["close"] = pd.to_numeric(d["close"], errors="coerce")
+        d = d.dropna(subset=["datetime", "close"])
+        d = d[d["close"] > 0].sort_values(["symbol", "datetime"]).drop_duplicates(["symbol", "datetime"], keep="last")
+        # 出来高は累計なので差分にする
+        cum = pd.to_numeric(d["volume"], errors="coerce")
+        d["volume"] = cum.groupby(d["symbol"]).diff().fillna(0).clip(lower=0)
+        d["open"] = d["close"]
+        d["high"] = d["close"]
+        d["low"] = d["close"]
+        return _prevday_resample(d, minutes)
+    except Exception:
+        logger.debug("[IND PREVDAY WARMUP] ranking load failed ymd=%s", ymd, exc_info=True)
+        return pd.DataFrame()
+
+
+def _prevday_load_union(db_path: str, table: str, symbols: tuple, rows_per_symbol: int) -> pd.DataFrame:
+    base = _load_prevday_warmup_cached.__wrapped__(db_path, table, symbols, rows_per_symbol)
+    if not _prevday_extra_sources_enabled():
+        return base
+    m = re.search(r"summary(\d{8})\.db$", str(db_path), re.IGNORECASE)
+    if not m:
+        return base
+    ymd = m.group(1)
+    minutes = _interval_minutes_from_table(table)
+    parts = []
+    if isinstance(base, pd.DataFrame) and not base.empty:
+        b = pd.DataFrame({"symbol": base["symbol"].astype(str),
+                          "datetime": pd.to_datetime(base["datetime"], errors="coerce")})
+        for k in ("open", "high", "low", "close"):
+            src = f"{k}_price" if f"{k}_price" in base.columns else k
+            b[k] = pd.to_numeric(base[src], errors="coerce") if src in base.columns else np.nan
+        b["volume"] = pd.to_numeric(base["volume"], errors="coerce") if "volume" in base.columns else 0.0
+        b["__prio"] = 0
+        parts.append(b)
+    y = _prevday_load_yahoo(ymd, symbols, minutes)
+    if not y.empty:
+        parts.append(y.assign(__prio=1))
+    r = _prevday_load_ranking(ymd, symbols, minutes)
+    if not r.empty:
+        parts.append(r.assign(__prio=2))
+    if not parts:
+        return base
+    u = pd.concat(parts, ignore_index=True, sort=False)
+    u = u.dropna(subset=["datetime", "close"])
+    u = u[u["datetime"] < pd.Timestamp(dt.datetime.strptime(ymd, "%Y%m%d").date() + dt.timedelta(days=1))]
+    u = u.sort_values(["symbol", "datetime", "__prio"]).drop_duplicates(["symbol", "datetime"], keep="first")
+    u = u.groupby("symbol", sort=False).tail(int(rows_per_symbol)).drop(columns=["__prio"])
+    for k in ("open", "high", "low", "close"):
+        u[f"{k}_price"] = u[k]
+    return u.reset_index(drop=True)
+
+
 def _load_prevday_warmup_per_symbol(db_path: str, table: str, symbols: tuple[str, ...], rows_per_symbol: int) -> pd.DataFrame:
     if not db_path or not symbols or rows_per_symbol <= 0:
         return pd.DataFrame()
@@ -1274,7 +1415,7 @@ def _load_prevday_warmup_per_symbol(db_path: str, table: str, symbols: tuple[str
         missing = tuple(sorted({str(x) for x in symbols} - set(per)))
     if missing:
         t0 = time.perf_counter()
-        loaded = _load_prevday_warmup_cached.__wrapped__(db_path, table, missing, rows_per_symbol)
+        loaded = _prevday_load_union(db_path, table, missing, rows_per_symbol)
         got: dict[str, pd.DataFrame] = {}
         if isinstance(loaded, pd.DataFrame) and not loaded.empty:
             sc = "symbol" if "symbol" in loaded.columns else ("Symbol" if "Symbol" in loaded.columns else None)

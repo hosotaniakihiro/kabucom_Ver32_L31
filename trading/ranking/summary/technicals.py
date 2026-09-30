@@ -312,9 +312,23 @@ def _build_ohlcv_compatible(df: pd.DataFrame) -> pd.DataFrame:
     # --------------------------------------------------------
     # OHLC はすべて同じ price にする
     # --------------------------------------------------------
-    x["open"] = price
-    x["high"] = price
-    x["low"] = price
+    # 2026-09-30: 既に本物の OHLC (Yahoo 1 分足で補った行 / 3・5 分足の
+    #   resample で high=max・low=min になった行) があれば潰さない。
+    #   従来は全行 open=high=low=close にしており ATR などが実際より小さく出ていた。
+    def _real(col_names):
+        out_ = pd.Series(np.nan, index=x.index, dtype="float64")
+        for c_ in col_names:
+            if c_ in x.columns:
+                v_ = _safe_numeric_series(x, c_, default=np.nan)
+                out_ = out_.where(out_.notna(), v_.where(v_ > 0))
+        return out_
+
+    _o = _real(["open", "open_price"])
+    _h = _real(["high", "high_price"])
+    _l = _real(["low", "low_price"])
+    x["open"] = _o.fillna(price)
+    x["high"] = pd.concat([_h.fillna(price), price, x["open"]], axis=1).max(axis=1)
+    x["low"] = pd.concat([_l.fillna(price), price, x["open"]], axis=1).min(axis=1)
     x["close"] = price
 
     # --------------------------------------------------------
