@@ -11,3 +11,4 @@ export * from './hazard';
 export * from './comparables';
 export * from './valuation';
 export * from './simulate';
+export * from './inspection';

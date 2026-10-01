@@ -104,3 +104,7 @@ h1, h2 { margin: .2em 0; }
 .big-number { font-size: 1.6rem; font-weight: 800; color: var(--brand); }
 .saved-list { list-style: none; padding: 0 12px; display: grid; gap: 8px; }
 .saved-item { width: 100%; text-align: left; display: grid; gap: 2px; }
+.markup { width: 100%; max-height: 60vh; object-fit: contain; border-radius: 12px; background: #ddd; margin: 8px 0; touch-action: manipulation; }
+textarea { margin: 8px 0; }
+.inspection { display: flex; gap: 10px; padding: 10px; }
+.thumb { width: 84px; height: 84px; object-fit: cover; border-radius: 8px; }

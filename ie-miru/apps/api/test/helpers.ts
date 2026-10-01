@@ -16,3 +16,19 @@ export async function json<T = any>(res: Response | Promise<Response>): Promise<
   const r = await res;
   return { status: r.status, body: (await r.json()) as T };
 }
+
+import { SqliteD1 } from '../src/storage/sqliteD1';
+import { MemoryR2 } from '../src/storage/fileR2';
+import { applyMigrations } from '../src/storage/local';
+import { createRepositories } from '../src/storage/d1';
+
+export async function makePersistentApp() {
+  const db = new SqliteD1(':memory:');
+  await applyMigrations(db);
+  const r2 = new MemoryR2();
+  const repos = createRepositories(db, r2);
+  return { app: makeApp({ repos }), db, r2, repos };
+}
+
+/** 1x1 PNG */
+export const PNG_1PX = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='), (c) => c.charCodeAt(0));
