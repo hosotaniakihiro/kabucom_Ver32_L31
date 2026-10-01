@@ -1,0 +1,18 @@
+{
+  "name": "@ie-miru/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:node": "tsx src/node-server.ts",
+    "dev:worker": "wrangler dev",
+    "deploy": "echo 'HUMAN ACTION: 本番デプロイは docs/IE_MIRU_HUMAN_ACTION.md の手順で人間が実行する' && exit 1"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.3",
+    "@ie-miru/config": "*",
+    "@ie-miru/domain": "*",
+    "@ie-miru/services": "*",
+    "hono": "^4.6.0"
+  }
+}

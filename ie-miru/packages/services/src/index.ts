@@ -11,3 +11,5 @@ export * from './reinfolib/parse';
 export * from './geocoder/gsi';
 export * from './reinfolib/service';
 export * from './hazard/service';
+export * from './geocoder/fallback';
+export * from './report/buildingReport';

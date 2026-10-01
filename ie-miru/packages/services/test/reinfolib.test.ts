@@ -83,7 +83,7 @@ describe('RealEstateDataService', () => {
     const z = await svc().zoning(P);
     expect(z.status).toBe('available');
     expect(z.sources[0]!.mode).toBe('mock');
-    expect(z.sources[0]!.name).toContain('モック');
+    expect(z.sources[0]!.mode).toBe('mock');
     const lp = await svc().landPrices(P);
     expect(lp.status).toBe('available');
     if (lp.status === 'available') {

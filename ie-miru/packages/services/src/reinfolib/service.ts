@@ -8,7 +8,7 @@ import { parseLandPrices, parseTransactions, parseZoningAt } from './parse';
 export function reinfolibSource(api: ReinfolibApi, mode: 'live' | 'mock'): SourceRef {
   return {
     id: `reinfolib.${api}`,
-    name: `国土交通省 不動産情報ライブラリ（${REINFOLIB_APIS[api]}）${mode === 'mock' ? '【モック】' : ''}`,
+    name: `国土交通省 不動産情報ライブラリ（${REINFOLIB_APIS[api]}）`,
     url: 'https://www.reinfolib.mlit.go.jp/',
     license: '出典: 国土交通省 不動産情報ライブラリ（利用規約に従い加工）',
     mode,
