@@ -7,3 +7,4 @@ export * from './building';
 export * from './selection';
 export * from './realestate';
 export * from './zoning';
+export * from './hazard';

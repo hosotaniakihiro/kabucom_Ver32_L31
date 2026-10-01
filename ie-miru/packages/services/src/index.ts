@@ -10,3 +10,4 @@ export * from './reinfolib/mock';
 export * from './reinfolib/parse';
 export * from './geocoder/gsi';
 export * from './reinfolib/service';
+export * from './hazard/service';
