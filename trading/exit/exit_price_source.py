@@ -23,7 +23,7 @@ import datetime as dt
 import logging
 import math
 import time
-from typing import Any, Dict, Iterable, Tuple
+from typing import List, Any, Dict, Iterable, Tuple
 
 import requests
 
@@ -184,30 +184,35 @@ def _5s_enabled() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
-def build_five_sec_bar_from_push_db(symbol: str) -> Dict[str, Any]:
-    """ローカル push DB のティックから直近の「完成した」5 秒足を作る。
+_5S_BARS_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
-    返すキーは blowoff_profit_take が読むものに合わせる:
-      open / high / low / close / volume / avg_volume / datetime
-    volume は push の累積出来高の差分。作れなければ {}。
+
+def build_recent_five_sec_bars_from_push_db(symbol: str, max_bars: int = 12) -> List[Dict[str, Any]]:
+    """ローカル push DB のティックから直近の「完成した」5 秒足を古い順に返す。
+
+    2026-10-01: エントリー側 (発注直前の 5 秒足ガード / TONOSAMA) も main.py
+    プロセスで動き、GC.monitor の 5 秒足は永久に空だった。EXIT 用の
+    build_five_sec_bar_from_push_db をここから作るようにして共用する。
+    各足のキー: open / high / low / close / volume / avg_volume / datetime。
+    ティックの無い 5 秒枠は飛ばす (足を補完しない)。作れなければ []。
     """
     if not _5s_enabled():
-        return {}
+        return []
     symbol = normalize_symbol(symbol)
     if not symbol:
-        return {}
+        return []
     now_ts = time.time()
-    hit = _5S_CACHE.get(symbol)
+    hit = _5S_BARS_CACHE.get(symbol)
     if hit and now_ts - hit[0] <= _5S_CACHE_TTL_SEC:
-        return dict(hit[1])
+        return [dict(x) for x in hit[1]][-max_bars:]
 
-    bar: Dict[str, Any] = {}
+    out: List[Dict[str, Any]] = []
     try:
         import sqlite3
         from trading.summary.mtf_local_bars import _push_db_path
         p = _push_db_path()
         if p is None:
-            return {}
+            return []
         lookback = max(20.0, _5s_env_float("EXIT_5SEC_BAR_LOOKBACK_SEC", 90.0))
         since = (dt.datetime.now() - dt.timedelta(seconds=lookback)).isoformat()
         con = sqlite3.connect("file:" + str(p) + "?mode=ro", uri=True, timeout=1.0)
@@ -223,7 +228,7 @@ def build_five_sec_bar_from_push_db(symbol: str) -> Dict[str, Any]:
             except Exception:
                 pass
         if not rows or len(rows) < 2:
-            return {}
+            return []
 
         # 5 秒バケットへ集約
         buckets: Dict[int, Dict[str, Any]] = {}
@@ -248,56 +253,54 @@ def build_five_sec_bar_from_push_db(symbol: str) -> Dict[str, Any]:
                 b["cum_last"] = cum
                 b["t"] = t
         if not buckets:
-            return {}
+            return []
 
-        keys = sorted(buckets)
-        # 今の 5 秒枠はまだ埋まっていないので 1 つ前の完成足を使う
+        # 今の 5 秒枠はまだ埋まっていないので完成足だけを使う
         cur_key = int(dt.datetime.now().timestamp() // 5)
-        done = [k for k in keys if k < cur_key]
+        done = [k for k in sorted(buckets) if k < cur_key]
         if not done:
-            return {}
-        last_key = done[-1]
+            return []
 
         # 出来高は累積の差分。前の足の cum_last との差を採る。
-        def _bar_volume(k: int) -> float:
+        vols: List[float] = []
+        for i, k in enumerate(done):
             b = buckets[k]
-            idx = keys.index(k)
-            if idx > 0:
-                prev = buckets[keys[idx - 1]]
-                d = float(b["cum_last"]) - float(prev["cum_last"])
-                if d >= 0:
-                    return d
-            d = float(b["cum_last"]) - float(b["cum_first"])
-            return d if d >= 0 else 0.0
+            d = -1.0
+            if i > 0:
+                d = float(b["cum_last"]) - float(buckets[done[i - 1]]["cum_last"])
+            if d < 0:
+                d = float(b["cum_last"]) - float(b["cum_first"])
+            vols.append(d if d >= 0 else 0.0)
 
         n_avg = int(max(1, _5s_env_float("EXIT_5SEC_BAR_AVG_BARS", 5.0)))
-        prev_done = [k for k in done if k != last_key][-n_avg:]
-        avg_volume = 0.0
-        if prev_done:
-            vals = [_bar_volume(k) for k in prev_done]
-            if vals:
-                avg_volume = sum(vals) / len(vals)
-
-        b = buckets[last_key]
-        bar = {
-            "open": b["open"],
-            "high": b["high"],
-            "low": b["low"],
-            "close": b["close"],
-            "volume": _bar_volume(last_key),
-            "avg_volume": avg_volume,
-            "datetime": b["t"].isoformat(),
-            "_source": "push_db_5s",
-        }
+        for i, k in enumerate(done):
+            b = buckets[k]
+            prev_vols = vols[max(0, i - n_avg):i]
+            out.append({
+                "open": b["open"],
+                "high": b["high"],
+                "low": b["low"],
+                "close": b["close"],
+                "volume": vols[i],
+                "avg_volume": (sum(prev_vols) / len(prev_vols)) if prev_vols else 0.0,
+                "datetime": b["t"].isoformat(),
+                "_source": "push_db_5s",
+            })
     except Exception:
         logger.debug("[5SEC BAR] push db build failed symbol=%s", symbol, exc_info=True)
-        return {}
+        return []
 
-    if bar:
-        _5S_CACHE[symbol] = (now_ts, dict(bar))
-        if len(_5S_CACHE) > 512:
-            _5S_CACHE.clear()
-    return bar
+    if out:
+        _5S_BARS_CACHE[symbol] = (now_ts, [dict(x) for x in out])
+        if len(_5S_BARS_CACHE) > 512:
+            _5S_BARS_CACHE.clear()
+    return out[-max_bars:]
+
+
+def build_five_sec_bar_from_push_db(symbol: str) -> Dict[str, Any]:
+    """直近の完成した 5 秒足 1 本 (EXIT の blowoff confirm 用)。作れなければ {}。"""
+    bars = build_recent_five_sec_bars_from_push_db(symbol)
+    return dict(bars[-1]) if bars else {}
 
 
 def get_five_sec_bar_safe(symbol: str) -> Dict[str, Any]:
@@ -305,13 +308,13 @@ def get_five_sec_bar_safe(symbol: str) -> Dict[str, Any]:
     if not symbol:
         return {}
     try:
+        # 2026-10-01: main.py には GC.monitor が無い。以前はここで {} を返して
+        #   下の push DB フォールバックに一度も届いていなかった (no_5sec_bar が 1 日 100 回超)。
         monitor = getattr(GC, "monitor", None)
-        if monitor is None:
-            return {}
-        for name in [
+        for name in ([] if monitor is None else [
             "get_five_sec_bar", "get_5sec_bar", "get_latest_5sec_bar",
             "get_latest_five_sec_bar", "get_bar_5s", "get_5s_bar",
-        ]:
+        ]):
             fn = getattr(monitor, name, None)
             if not callable(fn):
                 continue
@@ -801,6 +804,7 @@ __all__ = [
     "normalize_symbol",
     "dict_get_any",
     "get_five_sec_bar_safe",
+    "build_recent_five_sec_bars_from_push_db",
     "extract_price_from_5sec_bar",
     "get_push_price_safe",
     "get_global_data_price_safe",

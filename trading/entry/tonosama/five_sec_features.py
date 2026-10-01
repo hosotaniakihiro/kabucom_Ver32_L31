@@ -88,6 +88,17 @@ def get_recent_5sec_bars(symbol: str) -> list[dict[str, Any]]:
     latest=get_latest_5sec_bar(symbol)
     if prev: bars.append(prev)
     if latest: bars.append(latest)
+    if len(bars) >= 2:
+        return bars
+    # 2026-10-01: main.py には GC.monitor の 5 秒足が無い (push_receiver プロセス側にだけある)。
+    #   chg5s=0.000 / five_sec_dt=なし のまま判定していたので push DB から作る。
+    try:
+        from trading.exit.exit_price_source import build_recent_five_sec_bars_from_push_db
+        db_bars = build_recent_five_sec_bars_from_push_db(symbol, max_bars=6)
+        if db_bars:
+            return db_bars
+    except Exception:
+        logger.debug("[TONOSAMA 5SEC] push db 5s bars unavailable symbol=%s", symbol, exc_info=True)
     return bars
 
 def build_5sec_features(symbol: str) -> dict[str, Any]:
@@ -119,4 +130,5 @@ def build_5sec_features(symbol: str) -> dict[str, Any]:
     if latest_volume > 0 and avg_prev_volume > 0:
         volume_ok = volume_surge_ratio >= MIN_5SEC_VOLUME_SURGE_RATIO
     confirm_ok = bool(is_up and volume_ok and not is_drop)
-    return {"has_5sec_bar": bool(latest), "latest_5sec_close": latest_close, "latest_5sec_open": latest_open, "latest_5sec_high": _bar_high(latest), "latest_5sec_low": _bar_low(latest), "latest_5sec_volume": latest_volume, "prev_5sec_close": prev_close, "prev_5sec_volume": prev_volume, "avg_prev_5sec_volume": avg_prev_volume, "price_change_5s_pct": price_change_pct, "volume_surge_ratio_5s": volume_surge_ratio, "is_5sec_up": bool(is_up), "is_5sec_drop": bool(is_drop), "is_5sec_confirm_ok": bool(confirm_ok)}
+    latest_dt = dict_get_any(latest, "datetime", "dt", "timestamp", "time", default=None) if latest else None
+    return {"has_5sec_bar": bool(latest), "latest_5sec_dt": latest_dt, "latest_5sec_close": latest_close, "latest_5sec_open": latest_open, "latest_5sec_high": _bar_high(latest), "latest_5sec_low": _bar_low(latest), "latest_5sec_volume": latest_volume, "prev_5sec_close": prev_close, "prev_5sec_volume": prev_volume, "avg_prev_5sec_volume": avg_prev_volume, "price_change_5s_pct": price_change_pct, "volume_surge_ratio_5s": volume_surge_ratio, "is_5sec_up": bool(is_up), "is_5sec_drop": bool(is_drop), "is_5sec_confirm_ok": bool(confirm_ok)}

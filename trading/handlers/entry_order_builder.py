@@ -488,6 +488,17 @@ def _get_5s_df(symbol: str):
                     return df
         except Exception:
             continue
+    # 2026-10-01: 5 秒足を作る five_sec_bar_builder は push_receiver プロセスで
+    #   動くので、main.py 側の global_data は常に空 (ALLOW_NO_5S_BREAKOUT で
+    #   素通りしていた)。push DB から完成足を作って渡す。
+    try:
+        from trading.exit.exit_price_source import build_recent_five_sec_bars_from_push_db
+
+        bars = build_recent_five_sec_bars_from_push_db(symbol)
+        if bars:
+            return bars
+    except Exception:
+        logger.debug("[ENTRY 5S] push db 5s bars unavailable symbol=%s", symbol, exc_info=True)
     return None
 
 
@@ -1136,6 +1147,16 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
             price_source = "summary_fallback_safe_limit_after_board_retry"
     else:
         base_price = five_sec_breakout(symbol, side)
+        # 2026-10-01: 5 秒足が push DB から取れるようになったので、ブレイク時の
+        #   STOP (逆指値) 経路が初めて動きうる。2026 年のログで一度も使われて
+        #   いない経路なので、既定ではブレイクを確認したうえで従来の LIMIT 経路へ流す。
+        #   ENTRY_5S_BREAKOUT_STOP_ORDER_ENABLED=1 で STOP 注文を使う。
+        if base_price and not _5s_env_bool("ENTRY_5S_BREAKOUT_STOP_ORDER_ENABLED", False):
+            logger.warning(
+                "[ENTRY ORDER 5S] BREAKOUT_CONFIRMED symbol=%s side=%s source=%s level=%.4f -> LIMIT 経路",
+                symbol, side, source, float(base_price),
+            )
+            base_price = None
         if not base_price:
             fallback = _five_sec_optional_fallback_order(
                 symbol=symbol, side=side, source=source, entry_row=entry_row, qty_override=qty_override
