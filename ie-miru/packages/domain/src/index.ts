@@ -2,3 +2,6 @@ export * from './geo';
 export * from './location';
 export * from './heading';
 export * from './ar';
+export * from './provenance';
+export * from './building';
+export * from './selection';
