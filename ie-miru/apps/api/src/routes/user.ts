@@ -1,5 +1,5 @@
 import type { Context, Hono } from 'hono';
-import { ALLOWED_PHOTO_TYPES, AR_NOTE_STATUSES, MAX_PHOTO_BYTES, validateArNote, validateInspection, type ArNoteStatus, type Building, type LatLng } from '@ie-miru/domain';
+import { ALLOWED_PHOTO_TYPES, AR_NOTE_STATUSES, SAVED_STATUSES, validateSaved, type SavedStatus, MAX_PHOTO_BYTES, validateArNote, validateInspection, type ArNoteStatus, type Building, type LatLng } from '@ie-miru/domain';
 import type { AppDeps, AppEnv } from '../app';
 
 export interface UserRouteDeps extends AppDeps {
@@ -116,5 +116,56 @@ export function registerUserRoutes(app: Hono<AppEnv>, deps: UserRouteDeps) {
     if (g) return g;
     const data = await deps.repos!.arNotes.getWorldMap(c.get('deviceId')!, c.req.param('id'));
     return data ? new Response(data, { headers: { 'Content-Type': 'application/octet-stream' } }) : c.json({ error: 'not_found' }, 404);
+  });
+
+  // ───── 保存した家 ─────
+  app.get('/v1/saved', async (c) => {
+    const g = guard(c);
+    if (g) return g;
+    return c.json({ saved: await deps.repos!.saved.list(c.get('deviceId')!) });
+  });
+
+  app.post('/v1/saved', async (c) => {
+    const g = guard(c);
+    if (g) return g;
+    const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body) return c.json({ error: 'invalid_json' }, 400);
+    const v = validateSaved(body);
+    if (!v.ok) return c.json({ error: 'invalid_input', details: v.errors }, 400);
+    // スナップショットが無ければ建物データから補う（再表示時の位置ヒント）
+    let snapshot = v.value.snapshot;
+    if (!snapshot) {
+      const b = await deps.findBuilding(v.value.buildingId, null).catch(() => null);
+      if (b) snapshot = { lat: b.centroid.lat, lng: b.centroid.lng, usage: b.usage, sourceMode: b.source.mode };
+    }
+    const saved = await deps.repos!.saved.upsert(c.get('deviceId')!, { ...v.value, snapshot }, now());
+    return c.json({ saved }, 201);
+  });
+
+  app.patch('/v1/saved/:buildingId{.+}', async (c) => {
+    const g = guard(c);
+    if (g) return g;
+    const id = decodeURIComponent(c.req.param('buildingId'));
+    const cur = await deps.repos!.saved.get(c.get('deviceId')!, id);
+    if (!cur) return c.json({ error: 'not_found' }, 404);
+    const body = ((await c.req.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
+    if (body.status !== undefined && !(typeof body.status === 'string' && body.status in SAVED_STATUSES)) return c.json({ error: 'invalid_status' }, 400);
+    const saved = await deps.repos!.saved.upsert(
+      c.get('deviceId')!,
+      {
+        buildingId: id,
+        nickname: typeof body.nickname === 'string' && body.nickname.trim() ? body.nickname.trim().slice(0, 60) : cur.nickname,
+        status: (body.status as SavedStatus | undefined) ?? cur.status,
+        snapshot: cur.snapshot,
+      },
+      now(),
+    );
+    return c.json({ saved });
+  });
+
+  app.delete('/v1/saved/:buildingId{.+}', async (c) => {
+    const g = guard(c);
+    if (g) return g;
+    return (await deps.repos!.saved.delete(c.get('deviceId')!, decodeURIComponent(c.req.param('buildingId')))) ? c.json({ ok: true }) : c.json({ error: 'not_found' }, 404);
   });
 }

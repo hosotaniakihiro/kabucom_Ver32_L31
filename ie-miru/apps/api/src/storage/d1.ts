@@ -1,4 +1,4 @@
-import type { ArNote, Inspection } from '@ie-miru/domain';
+import type { ArNote, Inspection, SavedBuilding } from '@ie-miru/domain';
 import type { BuildingReport } from '@ie-miru/services';
 import type { D1Like, R2Like } from './types';
 import type { Repositories } from './repositories';
@@ -37,6 +37,16 @@ const toArNote = (r: ArNoteRow): ArNote => {
     updatedAt: r.updated_at,
   };
 };
+
+type SavedRow = { building_id: string; nickname: string; status: string; snapshot: string | null; created_at: string; updated_at: string };
+const toSaved = (r: SavedRow): SavedBuilding => ({
+  buildingId: r.building_id,
+  nickname: r.nickname,
+  status: r.status as SavedBuilding['status'],
+  snapshot: j(r.snapshot, null),
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+});
 
 export function createRepositories(db: D1Like, photos: R2Like | null): Repositories {
   return {
@@ -127,6 +137,29 @@ export function createRepositories(db: D1Like, photos: R2Like | null): Repositor
         if (!cur?.world_map_key || !photos) return null;
         const o = await photos.get(cur.world_map_key);
         return o ? o.arrayBuffer() : null;
+      },
+    },
+    saved: {
+      async upsert(deviceId, sv, now) {
+        await db
+          .prepare(
+            `INSERT INTO saved_buildings (device_id, building_id, nickname, status, snapshot, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (device_id, building_id) DO UPDATE SET nickname = excluded.nickname, status = excluded.status, snapshot = COALESCE(excluded.snapshot, saved_buildings.snapshot), updated_at = excluded.updated_at`,
+          )
+          .bind(deviceId, sv.buildingId, sv.nickname, sv.status, sv.snapshot ? JSON.stringify(sv.snapshot) : null, now, now)
+          .run();
+        return (await this.get(deviceId, sv.buildingId))!;
+      },
+      async list(deviceId) {
+        return (await db.prepare('SELECT * FROM saved_buildings WHERE device_id = ? ORDER BY updated_at DESC LIMIT 500').bind(deviceId).all<SavedRow>()).results.map(toSaved);
+      },
+      async get(deviceId, buildingId) {
+        const r = await db.prepare('SELECT * FROM saved_buildings WHERE device_id = ? AND building_id = ?').bind(deviceId, buildingId).first<SavedRow>();
+        return r ? toSaved(r) : null;
+      },
+      async delete(deviceId, buildingId) {
+        const r = await db.prepare('DELETE FROM saved_buildings WHERE device_id = ? AND building_id = ?').bind(deviceId, buildingId).run();
+        return (r.meta?.changes ?? 0) > 0;
       },
     },
   };

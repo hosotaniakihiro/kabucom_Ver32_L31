@@ -1,4 +1,4 @@
-import type { ArNote, ArNoteStatus, Inspection } from '@ie-miru/domain';
+import type { ArNote, ArNoteStatus, Inspection, SavedBuilding } from '@ie-miru/domain';
 import type { BuildingReport } from '@ie-miru/services';
 
 export interface AnalysisRepo {
@@ -23,9 +23,18 @@ export interface ArNoteRepo {
   getWorldMap(deviceId: string, id: string): Promise<ArrayBuffer | null>;
 }
 
+export interface SavedRepo {
+  /** 既に保存済みなら nickname/status/snapshot を更新（upsert） */
+  upsert(deviceId: string, s: Omit<SavedBuilding, 'createdAt' | 'updatedAt'>, now: string): Promise<SavedBuilding>;
+  list(deviceId: string): Promise<SavedBuilding[]>;
+  get(deviceId: string, buildingId: string): Promise<SavedBuilding | null>;
+  delete(deviceId: string, buildingId: string): Promise<boolean>;
+}
+
 /** 永続化の集約（D1 + R2）。利用者データはすべて匿名端末ID（device_id）で分離する。 */
 export interface Repositories {
   analysis: AnalysisRepo;
   inspections: InspectionRepo;
   arNotes: ArNoteRepo;
+  saved: SavedRepo;
 }

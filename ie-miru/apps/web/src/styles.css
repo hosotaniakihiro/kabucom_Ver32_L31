@@ -119,3 +119,8 @@ textarea { margin: 8px 0; }
 .rebuild { min-height: 100%; background: var(--bg); }
 .rebuild.no-camera .arview { background: linear-gradient(#9ca3af, #e5e7eb); }
 .massing { position: absolute; inset: 0; width: 100%; height: 100%; }
+.save-btn { white-space: nowrap; }
+.save-dialog { border: none; border-radius: 16px; padding: 16px; width: min(92vw, 420px); background: var(--card); color: var(--fg); }
+.save-dialog::backdrop { background: #0006; }
+.saved-list .card { padding: 10px 12px; }
+.saved-item { text-align: left; width: 100%; padding: 4px 0; }
