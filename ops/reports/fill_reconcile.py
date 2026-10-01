@@ -246,13 +246,21 @@ def system_pnl_from_logs(ymd: str) -> dict[str, float]:
     return out
 
 
-def build_report(orders: list[dict], ymd: str, annual_pct: float, only_day: bool = True) -> str:
+def build_report(orders: list[dict], ymd: str, annual_pct: float, only_day: bool = True,
+                 lending_pct: float | None = None) -> str:
+    """2026-10-01: 手数料 (Details の実額) と売り建ての貸株料を差し引く。
+    売り建て (新規 Side=1) は損益の向きを反転する (以前は買いと同じ式で符号が逆だった)。
+    """
+    if lending_pct is None:
+        lending_pct = annual_pct
     entries = entry_price_map(ymd)
     sys_pnl = system_pnl_from_logs(ymd)
 
     # 新規 (CashMargin=2) と返済 (CashMargin=3) に分ける
     news: dict[str, list[tuple[float, float]]] = {}
     closes: dict[str, list[tuple[str, float, float]]] = {}
+    sides: dict[str, set] = {}
+    fee_map: dict[str, float] = {}
     skipped_other_day = 0
     for o in orders:
         sym = str(o.get("Symbol") or "").strip()
@@ -267,30 +275,14 @@ def build_report(orders: list[dict], ymd: str, annual_pct: float, only_day: bool
         q, px = avg_fill(o)
         if q <= 0:
             continue
+        fee_map[sym] = fee_map.get(sym, 0.0) + fees(o)
         if cm == CASH_MARGIN_NEW:
             news.setdefault(sym, []).append((q, px))
+            sides.setdefault(sym, set()).add("SELL" if str(o.get("Side")) == "1" else "BUY")
         elif cm == CASH_MARGIN_CLOSE:
             closes.setdefault(sym, []).append((str(o.get("ID") or o.get("OrderId") or ""), q, px))
 
-    lines = []
-    lines.append("# 実約定による損益照合 %s-%s-%s" % (ymd[:4], ymd[4:6], ymd[6:]))
-    lines.append("")
-    lines.append("損益の正は証券会社の約定。システムの EXIT COMPLETE は判定価格から")
-    lines.append("計算した想定値で、実約定と金利を含まないため参考値として並記する。")
-    lines.append("")
-    lines.append("金利は年率 %.2f%% (建玉金額 x %.5f%%/日) で計算。" % (
-        annual_pct, annual_pct / 365.0))
-    if only_day:
-        lines.append("")
-        lines.append("注文 ID の先頭 8 桁で対象日を絞っている "
-                     "(除外 %d 件)。/orders には過去日の注文も混ざるため。" % skipped_other_day)
-    lines.append("")
-
-    total_gross = 0.0
-    total_interest = 0.0
-    lines.append("| 銘柄 | 新規平均 | 返済平均 | 数量 | 総額損益 | 金利 | 実質損益 |")
-    lines.append("|---|---|---|---|---|---|---|")
-    for sym in sorted(set(list(news) + list(closes))):
+    def _pnl(sym: str):
         nq = sum(q for q, _ in news.get(sym, []))
         namt = sum(q * p for q, p in news.get(sym, []))
         navg = namt / nq if nq else 0.0
@@ -298,20 +290,49 @@ def build_report(orders: list[dict], ymd: str, annual_pct: float, only_day: bool
         camt = sum(q * p for _, q, p in closes.get(sym, []))
         cavg = camt / cq if cq else 0.0
         if nq <= 0 or cq <= 0:
-            lines.append("| %s | %s | %s | 新規/返済が揃っていない | | | |" % (
-                sym, "%.2f" % navg if nq else "-", "%.2f" % cavg if cq else "-"))
-            continue
+            return None, navg, cavg
         q = min(nq, cq)
-        gross = (cavg - navg) * q
-        interest = navg * q * (annual_pct / 365.0) / 100.0
-        net = gross - interest
-        total_gross += gross
-        total_interest += interest
-        lines.append("| %s | %.2f | %.2f | %.0f | %+.0f | -%.0f | **%+.0f** |" % (
-            sym, navg, cavg, q, gross, interest, net))
+        side = "SELL" if sides.get(sym) == {"SELL"} else "BUY"
+        gross = (cavg - navg) * q * (1 if side == "BUY" else -1)
+        rate = annual_pct if side == "BUY" else lending_pct
+        carry = navg * q * (rate / 365.0) / 100.0
+        fee = fee_map.get(sym, 0.0)
+        return {"side": side, "navg": navg, "cavg": cavg, "q": q, "gross": gross,
+                "carry": carry, "fee": fee, "net": gross - carry - fee,
+                "mixed": len(sides.get(sym, set())) > 1}, navg, cavg
+
+    lines = []
+    lines.append("# 実約定による損益照合 %s-%s-%s" % (ymd[:4], ymd[4:6], ymd[6:]))
     lines.append("")
-    lines.append("**実質損益 合計 %+.0f 円** (総額 %+.0f / 金利 -%.0f)" % (
-        total_gross - total_interest, total_gross, total_interest))
+    lines.append("損益の正は証券会社の約定。システムの EXIT COMPLETE は判定価格から")
+    lines.append("計算した想定値で、実約定・金利・手数料を含まないため参考値として並記する。")
+    lines.append("")
+    lines.append("金利 (買い建て) 年率 %.2f%% / 貸株料 (売り建て) 年率 %.2f%% を建玉金額に日割りで掛ける。"
+                 "手数料は約定明細の Commission + CommissionTax の実額。" % (annual_pct, lending_pct))
+    if only_day:
+        lines.append("")
+        lines.append("注文 ID の先頭 8 桁で対象日を絞っている "
+                     "(除外 %d 件)。/orders には過去日の注文も混ざるため。" % skipped_other_day)
+    lines.append("")
+
+    tot = {"gross": 0.0, "carry": 0.0, "fee": 0.0, "win": 0, "n": 0}
+    lines.append("| 銘柄 | 売買 | 新規平均 | 返済平均 | 数量 | 総額損益 | 金利/貸株料 | 手数料 | 実質損益 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    for sym in sorted(set(list(news) + list(closes))):
+        r, navg, cavg = _pnl(sym)
+        if r is None:
+            lines.append("| %s | | %s | %s | 新規/返済が揃っていない | | | | |" % (
+                sym, "%.2f" % navg if navg else "-", "%.2f" % cavg if cavg else "-"))
+            continue
+        tot["gross"] += r["gross"]; tot["carry"] += r["carry"]; tot["fee"] += r["fee"]
+        tot["n"] += 1; tot["win"] += 1 if r["net"] > 0 else 0
+        lines.append("| %s | %s%s | %.2f | %.2f | %.0f | %+.0f | -%.0f | -%.0f | **%+.0f** |" % (
+            sym, "買" if r["side"] == "BUY" else "売", " (売買混在)" if r["mixed"] else "",
+            r["navg"], r["cavg"], r["q"], r["gross"], r["carry"], r["fee"], r["net"]))
+    net_total = tot["gross"] - tot["carry"] - tot["fee"]
+    lines.append("")
+    lines.append("**実質損益 合計 %+.0f 円** (総額 %+.0f / 金利・貸株料 -%.0f / 手数料 -%.0f / 勝ち %d / %d 銘柄)" % (
+        net_total, tot["gross"], tot["carry"], tot["fee"], tot["win"], tot["n"]))
     lines.append("")
 
     if sys_pnl:
@@ -320,23 +341,16 @@ def build_report(orders: list[dict], ymd: str, annual_pct: float, only_day: bool
         lines.append("| 銘柄 | システム記録 | 実質損益 | 差 |")
         lines.append("|---|---|---|---|")
         for sym in sorted(set(list(sys_pnl) + list(closes))):
-            nq = sum(q for q, _ in news.get(sym, []))
-            namt = sum(q * p for q, p in news.get(sym, []))
-            navg = namt / nq if nq else 0.0
-            cq = sum(q for _, q, _ in closes.get(sym, []))
-            camt = sum(q * p for _, q, p in closes.get(sym, []))
-            cavg = camt / cq if cq else 0.0
-            if nq <= 0 or cq <= 0:
+            r, _, _ = _pnl(sym)
+            if r is None:
                 continue
-            q = min(nq, cq)
-            net = (cavg - navg) * q - navg * q * (annual_pct / 365.0) / 100.0
-            s = sys_pnl.get(sym)
+            s_ = sys_pnl.get(sym)
             lines.append("| %s | %s | %+.0f | %s |" % (
-                sym, ("%+.0f" % s) if s is not None else "記録なし", net,
-                ("%+.0f" % (net - s)) if s is not None else "-"))
+                sym, ("%+.0f" % s_) if s_ is not None else "記録なし", r["net"],
+                ("%+.0f" % (r["net"] - s_)) if s_ is not None else "-"))
         lines.append("")
         lines.append("システム合計 %+.0f 円 / 実質損益 合計 %+.0f 円" % (
-            sum(sys_pnl.values()), total_gross - total_interest))
+            sum(sys_pnl.values()), net_total))
         lines.append("")
 
     lines.append("## 返済注文ごとの約定")
@@ -360,6 +374,8 @@ def main() -> int:
                     help="稼働中でも実行する (トークンを奪うので通常は使わない)")
     ap.add_argument("--annual-interest-pct", type=float,
                     default=DEFAULT_ANNUAL_INTEREST_PCT)
+    ap.add_argument("--annual-lending-pct", type=float, default=None,
+                    help="売り建ての貸株料 年率%%。既定は金利と同じ (未実測)")
     ap.add_argument("--all-days", action="store_true",
                     help="注文 ID の日付で絞らず全部集計する (過去分もまとめて見るとき)")
     a = ap.parse_args()
@@ -387,7 +403,8 @@ def main() -> int:
         p = save_raw(orders, ymd)
         print("生データを保存: %s (%d 件)" % (p, len(orders)))
 
-    md = build_report(orders, ymd, a.annual_interest_pct, only_day=not a.all_days)
+    md = build_report(orders, ymd, a.annual_interest_pct, only_day=not a.all_days,
+                      lending_pct=a.annual_lending_pct)
     out = _reports_dir() / ("fill_reconcile_%s.md" % ymd)
     out.write_text(md, encoding="utf-8")
     print()

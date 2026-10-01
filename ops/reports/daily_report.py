@@ -48,6 +48,13 @@ RE_REGNG = re.compile(r"\[REGISTER NG SYMBOLS\][^\n]*symbols=\[([^\]]*)\]")
 RE_GATE_DETAIL = re.compile(r"'detail_reason': '([A-Z_]+)")
 
 
+
+# 2026-10-01: 損益から差し引くコスト。金利は 9/28 の実測 3 件 (0.00475〜0.00479%/日) から。
+#   貸株料は未実測なので金利と同じ値を仮置き。手数料はデイトレ信用で 0 円。
+ANNUAL_INTEREST_PCT = float(os.environ.get("REPORT_ANNUAL_INTEREST_PCT", "1.75"))
+ANNUAL_LENDING_PCT = float(os.environ.get("REPORT_ANNUAL_LENDING_PCT", "1.75"))
+COMMISSION_YEN_PER_TRADE = float(os.environ.get("REPORT_COMMISSION_YEN_PER_TRADE", "0"))
+
 def _fmt_yen(v: float) -> str:
     return f"{v:+,.0f}円"
 
@@ -179,9 +186,16 @@ def scan_positions(day: str) -> dict:
         side = str(r.get("side") or "").upper()
         status = str(r.get("status") or "").upper()
         pnl = None
+        cost = 0.0
         if xp > 0 and ep > 0 and qty > 0 and status.startswith("CLOSED"):
-            pnl = (xp - ep) * qty * (1.0 if side.startswith(("BUY", "LONG")) else -1.0)
+            is_buy = side.startswith(("BUY", "LONG"))
+            pnl = (xp - ep) * qty * (1.0 if is_buy else -1.0)
+            # 2026-10-01: 金利 (買い) / 貸株料 (売り) を建玉金額の日割りで引く。
+            #   手数料はデイトレ信用で実額 0 円 (9/28・9/30 の約定明細で確認)。
+            rate = ANNUAL_INTEREST_PCT if is_buy else ANNUAL_LENDING_PCT
+            cost = ep * qty * rate / 365.0 / 100.0 + COMMISSION_YEN_PER_TRADE
         r["pnl"] = pnl
+        r["cost"] = cost
         out["rows"].append(r)
     return out
 
@@ -202,10 +216,12 @@ def build_report(day: str, logs: dict, pos: dict) -> str:
         closed = [r for r in pos["rows"] if r.get("pnl") is not None]
         open_ = [r for r in pos["rows"] if str(r.get("status") or "").upper() == "OPEN"]
         total = sum(r["pnl"] for r in closed)
-        wins = [r for r in closed if r["pnl"] > 0]
-        L.append(f"- 決済 {len(closed)} 件 / 勝ち {len(wins)} / 合計 {_fmt_yen(total)} / 未決済 {len(open_)} 件")
+        cost_total = sum(r.get("cost") or 0.0 for r in closed)
+        wins = [r for r in closed if r["pnl"] - (r.get("cost") or 0.0) > 0]
+        L.append(f"- 決済 {len(closed)} 件 / 勝ち {len(wins)} / 実質 {_fmt_yen(total - cost_total)} (総額 {_fmt_yen(total)} / 金利・貸株料・手数料 -{cost_total:,.0f}円) / 未決済 {len(open_)} 件")
+        L.append(f"- 注意: 判定価格ベースのシステム記録。実約定は引け後に fill_reconcile.py で取る")
         for r in closed:
-            L.append(f"  - {r['symbol']} {r['side']} {int(float(r['qty'] or 0))}株 {r['avg_price']} → {r['exit_price']} = {_fmt_yen(r['pnl'])}  ({str(r.get('entry_time'))[11:19]} → {str(r.get('exit_time') or r.get('closed_time'))[11:19]})")
+            L.append(f"  - {r['symbol']} {r['side']} {int(float(r['qty'] or 0))}株 {r['avg_price']} → {r['exit_price']} = {_fmt_yen(r['pnl'] - (r.get('cost') or 0.0))} (コスト -{(r.get('cost') or 0.0):,.0f}円)  ({str(r.get('entry_time'))[11:19]} → {str(r.get('exit_time') or r.get('closed_time'))[11:19]})")
         for r in open_:
             L.append(f"  - [OPEN] {r['symbol']} {r['side']} {int(float(r['qty'] or 0))}株 @{r['avg_price']} ({str(r.get('entry_time'))[11:19]})")
     L.append("")
