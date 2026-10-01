@@ -56,7 +56,9 @@ from utils_common import (
     # (retry 層を通したい呼び出しは関数内 import 側 = _epi_* を参照)
     _get_latest_bid_ask_core as _sbr_orig_get_latest_bid_ask,
     calculate_qty_by_budget,
-    get_tick_size,
+    # 2026-10-01: このモジュールの get_tick_size は全部「発注価格の丸め」用。
+    #   旧表 (1,000〜3,000 円を 5 円刻み) で売り指値が気配より上に飛んでいた。
+    get_order_tick_size as get_tick_size,
 )
 from sqlite_cm import committing_connect
 from nas_root import nas_path, nas_root
@@ -777,12 +779,18 @@ def _passive_limit_price(bid: float, ask: float, side: str) -> float:
     """自分側の気配に置く指値 (BUY=bid / SELL=ask)。mode=mid なら仲値を自分側へ丸める。"""
     side_u = str(side or "").upper()
     b, a = float(bid), float(ask)
+    near = b if side_u == "BUY" else a
     if ENTRY_PASSIVE_LIMIT_MODE == "mid" and b > 0 and a > 0:
         mid = (b + a) / 2.0
         tick = get_tick_size(mid)
         # BUY は切り下げ (安い側)、SELL は切り上げ (高い側) = 自分に有利な側へ
-        return math.floor(mid / tick) * tick if side_u == "BUY" else math.ceil(mid / tick) * tick
-    near = b if side_u == "BUY" else a
+        px = math.floor(mid / tick) * tick if side_u == "BUY" else math.ceil(mid / tick) * tick
+        # 2026-10-01: 呼値の表が実際より粗い (TOPIX100 等) と気配の外へ出るので気配の内側に収める
+        return min(max(px, b), a)
+    # 2026-10-01: 気配の値段はそれ自体が有効な呼値なので丸めない。
+    #   以前は粗い呼値で切り上げ/切り下げて、売り指値が買い気配から 4 円離れていた (5706: 2371 -> 2375)。
+    if near > 0:
+        return near
     tick = get_tick_size(near)
     return math.floor(near / tick) * tick if side_u == "BUY" else math.ceil(near / tick) * tick
 
@@ -2041,7 +2049,7 @@ def _epi_norm_side(v: Any) -> str:
 
 def _epi_get_tick_size(price: float) -> float:
     try:
-        from utils_common import get_tick_size
+        from utils_common import get_order_tick_size as get_tick_size
         tick = float(get_tick_size(float(price)))
         if tick > 0:
             return tick
@@ -3004,7 +3012,7 @@ def _rfb_source_enabled(source: str) -> bool:
 
 def _rfb_tick(price: float) -> float:
     try:
-        from utils_common import get_tick_size
+        from utils_common import get_order_tick_size as get_tick_size
         t = float(get_tick_size(price))
         return t if t > 0 else 1.0
     except Exception:

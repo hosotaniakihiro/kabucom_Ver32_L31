@@ -338,6 +338,30 @@ def calculate_qty_by_budget(
 # 🔵 Tick Size
 # ============================================================
 
+def get_order_tick_size(price) -> float:
+    """発注価格を丸めるための東証の呼値 (TOPIX100 以外の通常銘柄の表)。
+
+    2026-10-01: get_tick_size は 1,000〜3,000 円を 5 円刻みにしている (旧制度)。
+    これで売り指値を切り上げると 5706 は 気配 2371 -> 2375 になり、
+    買い気配より 4 円上の指値で約定せず 1 秒で取消されていた (売り新規 14 回中 0 約定)。
+    TOPIX100 銘柄はもっと細かいが、この表の刻みは TOPIX100 でも有効な値段になる。
+    """
+    try:
+        p = float(price)
+    except Exception:
+        return 1.0
+    if p <= 0:
+        return 1.0
+    for upper, tick in (
+        (3000, 1.0), (5000, 5.0), (30000, 10.0), (50000, 50.0),
+        (300000, 100.0), (500000, 500.0), (3000000, 1000.0),
+        (5000000, 5000.0), (30000000, 10000.0), (50000000, 50000.0),
+    ):
+        if p <= upper:
+            return tick
+    return 100000.0
+
+
 def get_tick_size(price_or_symbol):
     try:
         if isinstance(price_or_symbol, str):
