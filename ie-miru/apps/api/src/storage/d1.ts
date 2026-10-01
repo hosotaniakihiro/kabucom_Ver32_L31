@@ -1,4 +1,4 @@
-import type { ArNote, Inspection, SavedBuilding } from '@ie-miru/domain';
+import type { ArNote, Building, Inspection, SavedBuilding } from '@ie-miru/domain';
 import type { BuildingReport } from '@ie-miru/services';
 import type { D1Like, R2Like } from './types';
 import type { Repositories } from './repositories';
@@ -51,8 +51,66 @@ const toSaved = (r: SavedRow): SavedBuilding => ({
 export function createRepositories(db: D1Like, photos: R2Like | null): Repositories {
   return {
     analysis: {
-      async saveReport(_r: BuildingReport) {
-        /* Phase 19 */
+      async saveReport(r: BuildingReport) {
+        const b = r.building;
+        const now = r.generatedAt;
+        const { footprint, source, centroid, ...attrs } = b;
+        const v = r.valuation.status === 'available' ? r.valuation.value : null;
+        const z = r.zoning.status === 'available' ? r.zoning.value : null;
+        const stmts = [
+          db
+            .prepare(
+              `INSERT INTO buildings (id, source_id, source_mode, centroid_lat, centroid_lng, footprint, attributes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (id) DO UPDATE SET source_id = excluded.source_id, source_mode = excluded.source_mode, centroid_lat = excluded.centroid_lat, centroid_lng = excluded.centroid_lng, footprint = excluded.footprint, attributes = excluded.attributes, updated_at = excluded.updated_at`,
+            )
+            .bind(b.id, source.id, source.mode, centroid.lat, centroid.lng, JSON.stringify(footprint), JSON.stringify({ ...attrs, source }), now),
+          db
+            .prepare(
+              `INSERT INTO property_analysis (building_id, generated_at, data_mode, valuation_low, valuation_mid, valuation_high, valuation_confidence, comparables_count, use_district, coverage_ratio_pct, floor_area_ratio_pct, report_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (building_id) DO UPDATE SET generated_at = excluded.generated_at, data_mode = excluded.data_mode, valuation_low = excluded.valuation_low, valuation_mid = excluded.valuation_mid, valuation_high = excluded.valuation_high, valuation_confidence = excluded.valuation_confidence, comparables_count = excluded.comparables_count, use_district = excluded.use_district, coverage_ratio_pct = excluded.coverage_ratio_pct, floor_area_ratio_pct = excluded.floor_area_ratio_pct, report_json = excluded.report_json`,
+            )
+            .bind(
+              b.id, now, r.dataMode, v?.estimatedLow ?? null, v?.estimatedMid ?? null, v?.estimatedHigh ?? null, v?.confidence ?? null,
+              r.comparables.status === 'available' ? r.comparables.value.count : null, z?.useDistrict ?? null, z?.coverageRatioPct ?? null, z?.floorAreaRatioPct ?? null, JSON.stringify(r),
+            ),
+        ];
+        const uniqueSources = new Map(
+          [b.source, ...r.zoning.sources, ...r.landPrices.sources, ...r.transactions.sources, ...r.hazards.flatMap((h) => h.sources)].map((x) => [x.id, x]),
+        );
+        for (const sr of uniqueSources.values()) {
+          stmts.push(
+            db
+              .prepare(
+                `INSERT INTO building_sources (building_id, source_id, source_name, mode, url, license, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (building_id, source_id) DO UPDATE SET source_name = excluded.source_name, mode = excluded.mode, url = excluded.url, license = excluded.license, fetched_at = excluded.fetched_at`,
+              )
+              .bind(b.id, sr.id, sr.name, sr.mode, sr.url, sr.license, sr.fetchedAt),
+          );
+        }
+        for (const h of r.hazards) {
+          stmts.push(
+            db
+              .prepare(
+                `INSERT INTO hazards (building_id, hazard_type, status, level, severity, source_ids, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (building_id, hazard_type) DO UPDATE SET status = excluded.status, level = excluded.level, severity = excluded.severity, source_ids = excluded.source_ids, checked_at = excluded.checked_at`,
+              )
+              .bind(b.id, h.type, h.status, h.level, h.severity, JSON.stringify(h.sources.map((x) => `${x.id}:${x.mode}`)), now),
+          );
+        }
+        await db.batch(stmts);
+      },
+      async getReport(buildingId, maxAgeMs, now) {
+        const row = await db.prepare('SELECT generated_at, report_json FROM property_analysis WHERE building_id = ?').bind(buildingId).first<{ generated_at: string; report_json: string }>();
+        if (!row) return null;
+        if (now.getTime() - Date.parse(row.generated_at) > maxAgeMs) return null;
+        return j<BuildingReport | null>(row.report_json, null);
+      },
+      async getBuilding(buildingId) {
+        const row = await db.prepare('SELECT * FROM buildings WHERE id = ?').bind(buildingId).first<{ id: string; centroid_lat: number; centroid_lng: number; footprint: string; attributes: string }>();
+        if (!row) return null;
+        const attrs = j<Record<string, unknown>>(row.attributes, {});
+        return { ...(attrs as object), id: row.id, centroid: { lat: row.centroid_lat, lng: row.centroid_lng }, footprint: j(row.footprint, []) } as unknown as Building;
       },
     },
     inspections: {

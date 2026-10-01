@@ -1,8 +1,12 @@
-import type { ArNote, ArNoteStatus, Inspection, SavedBuilding } from '@ie-miru/domain';
+import type { ArNote, ArNoteStatus, Building, Inspection, SavedBuilding } from '@ie-miru/domain';
 import type { BuildingReport } from '@ie-miru/services';
 
 export interface AnalysisRepo {
+  /** レポートと構成要素（建物・出典・査定・ハザード）を保存。mock/demo も mode 付きで保存し混同しない */
   saveReport(r: BuildingReport): Promise<void>;
+  /** maxAgeMs 以内に作られたレポート（isolate を跨いだキャッシュ） */
+  getReport(buildingId: string, maxAgeMs: number, now: Date): Promise<BuildingReport | null>;
+  getBuilding(buildingId: string): Promise<Building | null>;
 }
 
 export interface InspectionRepo {

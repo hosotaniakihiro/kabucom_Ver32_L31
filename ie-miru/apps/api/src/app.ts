@@ -21,6 +21,9 @@ export interface AppDeps {
 
 export type AppEnv = { Variables: { deviceId: string | null } };
 
+/** レポートの永続キャッシュ期間（公的データの更新頻度は日〜年単位） */
+const REPORT_TTL_MS = 24 * 60 * 60 * 1000;
+
 const PERMISSIONS: LocationPermission[] = ['granted', 'denied', 'restricted', 'not_determined', 'unsupported'];
 
 function num(v: string | undefined): number | null {
@@ -63,7 +66,9 @@ export function createApp(deps: AppDeps) {
   async function findBuilding(id: string, hint: LatLng | null): Promise<Building | null> {
     const cached = buildingCache.get(id);
     if (cached) return cached;
-    const b = await services.buildings.getById(id, hint ?? undefined);
+    let b = await services.buildings.getById(id, hint ?? undefined);
+    // isolate 再起動後でも、一度レポートを作った建物は D1 から復元できる
+    if (!b && deps.repos) b = await deps.repos.analysis.getBuilding(id).catch(() => null);
     if (b) buildingCache.set(b.id, b);
     return b;
   }
@@ -116,6 +121,10 @@ export function createApp(deps: AppDeps) {
     if (!b) return c.json({ error: 'building_not_found' }, 404);
     const fresh = c.req.query('fresh') === '1';
     let report = fresh ? undefined : reportCache.get(id);
+    if (!report && !fresh && deps.repos) {
+      report = (await deps.repos.analysis.getReport(id, REPORT_TTL_MS, deps.now?.() ?? new Date()).catch(() => null)) ?? undefined;
+      if (report) reportCache.set(id, report);
+    }
     if (!report) {
       report = await buildReport(b, { realEstate: services.realEstate, hazards: services.hazards, geocoder: services.geocoder, now: deps.now });
       reportCache.set(id, report);

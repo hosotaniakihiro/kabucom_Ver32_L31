@@ -59,6 +59,8 @@ actor APIClient {
 
     func get(_ path: String) async throws -> Data { try await request(path) }
 
+    func delete(_ path: String) async throws -> Data { try await request(path, method: "DELETE") }
+
     func put(_ path: String, binary: Data) async throws -> Data {
         try await request(path, method: "PUT", body: binary, contentType: "application/octet-stream")
     }

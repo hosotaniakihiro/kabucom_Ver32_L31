@@ -78,7 +78,7 @@ struct SavedListView: View {
                     }
                 }
                 .onDelete { idx in
-                    for i in idx { let id = items[i].buildingId; Task { _ = try? await APIClient.shared.send("v1/saved/\(id.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? id)", method: "DELETE", json: Optional<String>.none) } }
+                    for i in idx { let id = items[i].buildingId; Task { _ = try? await APIClient.shared.delete("v1/saved/\(id.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? id)") } }
                     items.remove(atOffsets: idx)
                 }
             }

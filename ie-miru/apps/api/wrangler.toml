@@ -1,0 +1,44 @@
+# Cloudflare Workers 設定（家を見るAI API）
+# ⚠ 本番リソースの作成・Secret 設定・デプロイは HUMAN ACTION（docs/IE_MIRU_HUMAN_ACTION.md）。
+#   ここにある ID はプレースホルダで、このままではデプロイできない（誤って本番へ出さないため）。
+name = "ie-miru-api"
+main = "src/worker.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# live: キーがあれば実データ / mock: 外部にアクセスしない
+DATA_MODE = "live"
+# PLATEAU 建物 MVT のURLテンプレート（{z}/{x}/{y}）。未設定ならデモ建物
+PLATEAU_MVT_URL = ""
+PLATEAU_MVT_LAYER = ""
+PLATEAU_MVT_ZOOM = "16"
+ENABLE_OSM_FALLBACK = "0"
+# カンマ区切りの許可オリジン（空なら全許可。本番では必ず設定）
+ALLOWED_ORIGINS = ""
+
+# REINFOLIB_API_KEY は Secret: `wrangler secret put REINFOLIB_API_KEY`（コード・この設定に書かない）
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ie-miru"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "ie-miru-photos"
+
+[env.staging]
+name = "ie-miru-api-staging"
+[env.staging.vars]
+DATA_MODE = "mock"
+ALLOWED_ORIGINS = ""
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "ie-miru-staging"
+database_id = "REPLACE_WITH_STAGING_D1_DATABASE_ID"
+migrations_dir = "migrations"
+[[env.staging.r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "ie-miru-photos-staging"

@@ -1,0 +1,5 @@
+# ローカル開発用（コピーして .dev.vars に。.dev.vars は git 管理外）
+# REINFOLIB_API_KEY=xxxxxxxx
+# PLATEAU_MVT_URL=https://example.org/plateau/bldg/{z}/{x}/{y}.pbf
+# ENABLE_OSM_FALLBACK=1
+DATA_MODE=live
