@@ -10,6 +10,7 @@ import { TtlCache } from './cache';
 import type { Services } from './env';
 import type { Repositories } from './storage/repositories';
 import { registerUserRoutes } from './routes/user';
+import { registerSimulationRoutes } from './routes/simulations';
 
 export interface AppDeps {
   services: Services;
@@ -129,6 +130,7 @@ export function createApp(deps: AppDeps) {
     return b ? c.json(b) : c.json({ error: 'building_not_found' }, 404);
   });
 
+  registerSimulationRoutes(app);
   registerUserRoutes(app, { ...deps, findBuilding });
 
   app.notFound((c) => c.json({ error: 'not_found' }, 404));

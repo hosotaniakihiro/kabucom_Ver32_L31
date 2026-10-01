@@ -10,3 +10,4 @@ export * from './zoning';
 export * from './hazard';
 export * from './comparables';
 export * from './valuation';
+export * from './simulate';
