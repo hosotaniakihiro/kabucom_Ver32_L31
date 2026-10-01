@@ -1,0 +1,30 @@
+{
+  "name": "ie-miru",
+  "private": true,
+  "version": "0.1.0",
+  "description": "家を見るAI — iPhoneを建物に向けて、公的情報・参考相場・災害リスク・試算を表示する",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build:web": "npm run build -w @ie-miru/web",
+    "dev:api": "npm run dev:node -w @ie-miru/api",
+    "e2e": "npm run build:web && playwright test",
+    "check": "npm run typecheck && npm run test"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "tsx": "^4.23.15",
+    "typescript": "5.9",
+    "vitest": "^3.2.4"
+  }
+}
