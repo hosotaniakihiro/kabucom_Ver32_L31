@@ -50,7 +50,7 @@ final class ARNoteController: NSObject, ObservableObject, ARSessionDelegate {
         let config = ARSessionController.worldConfig()
         // 最新の ARWorldMap があれば読み込んで再ローカライズを試みる
         if let withMap = notes.first(where: { $0.anchor.worldMap != nil }),
-           let data = try? await APIClient.shared.send("v1/ar-notes/\(withMap.id)/world-map", method: "GET", json: Optional<String>.none),
+           let data = try? await APIClient.shared.get("v1/ar-notes/\(withMap.id)/world-map"),
            let map = try? NSKeyedUnarchiver.unarchivedObject(ofClass: ARWorldMap.self, from: data) {
             config.initialWorldMap = map
             info = "前回の空間を探しています。保存したときと同じ位置からゆっくり見回してください。"
@@ -65,7 +65,7 @@ final class ARNoteController: NSObject, ObservableObject, ARSessionDelegate {
     func load(buildingId: String) async {
         struct R: Decodable { var notes: [ARNoteDTO] }
         let q = buildingId.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? buildingId
-        if let d = try? await APIClient.shared.send("v1/ar-notes?buildingId=\(q)", method: "GET", json: Optional<String>.none),
+        if let d = try? await APIClient.shared.get("v1/ar-notes?buildingId=\(q)"),
            let r = try? JSONDecoder().decode(R.self, from: d) { notes = r.notes }
     }
 
@@ -84,7 +84,6 @@ final class ARNoteController: NSObject, ObservableObject, ARSessionDelegate {
             world = SIMD3(p.x, p.y, p.z)
             distance = Double(simd_distance(SIMD3(cam.x, cam.y, cam.z), world!)) * cos(pose.pitch * .pi / 180)
         }
-        let id = UUID().uuidString
         let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
         var anchor = ARNoteDTO.AnchorDTO(
             gps: .init(lat: fix.latitude, lng: fix.longitude, accuracyM: fix.horizontalAccuracy, altitudeM: fix.altitude),
@@ -108,9 +107,8 @@ final class ARNoteController: NSObject, ObservableObject, ARSessionDelegate {
         // 空間地図を保存（同じ場所での再ローカライズ用）
         arView.session.getCurrentWorldMap { map, _ in
             guard let map, let blob = try? NSKeyedArchiver.archivedData(withRootObject: map, requiringSecureCoding: true) else { return }
-            Task { _ = try? await APIClient.shared.upload("v1/ar-notes/\(created.id)/world-map", multipart: blob, boundary: "") }
+            Task { _ = try? await APIClient.shared.put("v1/ar-notes/\(created.id)/world-map", binary: blob) }
         }
-        _ = id
     }
 
     /// ARWorldMap で復元できなかったメモを GPS＋方位から推定配置
