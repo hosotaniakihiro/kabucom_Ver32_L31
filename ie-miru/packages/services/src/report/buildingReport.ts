@@ -1,6 +1,6 @@
 import {
-  available, estimateFloorsFromHeight, isMock, missing, summarizeHazards,
-  type Building, type HazardResult, type HazardSummary, type LandPricePoint, type Sourced, type SourceRef, type Transaction, type ZoningInfo,
+  available, estimateFloorsFromHeight, estimateSubject, isMock, missing, summarizeComparables, summarizeHazards,
+  type Building, type ComparablesSummary, type PropertySubject, type HazardResult, type HazardSummary, type LandPricePoint, type Sourced, type SourceRef, type Transaction, type ZoningInfo,
 } from '@ie-miru/domain';
 import type { Geocoder, AreaInfo } from '../geocoder/gsi';
 import type { HazardService } from '../hazard/service';
@@ -24,6 +24,10 @@ export interface BuildingReport {
   landPrices: Sourced<LandPricePoint[]>;
   /** 周辺取引事例（この建物の価格ではない） */
   transactions: Sourced<Transaction[]>;
+  /** 対象物件の推定プロファイル（AI推定。利用者が上書き可能） */
+  subject: Sourced<PropertySubject>;
+  /** 類似度で絞った周辺取引事例と参考相場 */
+  comparables: Sourced<ComparablesSummary>;
   hazards: HazardResult[];
   hazardSummary: HazardSummary;
   /** live / mock / demo / mixed */
@@ -79,6 +83,21 @@ export async function buildReport(b: Building, deps: ReportDeps, signal?: AbortS
     ? available({ prefectureCode: area.prefectureCode, cityCode: area.cityCode, townName: area.townName }, 'public', [area.source])
     : missing('unavailable', 'public', [], '所在地（市区町村）を特定できませんでした');
 
+  const townName = area?.townName ?? null;
+  const subject = estimateSubject(b, zoning.status === 'available' ? zoning.value : null, { townName });
+  const subjectSourced = available(subject, 'ai_estimate', [b.source, ...zoning.sources], '建物外形・用途地域から推定。買う/売る画面で修正できます。');
+  const now = deps.now?.() ?? new Date();
+  let comparables: Sourced<ComparablesSummary>;
+  if (transactions.status === 'available') {
+    const summary = summarizeComparables(subject, transactions.value, { sinceYear: now.getFullYear() - 3 });
+    comparables =
+      summary.count > 0
+        ? available(summary, 'reference', transactions.sources, '周辺取引事例から算出した参考相場です。')
+        : missing('no_data', 'reference', transactions.sources, '条件の近い取引事例が見つかりませんでした');
+  } else {
+    comparables = missing(transactions.status, 'reference', transactions.sources, transactions.reason);
+  }
+
   const allSources: SourceRef[] = [
     b.source,
     ...areaSourced.sources,
@@ -98,6 +117,8 @@ export async function buildReport(b: Building, deps: ReportDeps, signal?: AbortS
     zoning,
     landPrices,
     transactions,
+    subject: subjectSourced,
+    comparables,
     hazards,
     hazardSummary: summarizeHazards(hazards),
     dataMode,

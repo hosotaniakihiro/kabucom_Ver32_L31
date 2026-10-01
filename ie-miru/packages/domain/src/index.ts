@@ -8,3 +8,4 @@ export * from './selection';
 export * from './realestate';
 export * from './zoning';
 export * from './hazard';
+export * from './comparables';
