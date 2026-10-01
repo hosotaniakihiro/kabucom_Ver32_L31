@@ -1,0 +1,9 @@
+{
+  "status": "OK",
+  "data": [
+    { "PriceCategory": "不動産取引価格情報", "Type": "宅地(土地と建物)", "Region": "住宅地", "MunicipalityCode": "13112", "Prefecture": "東京都", "Municipality": "世田谷区", "DistrictName": "サンプル一丁目", "TradePrice": "52000000", "PricePerUnit": "", "FloorPlan": "", "Area": "110", "UnitPrice": "", "LandShape": "ほぼ長方形", "Frontage": "8.0", "TotalFloorArea": "95", "BuildingYear": "1990年", "Structure": "木造", "Use": "住宅", "Purpose": "住宅", "Direction": "南", "Classification": "区道", "Breadth": "4.0", "CityPlanning": "第１種低層住居専用地域", "CoverageRatio": "60", "FloorAreaRatio": "150", "Period": "2025年第2四半期", "Renovation": "", "Remarks": "" },
+    { "PriceCategory": "成約価格情報", "Type": "宅地(土地)", "Region": "住宅地", "MunicipalityCode": "13112", "Prefecture": "東京都", "Municipality": "世田谷区", "DistrictName": "サンプル二丁目", "TradePrice": "45000000", "PricePerUnit": "", "FloorPlan": "", "Area": "100", "UnitPrice": "450000", "LandShape": "不整形", "Frontage": "7.5", "TotalFloorArea": "", "BuildingYear": "", "Structure": "", "Use": "", "Purpose": "住宅", "Direction": "北", "Classification": "区道", "Breadth": "5.0", "CityPlanning": "第１種中高層住居専用地域", "CoverageRatio": "60", "FloorAreaRatio": "200", "Period": "2025年第1四半期", "Renovation": "", "Remarks": "" },
+    { "PriceCategory": "不動産取引価格情報", "Type": "宅地(土地と建物)", "Region": "住宅地", "MunicipalityCode": "13112", "Prefecture": "東京都", "Municipality": "世田谷区", "DistrictName": "サンプル三丁目", "TradePrice": "980000000", "Area": "2000㎡以上", "TotalFloorArea": "1500", "BuildingYear": "戦前", "Structure": "ＲＣ", "CityPlanning": "第１種住居地域", "CoverageRatio": "60", "FloorAreaRatio": "200", "Period": "2024年第4四半期" },
+    { "PriceCategory": "不動産取引価格情報", "Type": "宅地(土地)", "TradePrice": "", "Period": "2024年第4四半期" }
+  ]
+}

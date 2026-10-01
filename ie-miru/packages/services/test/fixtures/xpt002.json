@@ -1,0 +1,11 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    { "type": "Feature", "geometry": { "type": "Point", "coordinates": [139.6540, 35.6470] },
+      "properties": { "point_id": "13112-001", "target_year_name_ja": "令和7年", "land_price_type": 0, "u_current_years_price_ja": "512,000(円/㎡)", "year_on_year_change_rate": "2.3", "residence_display_name_ja": "世田谷区サンプル1-2-3", "use_category_name_ja": "住宅", "regulations_use_category_name_ja": "第一種低層住居専用地域", "u_regulations_building_coverage_ratio_ja": "60(%)", "u_regulations_floor_area_ratio_ja": "150(%)", "nearest_station_name_ja": "サンプル駅", "u_road_distance_to_nearest_station_name_ja": "850m" } },
+    { "type": "Feature", "geometry": { "type": "Point", "coordinates": [139.6600, 35.6500] },
+      "properties": { "point_id": "13112-002", "target_year_name_ja": "2025年", "land_price_type": 1, "u_current_years_price_ja": "480,000(円/㎡)", "year_on_year_change_rate": "", "use_category_name_ja": "住宅" } },
+    { "type": "Feature", "geometry": { "type": "Point", "coordinates": [139.6700, 35.6500] },
+      "properties": { "point_id": "13112-003", "u_current_years_price_ja": "" } }
+  ]
+}

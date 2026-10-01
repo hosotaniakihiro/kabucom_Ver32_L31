@@ -5,3 +5,8 @@ export * from './buildings/composite';
 export * from './plateau/attributes';
 export * from './plateau/mvtSource';
 export * from './osm/overpassSource';
+export * from './reinfolib/client';
+export * from './reinfolib/mock';
+export * from './reinfolib/parse';
+export * from './geocoder/gsi';
+export * from './reinfolib/service';

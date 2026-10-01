@@ -1,0 +1,8 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    { "type": "Feature",
+      "properties": { "use_area_ja": "第一種低層住居専用地域", "u_building_coverage_ratio_ja": "60%", "u_floor_area_ratio_ja": "150%", "prefecture": "東京都", "city_name": "世田谷区" },
+      "geometry": { "type": "Polygon", "coordinates": [[[139.650, 35.644], [139.656, 35.644], [139.656, 35.649], [139.650, 35.649], [139.650, 35.644]]] } }
+  ]
+}
