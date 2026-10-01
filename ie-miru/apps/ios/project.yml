@@ -1,0 +1,37 @@
+# XcodeGen 定義。`brew install xcodegen && xcodegen generate` で IeMiru.xcodeproj を生成する。
+name: IeMiru
+options:
+  bundleIdPrefix: app.iemiru
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: ""   # HUMAN ACTION: Apple Developer Team ID
+targets:
+  IeMiru:
+    type: application
+    platform: iOS
+    sources: [IeMiru]
+    info:
+      path: IeMiru/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: $(IEMIRU_DISPLAY_NAME)
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arm64]
+        NSLocationWhenInUseUsageDescription: 目の前の建物を特定するために現在地を使います。位置情報はサーバーに保存しません。
+        NSCameraUsageDescription: 建物を映して候補を選ぶため、また修繕箇所の写真を撮るためにカメラを使います。
+        NSMotionUsageDescription: iPhoneが向いている方向（方位・傾き）を求めるためにモーションセンサーを使います。
+        NSPhotoLibraryAddUsageDescription: 撮影した修繕写真を保存するために使います。
+        IEMIRU_API_BASE_URL: $(IEMIRU_API_BASE_URL)
+    settings:
+      base:
+        IEMIRU_DISPLAY_NAME: 家を見るAI
+        IEMIRU_API_BASE_URL: http://localhost:8787
+        PRODUCT_BUNDLE_IDENTIFIER: app.iemiru.ios
+  IeMiruTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [IeMiruTests]
+    dependencies:
+      - target: IeMiru
