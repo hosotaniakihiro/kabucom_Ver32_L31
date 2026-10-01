@@ -20,7 +20,9 @@ export function createMassingScene(canvas: HTMLCanvasElement) {
   scene.add(ground);
   let model: THREE.Group | null = null;
   let distance = 18;
+  let lookY = 3;
   let yawOffset = 0;
+  let last: [number, number] = [0, 5];
   let raf = 0;
 
   function build(plan: RebuildPlan) {
@@ -52,7 +54,10 @@ export function createMassingScene(canvas: HTMLCanvasElement) {
       model.add(slab);
     }
     scene.add(model);
-    distance = Math.max(12, plan.heightM * 2.2);
+    // 建物全体が画面に収まる距離（縦持ちの狭い横画角を考慮）
+    distance = Math.max(16, Math.max(plan.widthM, plan.depthM) * 2.4, plan.heightM * 2.6);
+    lookY = plan.heightM * 0.45;
+    setView(...last);
   }
 
   function resize() {
@@ -64,10 +69,11 @@ export function createMassingScene(canvas: HTMLCanvasElement) {
   }
 
   function setView(headingDeltaDeg: number, pitchDeg: number) {
+    last = [headingDeltaDeg, pitchDeg];
     yawOffset = (headingDeltaDeg * Math.PI) / 180;
     const pitch = (Math.max(-30, Math.min(30, pitchDeg)) * Math.PI) / 180;
     camera.position.set(0, 1.5, distance);
-    camera.lookAt(Math.sin(yawOffset) * distance, 1.5 + Math.tan(pitch) * distance, distance - Math.cos(yawOffset) * distance);
+    camera.lookAt(Math.sin(yawOffset) * distance, lookY + Math.tan(pitch) * distance, distance - Math.cos(yawOffset) * distance);
   }
 
   function loop() {

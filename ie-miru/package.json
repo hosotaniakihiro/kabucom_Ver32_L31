@@ -25,6 +25,7 @@
     "@playwright/test": "^1.56.1",
     "@types/node": "^22.20.4",
     "geojson-vt": "^3.2.1",
+    "jsdom": "^26.1.0",
     "tsx": "^4.23.15",
     "typescript": "5.9",
     "vitest": "^3.2.4",

@@ -45,12 +45,12 @@ h1, h2 { margin: .2em 0; }
 .manual-heading input { width: 100%; }
 .markers { position: absolute; top: 38%; left: 0; right: 0; height: 0; }
 .marker { position: absolute; transform: translateX(-50%); width: 40px; height: 40px; border-radius: 20px; padding: 0; background: #ffffffd9; color: #000; font-weight: 700; border: 2px solid #fff; }
-.marker.primary { background: var(--accent); color: #fff; }
+.marker.is-primary { background: var(--accent); color: #fff; z-index: 2; }
 .candidates { position: absolute; left: 0; right: 0; bottom: 0; background: var(--card); color: var(--fg); border-radius: 18px 18px 0 0; padding: 14px 14px calc(14px + var(--safe-bottom)); max-height: 52%; overflow: auto; }
 .candidates:empty::before { content: "建物を探しています…"; color: var(--muted); }
 .candidate-list { list-style: none; padding: 0; margin: 8px 0; display: grid; gap: 8px; }
 .candidate { width: 100%; display: grid; grid-template-columns: 32px 1fr; grid-template-rows: auto auto; text-align: left; gap: 0 8px; }
-.candidate.primary { border: 2px solid var(--accent); }
+.candidate.is-primary { border: 2px solid var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--card)); }
 .candidate .num { grid-row: span 2; align-self: center; font-weight: 700; color: var(--accent); font-size: 1.2rem; text-align: center; }
 .candidate .cmeta { font-size: .8rem; color: var(--muted); }
 .demo-flag { background: #fef3c7; color: #78350f; padding: 6px 10px; border-radius: 8px; font-size: .8rem; }

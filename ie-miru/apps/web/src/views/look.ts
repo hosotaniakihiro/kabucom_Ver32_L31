@@ -36,18 +36,21 @@ export function lookView(): { el: HTMLElement; dispose: () => void } {
   let inflight = false;
   let disposed = false;
   let lastSelection: any = null;
+  const startedAt = Date.now();
   const stops: Array<() => void> = [];
 
   const orientationPerm = sessionStorage.getItem('iemiru.orientationPermission');
   let gotOrientation = false;
   stops.push(
     watchOrientation((p) => {
+      const first = !gotOrientation;
       gotOrientation = true;
       manualWrap.hidden = true;
       pose = p;
       renderHud();
       renderMarkers();
-      maybeQuery();
+      // 方位なしで出した候補（距離順）を、方位が取れた時点ですぐ置き換える
+      maybeQuery(first && !!lastSelection && !lastSelection.usedHeading);
     }),
   );
   // 一定時間方位が来なければ手動方位スライダーを出す（PC・非対応端末・許可拒否）
@@ -114,6 +117,8 @@ export function lookView(): { el: HTMLElement; dispose: () => void } {
     if (inflight || disposed) return;
     if (!fix && permission !== 'denied' && permission !== 'unsupported') return;
     const now = Date.now();
+    // 起動直後は方位センサーの初回値を少し待つ（方位なしの候補を先に出さない）
+    if (!force && !pose && now - startedAt < 1500 && orientationPerm !== 'denied') return;
     const moved = fix ? Math.hypot((fix.latitude - lastQuery.lat) * 111000, (fix.longitude - lastQuery.lng) * 91000) : 0;
     const turned = pose ? Math.abs(signedAngleDiff(pose.heading, lastQuery.heading)) : 0;
     if (!force && now - lastQuery.at < 1200) return;
@@ -168,7 +173,7 @@ export function lookView(): { el: HTMLElement; dispose: () => void } {
           h(
             'button',
             {
-              class: `candidate ${sel.primaryId === b.id ? 'primary' : ''}`,
+              class: `candidate ${sel.primaryId === b.id ? 'is-primary' : ''}`,
               'data-testid': `candidate-${i}`,
               'data-building-id': b.id,
               onclick: () => go(buildingPath(b.id)),
@@ -186,12 +191,17 @@ export function lookView(): { el: HTMLElement; dispose: () => void } {
   function renderMarkers() {
     clear(markers);
     if (!pose || !lastSelection?.usedHeading) return;
-    lastSelection.candidates.forEach((c: any, i: number) => {
+    // 手前の建物に隠れている候補はマーカーを出さない（重なり防止）。最有力候補を最前面に描く
+    const visible = lastSelection.candidates
+      .map((c: any, i: number) => ({ c, i }))
+      .filter(({ c }: any) => c.hitOrder == null || c.hitOrder === 1)
+      .sort((a: any, b: any) => Number(a.c.building.id === lastSelection.primaryId) - Number(b.c.building.id === lastSelection.primaryId));
+    for (const { c, i } of visible) {
       const off = signedAngleDiff(c.bearingDeg, pose!.heading);
-      if (Math.abs(off) > CAMERA_HFOV_DEG / 2) return;
+      if (Math.abs(off) > CAMERA_HFOV_DEG / 2) continue;
       const x = 50 + (off / (CAMERA_HFOV_DEG / 2)) * 50;
-      markers.append(h('button', { class: `marker ${lastSelection.primaryId === c.building.id ? 'primary' : ''}`, style: `left:${x}%`, onclick: () => go(buildingPath(c.building.id)), 'aria-label': `候補${i + 1}` }, String(i + 1)));
-    });
+      markers.append(h('button', { class: `marker ${lastSelection.primaryId === c.building.id ? 'is-primary' : ''}`, style: `left:${x}%`, onclick: () => go(buildingPath(c.building.id)), 'aria-label': `候補${i + 1}` }, String(i + 1)));
+    }
   }
 
   renderHud();
