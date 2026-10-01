@@ -15,3 +15,20 @@ describe('API: simulations', () => {
     expect(status).toBe(200);
   });
 });
+
+describe('API: sell / rent / appraisal', () => {
+  it('sell defaults to reference price', async () => {
+    const { body } = await json(post('/v1/simulations/sell', { referencePrice: 42_000_000, mortgagePayoff: 5_000_000 }));
+    expect(body.result.netProceeds).toBe(42_000_000 - body.result.totalCosts - 5_000_000);
+    expect(body.result.capitalGainsTax).toBeNull();
+  });
+  it('rent', async () => {
+    const { body } = await json(post('/v1/simulations/rent', { referencePrice: 48_000_000 }));
+    expect(body.result.grossYieldPct).toBe(5);
+  });
+  it('appraisal is not connected by default', async () => {
+    const { body } = await json(post('/v1/appraisal-requests', { buildingId: 'demo:1_1' }));
+    expect(body.responses[0].status).toBe('not_connected');
+    expect((await post('/v1/appraisal-requests', {})).status).toBe(400);
+  });
+});

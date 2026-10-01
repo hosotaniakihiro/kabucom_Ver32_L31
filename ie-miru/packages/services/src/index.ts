@@ -13,3 +13,4 @@ export * from './reinfolib/service';
 export * from './hazard/service';
 export * from './geocoder/fallback';
 export * from './report/buildingReport';
+export * from './appraisal/provider';

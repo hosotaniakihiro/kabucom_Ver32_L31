@@ -71,3 +71,98 @@ struct ManField: View {
         }
     }
 }
+
+struct SellSimulationView: View {
+    let report: BuildingReportDTO
+    @State private var price: Double = 0
+    @State private var payoff: Double = 0
+    @State private var acquisition: Double = 0
+    @State private var holding: Double = 0
+    @State private var ownHome = true
+    @State private var result: SellResultDTO?
+    @State private var appraisalMessage: String?
+
+    struct SellResultDTO: Codable { var costs: [CostLineDTO]; var totalCosts: Double; var capitalGainsTax: Double?; var taxNote: String; var netProceeds: Double }
+    struct Resp: Codable { var result: SellResultDTO }
+
+    var body: some View {
+        Form {
+            Section("参考") {
+                if let v = report.valuation?.value { LabeledContent("AI参考査定", value: Yen.range(v.estimatedLow, v.estimatedHigh)) } else { Text("AI参考査定: 算出できません") }
+                if let c = report.comparables?.value { LabeledContent("周辺取引事例", value: "\(c.count)件") }
+                Text("正式な査定ではありません。").font(.caption2)
+            }
+            Section("条件") {
+                ManField(label: "想定売却価格", yen: $price)
+                ManField(label: "ローン残債", yen: $payoff)
+                ManField(label: "取得費（任意）", yen: $acquisition)
+                Stepper("所有期間 \(Int(holding))年", value: $holding, in: 0...80)
+                Toggle("居住用3,000万円特別控除", isOn: $ownHome)
+            }
+            if let r = result {
+                Section("結果") {
+                    ForEach(r.costs, id: \.key) { LabeledContent($0.label + ($0.estimated ? "（概算）" : ""), value: Yen.man($0.amount)) }
+                    LabeledContent("譲渡所得税（概算）", value: r.capitalGainsTax.map { Yen.man($0) } ?? "未計算")
+                    Text(r.taxNote).font(.caption2)
+                    LabeledContent("手取り概算", value: Yen.man(r.netProceeds)).bold()
+                }
+            }
+            Section("不動産会社に査定を依頼") {
+                Button("査定を依頼する") { Task { await requestAppraisal() } }
+                if let m = appraisalMessage { Text(m).font(.caption) }
+            }
+        }
+        .navigationTitle("売る")
+        .task { price = report.valuation?.value?.estimatedMid ?? 0; await recalc() }
+        .onChange(of: [price, payoff, acquisition, holding]) { _, _ in Task { await recalc() } }
+        .onChange(of: ownHome) { _, _ in Task { await recalc() } }
+    }
+
+    private func recalc() async {
+        struct Body: Encodable { var salePrice: Double; var mortgagePayoff: Double; var acquisitionCost: Double?; var holdingYears: Double?; var ownHomeDeduction: Bool }
+        let body = Body(salePrice: price, mortgagePayoff: payoff, acquisitionCost: acquisition > 0 ? acquisition : nil, holdingYears: holding > 0 ? holding : nil, ownHomeDeduction: ownHome)
+        guard let data = try? await APIClient.shared.send("v1/simulations/sell", method: "POST", json: body) else { return }
+        result = try? JSONDecoder().decode(Resp.self, from: data).result
+    }
+
+    private func requestAppraisal() async {
+        struct Body: Encodable { var buildingId: String }
+        struct R: Decodable { struct X: Decodable { var message: String }; var responses: [X] }
+        guard let data = try? await APIClient.shared.send("v1/appraisal-requests", method: "POST", json: Body(buildingId: report.building.id)),
+              let r = try? JSONDecoder().decode(R.self, from: data) else { appraisalMessage = "通信できませんでした。"; return }
+        appraisalMessage = r.responses.map(\.message).joined(separator: " ")
+    }
+}
+
+struct RentSimulationView: View {
+    let report: BuildingReportDTO
+    @State private var rent: Double = 0
+    @State private var occupancy: Double = 95
+    @State private var result: RentResultDTO?
+    struct RentResultDTO: Codable { var annualNetIncome: Double; var grossYieldPct: Double?; var netYieldPct: Double?; var notes: [String] }
+    struct Resp: Codable { var input: In; var result: RentResultDTO; struct In: Codable { var monthlyRent: Double } }
+
+    var body: some View {
+        Form {
+            ManField(label: "想定家賃（月額）", yen: $rent)
+            Stepper("入居率 \(Int(occupancy))%", value: $occupancy, in: 0...100, step: 5)
+            if let r = result {
+                LabeledContent("年間手取り", value: Yen.man(r.annualNetIncome)).bold()
+                LabeledContent("表面利回り", value: r.grossYieldPct.map { String(format: "%.1f%%", $0) } ?? "算出不可")
+                LabeledContent("実質利回り", value: r.netYieldPct.map { String(format: "%.1f%%", $0) } ?? "算出不可")
+                ForEach(r.notes, id: \.self) { Text($0).font(.caption2) }
+            }
+        }
+        .navigationTitle("貸す")
+        .task { await recalc(initial: true) }
+        .onChange(of: [rent, occupancy]) { _, _ in Task { await recalc(initial: false) } }
+    }
+
+    private func recalc(initial: Bool) async {
+        struct Body: Encodable { var referencePrice: Double?; var monthlyRent: Double?; var occupancyPct: Double }
+        let body = Body(referencePrice: report.valuation?.value?.estimatedMid, monthlyRent: initial ? nil : rent, occupancyPct: occupancy)
+        guard let data = try? await APIClient.shared.send("v1/simulations/rent", method: "POST", json: body), let r = try? JSONDecoder().decode(Resp.self, from: data) else { return }
+        if initial { rent = r.input.monthlyRent }
+        result = r.result
+    }
+}

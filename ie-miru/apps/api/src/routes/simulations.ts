@@ -3,6 +3,7 @@ import {
   defaultBuyInput, defaultRentInput, defaultSellInput, simulateBuy, simulateRent, simulateSell,
   type BuyInput, type RentInput, type SellInput,
 } from '@ie-miru/domain';
+import { AppraisalProviderRegistry } from '@ie-miru/services';
 import type { AppEnv } from '../app';
 
 const n = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
@@ -14,7 +15,25 @@ function overrides<K extends string>(v: unknown, keys: readonly K[]): Partial<Re
 }
 
 /** 試算 API（iOS など domain を直接持たないクライアント向け。Web は同じ domain をローカルで実行） */
-export function registerSimulationRoutes(app: Hono<AppEnv>) {
+export function registerSimulationRoutes(app: Hono<AppEnv>, appraisal = new AppraisalProviderRegistry()) {
+  /** 不動産会社査定（既定は未接続）。個人情報は同意がある場合のみ provider に渡す */
+  app.get('/v1/appraisal-providers', (c) => c.json({ providers: appraisal.list() }));
+  app.post('/v1/appraisal-requests', async (c) => {
+    const b = ((await c.req.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
+    if (typeof b.buildingId !== 'string') return c.json({ error: 'buildingId_required' }, 400);
+    const contact = b.contact && typeof b.contact === 'object' && (b.contact as { consent?: unknown }).consent === true ? (b.contact as never) : null;
+    const responses = await appraisal.requestAll({
+      buildingId: b.buildingId,
+      areaLabel: typeof b.areaLabel === 'string' ? b.areaLabel : null,
+      propertyType: typeof b.propertyType === 'string' ? b.propertyType : '戸建',
+      landAreaM2: nn(b.landAreaM2),
+      floorAreaM2: nn(b.floorAreaM2),
+      builtYear: nn(b.builtYear),
+      contact,
+    });
+    return c.json({ responses });
+  });
+
   app.post('/v1/simulations/buy', async (c) => {
     const b = ((await c.req.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
     const d = defaultBuyInput(nn(b.referencePrice));
