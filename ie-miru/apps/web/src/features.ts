@@ -3,4 +3,5 @@ import './features/market';
 import './features/buy';
 import './features/sell';
 import './features/rent';
+import './features/arnote';
 import './features/fix';

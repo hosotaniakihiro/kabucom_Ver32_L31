@@ -1,5 +1,5 @@
 import type { Context, Hono } from 'hono';
-import { ALLOWED_PHOTO_TYPES, MAX_PHOTO_BYTES, validateInspection, type Building, type LatLng } from '@ie-miru/domain';
+import { ALLOWED_PHOTO_TYPES, AR_NOTE_STATUSES, MAX_PHOTO_BYTES, validateArNote, validateInspection, type ArNoteStatus, type Building, type LatLng } from '@ie-miru/domain';
 import type { AppDeps, AppEnv } from '../app';
 
 export interface UserRouteDeps extends AppDeps {
@@ -63,5 +63,58 @@ export function registerUserRoutes(app: Hono<AppEnv>, deps: UserRouteDeps) {
     const g = guard(c);
     if (g) return g;
     return (await deps.repos!.inspections.delete(c.get('deviceId')!, c.req.param('id'))) ? c.json({ ok: true }) : c.json({ error: 'not_found' }, 404);
+  });
+
+  // ───── ARメモ ─────
+  app.post('/v1/ar-notes', async (c) => {
+    const g = guard(c);
+    if (g) return g;
+    const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body) return c.json({ error: 'invalid_json' }, 400);
+    const v = validateArNote(body);
+    if (!v.ok) return c.json({ error: 'invalid_input', details: v.errors }, 400);
+    const t = now();
+    const note = await deps.repos!.arNotes.create(c.get('deviceId')!, { id: newId(), ...v.value, createdAt: t, updatedAt: t });
+    return c.json({ note }, 201);
+  });
+
+  app.get('/v1/ar-notes', async (c) => {
+    const g = guard(c);
+    if (g) return g;
+    return c.json({ notes: await deps.repos!.arNotes.list(c.get('deviceId')!, c.req.query('buildingId') ?? null) });
+  });
+
+  app.patch('/v1/ar-notes/:id', async (c) => {
+    const g = guard(c);
+    if (g) return g;
+    const body = ((await c.req.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
+    const status = typeof body.status === 'string' && body.status in AR_NOTE_STATUSES ? (body.status as ArNoteStatus) : undefined;
+    if (body.status !== undefined && !status) return c.json({ error: 'invalid_status' }, 400);
+    const text = typeof body.text === 'string' ? body.text.slice(0, 500) : undefined;
+    const n = await deps.repos!.arNotes.update(c.get('deviceId')!, c.req.param('id'), { status, text, updatedAt: now() });
+    return n ? c.json({ note: n }) : c.json({ error: 'not_found' }, 404);
+  });
+
+  app.delete('/v1/ar-notes/:id', async (c) => {
+    const g = guard(c);
+    if (g) return g;
+    return (await deps.repos!.arNotes.delete(c.get('deviceId')!, c.req.param('id'))) ? c.json({ ok: true }) : c.json({ error: 'not_found' }, 404);
+  });
+
+  /** iOS ARWorldMap（NSKeyedArchiver でアーカイブしたバイナリ）。最大 20MB */
+  app.put('/v1/ar-notes/:id/world-map', async (c) => {
+    const g = guard(c);
+    if (g) return g;
+    const buf = new Uint8Array(await c.req.arrayBuffer());
+    if (buf.byteLength === 0 || buf.byteLength > 20 * 1024 * 1024) return c.json({ error: 'invalid_size' }, 413);
+    const key = await deps.repos!.arNotes.putWorldMap(c.get('deviceId')!, c.req.param('id'), buf);
+    return key ? c.json({ ok: true }) : c.json({ error: 'not_found' }, 404);
+  });
+
+  app.get('/v1/ar-notes/:id/world-map', async (c) => {
+    const g = guard(c);
+    if (g) return g;
+    const data = await deps.repos!.arNotes.getWorldMap(c.get('deviceId')!, c.req.param('id'));
+    return data ? new Response(data, { headers: { 'Content-Type': 'application/octet-stream' } }) : c.json({ error: 'not_found' }, 404);
   });
 }
