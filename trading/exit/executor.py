@@ -830,10 +830,16 @@ def _mark_db_position_closing(*, symbol: str, exit_price: float, pnl: float, rea
     """
     session = Session_position()
     try:
+        # 2026-10-01: OPEN 行を優先し、entry_time の新しい順に選ぶ
+        #   (_load_db_open_position が選ぶ行と揃える)。.first() だけだと既に
+        #   CLOSING の古い行を掴み直し、今回返済した行が OPEN のまま残っていた。
+        from sqlalchemy import case
+
         db_pos = (
             session.query(Position)
             .filter(Position.symbol == str(symbol))
             .filter(Position.status.in_(["OPEN", "CLOSING"]))
+            .order_by(case((Position.status == "OPEN", 0), else_=1), Position.entry_time.desc())
             .first()
         )
         if not db_pos:
@@ -886,6 +892,7 @@ def _close_db_position_core(*, symbol: str, exit_price: float, pnl: float, reaso
             session.query(Position)
             .filter(Position.symbol == symbol)
             .filter(Position.status == "OPEN")
+            .order_by(Position.entry_time.desc())
             .first()
         )
         if not db_pos:
@@ -948,7 +955,55 @@ def _remove_from_memory_positions(symbol: str) -> None:
         logger.debug("[EXIT_EXECUTOR] failed to remove from GC.positions symbol=%s", symbol, exc_info=True)
 
 
+# ============================================================
+# 2026-10-01: 全返済は同じ銘柄の残り建玉を続けて返済する
+#   positions.db は約定ごとに 100 株ずつ別行 (別 HoldID) で持つ。
+#   _execute_exit_single は 1 行しか返済しないため、300 株だと
+#   残りは次の判定 (10〜30 秒後) 待ちになり、急落中の損切りが
+#   -0.3% の線に対して -0.9〜-1.8% で約定していた (9/18〜10/1 の 24 件)。
+#   EXIT_SWEEP_REMAINING_ENABLED=0 で従来動作。
+# ============================================================
+EXIT_SWEEP_REMAINING_ENABLED = _exit_board_env_bool("EXIT_SWEEP_REMAINING_ENABLED", True)
+EXIT_SWEEP_MAX_ROWS = int(_exit_board_env_float("EXIT_SWEEP_MAX_ROWS", 10))
+
+
+def _count_db_open_rows(symbol: str) -> int:
+    session = Session_position()
+    try:
+        return int(
+            session.query(Position)
+            .filter(Position.symbol == str(symbol))
+            .filter(Position.status == "OPEN")
+            .filter(Position.qty > 0)
+            .count()
+        )
+    except Exception:
+        logger.debug("[EXIT SWEEP] count failed symbol=%s", symbol, exc_info=True)
+        return 0
+    finally:
+        session.close()
+
+
 def execute_exit(symbol: str, reason: str, exit_price: float) -> bool:
+    ok = _execute_exit_single(symbol, reason, exit_price)
+    if not ok or not EXIT_SWEEP_REMAINING_ENABLED:
+        return ok
+    symbol = _normalize_symbol(symbol)
+    for i in range(max(0, EXIT_SWEEP_MAX_ROWS)):
+        left = _count_db_open_rows(symbol)
+        if left <= 0:
+            break
+        logger.warning(
+            "[EXIT SWEEP] 残り建玉を続けて返済する symbol=%s reason=%s open_rows=%s round=%s",
+            symbol, reason, left, i + 1,
+        )
+        if not _execute_exit_single(symbol, reason, exit_price):
+            logger.warning("[EXIT SWEEP] 返済できなかったので打ち切り symbol=%s round=%s", symbol, i + 1)
+            break
+    return ok
+
+
+def _execute_exit_single(symbol: str, reason: str, exit_price: float) -> bool:
     symbol = _normalize_symbol(symbol)
     if not symbol:
         logger.warning("[EXIT_EXECUTOR] empty symbol")

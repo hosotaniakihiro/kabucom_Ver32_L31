@@ -398,7 +398,7 @@ def _send_order_core(payload, symbol):
             symbol,
             payload.get("Exchange") if isinstance(payload, dict) else None,
             bool(isinstance(payload, dict) and payload.get("Exchange") == 9),
-            payload,
+            ({**payload, "Password": "***"} if isinstance(payload, dict) and "Password" in payload else payload),
         )
 
         res = send_order_common(payload)

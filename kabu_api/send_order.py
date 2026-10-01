@@ -422,6 +422,35 @@ def _retry_with_fallback_margin(payload: dict, data: Any, *, status_code: Any = 
     return send_order_common(new_payload, _margin_fallback_done=True)
 
 
+# ============================================================
+# 2026-10-01: 新規エントリーの停止スイッチ (再起動不要)
+#   %LOCALAPPDATA%\autostock\runtime\ENTRY_PAUSE があれば新規注文
+#   (信用新規 CashMargin=2 / 現物買い) を送らない。返済は止めない。
+#   ファイルを消せば即再開。発注ごとに存在確認するだけ。
+# ============================================================
+def _entry_pause_file():
+    import os
+    from pathlib import Path
+
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "autostock" / "runtime" / "ENTRY_PAUSE"
+
+
+def _entry_paused_by_file(payload: dict) -> bool:
+    try:
+        cm = int(payload.get("CashMargin") or 0)
+        is_entry = cm == 2 or (cm == 1 and str(payload.get("Side")) == "2")
+        if not is_entry or not _entry_pause_file().exists():
+            return False
+        logger.warning(
+            "[ENTRY PAUSE] 新規注文を送らない (停止ファイルあり) symbol=%s side=%s qty=%s file=%s",
+            payload.get("Symbol"), payload.get("Side"), payload.get("Qty"), _entry_pause_file(),
+        )
+        return True
+    except Exception:
+        return False
+
+
 def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
     if not isinstance(payload, dict):
         logger.error("❌ send_order_common: payload is not dict type=%s payload=%s", type(payload).__name__, payload)
@@ -435,6 +464,10 @@ def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
 
     if _credit_new_suppressed_now(payload):
         _set_last_send_order_error(payload, {"Code": "LOCAL_SUPPRESS", "Message": "credit new local suppress"}, status_code="LOCAL")
+        return None
+
+    if _entry_paused_by_file(payload):
+        _set_last_send_order_error(payload, {"Code": "ENTRY_PAUSE", "Message": "entry paused by file"}, status_code="LOCAL")
         return None
 
     token = get_valid_token()

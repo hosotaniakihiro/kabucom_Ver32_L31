@@ -72,6 +72,14 @@ def _get_board_info(symbol: str):
 # ------------------------------------------------------------
 def _post_order(payload: dict, token: str):
 
+    # 2026-10-01: 新規停止スイッチ (kabu_api.send_order と同じファイル)
+    try:
+        from kabu_api.send_order import _entry_paused_by_file
+        if _entry_paused_by_file(payload):
+            return None
+    except Exception:
+        pass
+
     url = f"{API_URL}/sendorder"
     headers = {
         "Content-Type": "application/json",
@@ -80,7 +88,7 @@ def _post_order(payload: dict, token: str):
 
     print("\n================ SENDORDER ==================")
     print("📤 Payload:")
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    print(json.dumps({**payload, "Password": "***"} if isinstance(payload, dict) else payload, indent=2, ensure_ascii=False))
     print("==============================================")
 
     try:

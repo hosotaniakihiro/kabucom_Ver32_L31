@@ -272,7 +272,7 @@ def _send_credit_close_order_core(
     }
 
     print("\n===== SENDORDER(EXIT-CREDIT) =====")
-    print(json.dumps(body, indent=2, ensure_ascii=False))
+    print(json.dumps({**body, "Password": "***"}, indent=2, ensure_ascii=False))
     print("=================================\n")
 
     try:
@@ -369,7 +369,7 @@ def send_cash_close_order(symbol, qty, side, exchange):
     }
 
     print("\n===== SENDORDER(EXIT-CASH) =====")
-    print(json.dumps(body, indent=2, ensure_ascii=False))
+    print(json.dumps({**body, "Password": "***"}, indent=2, ensure_ascii=False))
     print("===============================\n")
 
     try:
