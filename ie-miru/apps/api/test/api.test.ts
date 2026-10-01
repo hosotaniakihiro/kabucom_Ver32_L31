@@ -77,3 +77,17 @@ describe('API: buildings', () => {
     expect(r.status).toBe(200);
   });
 });
+
+describe('API: report includes valuation range and comparables', () => {
+  it('valuation is a range with disclaimer, comparables are labelled reference', async () => {
+    const app = makeApp();
+    const { body: near } = await json(app.request(`/v1/buildings/nearby?lat=${DEMO_CENTER.lat}&lng=${DEMO_CENTER.lng}&radius=80`));
+    const { body: rep } = await json(app.request(`/v1/buildings/${encodeURIComponent(near.buildings[0].id)}/report`));
+    expect(rep.valuation.status).toBe('available');
+    expect(rep.valuation.kind).toBe('ai_estimate');
+    expect(rep.valuation.value.estimatedLow).toBeLessThan(rep.valuation.value.estimatedHigh);
+    expect(rep.valuation.note).toContain('正式な不動産鑑定ではありません');
+    expect(rep.comparables.kind).toBe('reference');
+    expect(rep.subject.kind).toBe('ai_estimate');
+  });
+});

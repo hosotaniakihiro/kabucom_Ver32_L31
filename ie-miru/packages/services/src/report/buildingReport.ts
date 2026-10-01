@@ -1,6 +1,6 @@
 import {
-  available, estimateFloorsFromHeight, estimateSubject, isMock, missing, summarizeComparables, summarizeHazards,
-  type Building, type ComparablesSummary, type PropertySubject, type HazardResult, type HazardSummary, type LandPricePoint, type Sourced, type SourceRef, type Transaction, type ZoningInfo,
+  available, estimateFloorsFromHeight, estimateSubject, estimateValue, isMock, missing, summarizeComparables, summarizeHazards,
+  type Building, type ComparablesSummary, type PropertySubject, type Valuation, type HazardResult, type HazardSummary, type LandPricePoint, type Sourced, type SourceRef, type Transaction, type ZoningInfo,
 } from '@ie-miru/domain';
 import type { Geocoder, AreaInfo } from '../geocoder/gsi';
 import type { HazardService } from '../hazard/service';
@@ -28,6 +28,8 @@ export interface BuildingReport {
   subject: Sourced<PropertySubject>;
   /** 類似度で絞った周辺取引事例と参考相場 */
   comparables: Sourced<ComparablesSummary>;
+  /** AI参考査定（レンジ。正式な鑑定ではない） */
+  valuation: Sourced<Valuation>;
   hazards: HazardResult[];
   hazardSummary: HazardSummary;
   /** live / mock / demo / mixed */
@@ -36,6 +38,7 @@ export interface BuildingReport {
 }
 
 export const REPORT_DISCLAIMERS = [
+  'AI参考査定は公開データからの機械的な推定で、正式な不動産鑑定・査定ではありません。必ずレンジ（幅）でご覧ください。',
   '周辺取引事例・参考相場は近隣の取引の情報であり、この建物そのものの売買価格ではありません。',
   'ハザード情報で「データなし」は安全を意味しません。自治体のハザードマップも確認してください。',
   '所有者などの個人情報は表示しません。',
@@ -98,6 +101,17 @@ export async function buildReport(b: Building, deps: ReportDeps, signal?: AbortS
     comparables = missing(transactions.status, 'reference', transactions.sources, transactions.reason);
   }
 
+  const v = estimateValue({
+    subject,
+    landPrices: landPrices.status === 'available' ? landPrices.value : null,
+    comparables: comparables.status === 'available' ? comparables.value : null,
+    now,
+  });
+  const valuationSources = [...landPrices.sources, ...comparables.sources];
+  const valuation: Sourced<Valuation> = v.ok
+    ? available(v.valuation, 'ai_estimate', valuationSources, '公開データからの機械的な推定です。正式な不動産鑑定ではありません。')
+    : missing(landPrices.status === 'unavailable' && comparables.status === 'unavailable' ? 'unavailable' : 'no_data', 'ai_estimate', valuationSources, v.reason);
+
   const allSources: SourceRef[] = [
     b.source,
     ...areaSourced.sources,
@@ -119,6 +133,7 @@ export async function buildReport(b: Building, deps: ReportDeps, signal?: AbortS
     transactions,
     subject: subjectSourced,
     comparables,
+    valuation,
     hazards,
     hazardSummary: summarizeHazards(hazards),
     dataMode,
