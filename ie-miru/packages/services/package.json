@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@ie-miru/config": "*",
-    "@ie-miru/domain": "*"
+    "@ie-miru/domain": "*",
+    "@mapbox/vector-tile": "^3.0.0",
+    "pbf": "^5.1.2"
   }
 }

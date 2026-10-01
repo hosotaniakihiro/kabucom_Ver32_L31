@@ -205,7 +205,7 @@ export function smoothHeading(prev: number | null, next: number, factor = 0.25):
 /**
  * 候補抽出に使う実効半視野角。方位精度が悪いほど広げる（最大 60°）。
  */
-export function effectiveHalfFov(pose: Pick<CameraPose, 'headingAccuracy'> | null, base = LOCATION_DEFAULTS.halfFieldOfViewDeg): number {
+export function effectiveHalfFov(pose: Pick<CameraPose, 'headingAccuracy'> | null, base: number = LOCATION_DEFAULTS.halfFieldOfViewDeg): number {
   const acc = pose?.headingAccuracy;
   if (acc == null) return Math.min(60, base + 15);
   return Math.min(60, base + Math.max(0, acc - 10));
