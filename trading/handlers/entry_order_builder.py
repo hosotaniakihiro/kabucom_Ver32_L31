@@ -3096,7 +3096,9 @@ def _rfb_fetch_board(symbol: str, *, force: bool = False) -> dict | None:
         bid, ask = ask, bid
     if bid <= 0 or ask <= 0 or ask < bid:
         return None
-    board = {"bid": bid, "ask": ask, "bids": bids, "asks": asks, "source": "rest_board", "force": bool(force)}
+    board = {"bid": bid, "ask": ask, "bids": bids, "asks": asks, "source": "rest_board", "force": bool(force),
+             "over_sell_qty": _rfb_safe_float(raw.get("OverSellQty")),
+             "under_buy_qty": _rfb_safe_float(raw.get("UnderBuyQty"))}
     _RFB_CACHE[symbol] = (now, board)
     return dict(board)
 
@@ -3119,10 +3121,27 @@ def _rfb_find_level_qty(levels: list[dict], price: float) -> float:
     return 0.0
 
 
+def _rfb_board_tick(board: dict) -> float:
+    """板に並んだ値段の間隔から実際の呼値を求める。取れなければ 0。
+
+    2026-10-01: 呼値の表は TOPIX100 (例: 5801 は 4,000 円台で 1 円刻み) を区別できず 5 円になり、
+    「買気配+1 刻み を 売気配-1 刻み で頭打ち」が売気配 4065 に触れていた (NO_TOUCH なのに約定側へ)。
+    """
+    diffs = []
+    for key in ("bids", "asks"):
+        px = sorted({_rfb_safe_float(x.get("price")) for x in (board.get(key) or []) if _rfb_safe_float(x.get("price")) > 0})
+        diffs += [round(b - a, 6) for a, b in zip(px, px[1:]) if b - a > 0]
+    bid, ask = _rfb_safe_float(board.get("bid")), _rfb_safe_float(board.get("ask"))
+    if ask > bid > 0:
+        diffs.append(round(ask - bid, 6))
+    return min(diffs) if diffs else 0.0
+
+
 def _rfb_decide_price(board: dict, side: str, *, touch: bool | None = None) -> tuple[float, str, dict]:
     bid, ask = _rfb_safe_float(board.get("bid")), _rfb_safe_float(board.get("ask"))
     mid = (bid + ask) / 2.0
-    t = _rfb_tick(mid)
+    board_tick = _rfb_board_tick(board)
+    t = board_tick if board_tick > 0 else _rfb_tick(mid)
     bids, asks = list(board.get("bids") or []), list(board.get("asks") or [])
     if touch is None:
         touch = _rfb_env_bool("ENTRY_REST_FULL_BOARD_ALLOW_TOUCH_ASK_BID", True)
@@ -3139,7 +3158,9 @@ def _rfb_decide_price(board: dict, side: str, *, touch: bool | None = None) -> t
     if not touch:
         mode += "_NO_TOUCH"
     n = int(_rfb_env_float("ENTRY_REST_FULL_BOARD_IMBALANCE_DEPTH", 5))
-    return _rfb_round(p, side), mode, {"bid": bid, "ask": ask, "tick": t, "thick_level": lv, "bid_total_topN": _rfb_sum_qty(bids, n), "ask_total_topN": _rfb_sum_qty(asks, n), "depth": n}
+    # 板由来の刻みで作った値段は板の値段 ± 実際の刻みなので有効な呼値。表で丸め直すと粗い刻みに飛ぶ。
+    final = p if board_tick > 0 else _rfb_round(p, side)
+    return final, mode, {"bid": bid, "ask": ask, "tick": t, "board_tick": board_tick, "thick_level": lv, "bid_total_topN": _rfb_sum_qty(bids, n), "ask_total_topN": _rfb_sum_qty(asks, n), "depth": n}
 
 
 def _rfb_imbalance_ng(board: dict, side: str) -> dict | None:
@@ -3154,6 +3175,13 @@ def _rfb_imbalance_ng(board: dict, side: str) -> dict | None:
     min_ratio_denom = max(1.0, _rfb_env_float("ENTRY_REST_FULL_BOARD_RATIO_MIN_DENOM", 100.0))
 
     if side == "BUY":
+        # 2026-10-01: 板の外の買い (UNDER) が売り (OVER) を大きく上回ると、その後 5 分で
+        #   仲値 -0.20% (push DB 15 日、前半 -0.25% / 後半 -0.16%、n=6,326)。急騰後の買い待ちの形。
+        over, under = _rfb_safe_float(board.get("over_sell_qty")), _rfb_safe_float(board.get("under_buy_qty"))
+        ou_max = _rfb_env_float("ENTRY_REST_FULL_BOARD_BUY_MAX_UNDER_IMBALANCE", 0.6)
+        if over + under > 0 and (under - over) / (under + over) >= ou_max:
+            return {"reason": "REST_FULL_BOARD_BUY_UNDER_HEAVY", "over_sell_qty": over, "under_buy_qty": under,
+                    "under_imbalance": (under - over) / (under + over), "max_under_imbalance": ou_max}
         ratio = ask_total / max(bid_total, min_ratio_denom)
         if bid_total < min_same:
             return {"reason": "REST_FULL_BOARD_BUY_SUPPORT_TOO_THIN", "bid_total_topN": bid_total, "ask_total_topN": ask_total, "depth": n, "min_same_side_total": min_same}
