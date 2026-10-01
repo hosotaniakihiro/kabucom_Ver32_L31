@@ -2390,6 +2390,9 @@ def _final_guard_recent_reverse_ok(row: dict, symbol: str, side: str) -> bool:
 def _final_guard_extract_bid_ask(row: dict) -> tuple[float, float, float, float]:
     bid = _safe_float(_guard_first(row, ("bid", "best_bid", "BidPrice", "bid_price"), 0.0), 0.0)
     ask = _safe_float(_guard_first(row, ("ask", "best_ask", "AskPrice", "ask_price"), 0.0), 0.0)
+    # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+    if bid > 0 and ask > 0 and bid > ask:
+        bid, ask = ask, bid
     bid_qty = _safe_float(_guard_first(row, ("bid_qty", "best_bid_qty", "BidQty", "bid_volume"), 0.0), 0.0)
     ask_qty = _safe_float(_guard_first(row, ("ask_qty", "best_ask_qty", "AskQty", "ask_volume"), 0.0), 0.0)
     return bid, ask, bid_qty, ask_qty
@@ -2414,6 +2417,9 @@ def _final_guard_try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, fl
         if isinstance(res, dict):
             bid = _safe_float(res.get("bid") or res.get("best_bid") or res.get("BidPrice") or res.get("bid_price"), 0.0)
             ask = _safe_float(res.get("ask") or res.get("best_ask") or res.get("AskPrice") or res.get("ask_price"), 0.0)
+            # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+            if bid > 0 and ask > 0 and bid > ask:
+                bid, ask = ask, bid
             bid_qty = _safe_float(res.get("bid_qty") or res.get("BidQty") or res.get("bid_volume"), 0.0)
             ask_qty = _safe_float(res.get("ask_qty") or res.get("AskQty") or res.get("ask_volume"), 0.0)
         elif isinstance(res, (list, tuple)) and len(res) >= 2:

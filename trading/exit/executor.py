@@ -438,6 +438,9 @@ def _exit_board_get_bid_ask(symbol: str) -> tuple[float, float]:
         if isinstance(ret, dict):
             bid = _exit_board_float(ret.get("bid") or ret.get("bid_price") or ret.get("BidPrice") or ret.get("best_bid"), 0.0)
             ask = _exit_board_float(ret.get("ask") or ret.get("ask_price") or ret.get("AskPrice") or ret.get("best_ask"), 0.0)
+            # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+            if bid > 0 and ask > 0 and bid > ask:
+                bid, ask = ask, bid
             return bid, ask
         if isinstance(ret, (tuple, list)) and len(ret) >= 2:
             return _exit_board_float(ret[0], 0.0), _exit_board_float(ret[1], 0.0)
@@ -449,6 +452,9 @@ def _exit_board_get_bid_ask(symbol: str) -> tuple[float, float]:
         if isinstance(tick, dict):
             bid = _exit_board_float(tick.get("BidPrice") or tick.get("bid") or tick.get("best_bid"), 0.0)
             ask = _exit_board_float(tick.get("AskPrice") or tick.get("ask") or tick.get("best_ask"), 0.0)
+            # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+            if bid > 0 and ask > 0 and bid > ask:
+                bid, ask = ask, bid
             return bid, ask
     except Exception:
         logger.debug("[EXIT LIMIT BOARD TOUCH] global tick bid/ask failed symbol=%s", symbol, exc_info=True)
@@ -521,6 +527,9 @@ def _exit_board_fetch_rest(symbol: str, exchange: int) -> Optional[dict]:
 
     bid = _exit_board_float(raw.get("BidPrice")) or (bids[0]["price"] if bids else 0.0)
     ask = _exit_board_float(raw.get("AskPrice")) or (asks[0]["price"] if asks else 0.0)
+    # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+    if bid > 0 and ask > 0 and bid > ask:
+        bid, ask = ask, bid
     if bid <= 0 or ask <= 0 or ask < bid:
         return None
 

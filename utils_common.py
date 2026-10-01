@@ -194,12 +194,21 @@ def _get_latest_bid_ask_core(symbol: str):
         if ask is None or bid is None or ask <= 0 or bid <= 0:
             return None
 
+        ask_qty = int(safe_float(row.get("ask_qty"), 0))
+        bid_qty = int(safe_float(row.get("bid_qty"), 0))
+        # 2026-10-01: kabu の BidPrice は売気配・AskPrice は買気配 (名前が逆)。
+        #   push_df は BidPrice -> bid_price と素直に写しているので、ここで向きを直す。
+        #   以前は spread_pct が常に負で、スプレッドガードが一度も効いていなかった。
+        if bid > ask:
+            bid, ask = ask, bid
+            bid_qty, ask_qty = ask_qty, bid_qty
+
         return {
             "symbol": symbol,
             "ask_price": ask,
             "bid_price": bid,
-            "ask_qty": int(safe_float(row.get("ask_qty"), 0)),
-            "bid_qty": int(safe_float(row.get("bid_qty"), 0)),
+            "ask_qty": ask_qty,
+            "bid_qty": bid_qty,
             "source": "push_df",
         }
 

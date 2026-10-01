@@ -2071,6 +2071,9 @@ def _epi_get_board(symbol: str, row: dict | None = None) -> dict:
     row = row or {}
     bid = _epi_safe_float(_epi_first(row, ("bid_price", "bid", "best_bid", "BidPrice"), 0.0), 0.0)
     ask = _epi_safe_float(_epi_first(row, ("ask_price", "ask", "best_ask", "AskPrice"), 0.0), 0.0)
+    # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+    if bid > 0 and ask > 0 and bid > ask:
+        bid, ask = ask, bid
     bid_qty = _epi_safe_float(_epi_first(row, ("bid_qty", "best_bid_qty", "BidQty", "bid_volume"), 0.0), 0.0)
     ask_qty = _epi_safe_float(_epi_first(row, ("ask_qty", "best_ask_qty", "AskQty", "ask_volume"), 0.0), 0.0)
 
@@ -2083,6 +2086,9 @@ def _epi_get_board(symbol: str, row: dict | None = None) -> dict:
         if isinstance(q, dict):
             bid = _epi_safe_float(q.get("bid_price") or q.get("bid") or q.get("best_bid") or q.get("BidPrice"), 0.0)
             ask = _epi_safe_float(q.get("ask_price") or q.get("ask") or q.get("best_ask") or q.get("AskPrice"), 0.0)
+            # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+            if bid > 0 and ask > 0 and bid > ask:
+                bid, ask = ask, bid
             bid_qty = _epi_safe_float(q.get("bid_qty") or q.get("best_bid_qty") or q.get("BidQty") or q.get("bid_volume"), 0.0)
             ask_qty = _epi_safe_float(q.get("ask_qty") or q.get("best_ask_qty") or q.get("AskQty") or q.get("ask_volume"), 0.0)
         elif isinstance(q, (list, tuple)) and len(q) >= 2:
@@ -3085,6 +3091,9 @@ def _rfb_fetch_board(symbol: str, *, force: bool = False) -> dict | None:
 
     bid = _rfb_safe_float(raw.get("BidPrice")) or (bids[0]["price"] if bids else 0.0)
     ask = _rfb_safe_float(raw.get("AskPrice")) or (asks[0]["price"] if asks else 0.0)
+    # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+    if bid > 0 and ask > 0 and bid > ask:
+        bid, ask = ask, bid
     if bid <= 0 or ask <= 0 or ask < bid:
         return None
     board = {"bid": bid, "ask": ask, "bids": bids, "asks": asks, "source": "rest_board", "force": bool(force)}
@@ -3937,6 +3946,9 @@ def _sbr_extract_bid_ask(board: Any) -> tuple[float, float, float, float]:
     sell1 = board.get("Sell1") if isinstance(board.get("Sell1"), dict) else {}
     bid = _sbr_safe_float(board.get("bid_price") or board.get("bid") or board.get("best_bid") or board.get("BidPrice") or board.get("BestBid") or buy1.get("Price"), 0.0)
     ask = _sbr_safe_float(board.get("ask_price") or board.get("ask") or board.get("best_ask") or board.get("AskPrice") or board.get("BestAsk") or sell1.get("Price"), 0.0)
+    # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+    if bid > 0 and ask > 0 and bid > ask:
+        bid, ask = ask, bid
     bid_qty = _sbr_safe_float(board.get("bid_qty") or board.get("BidQty") or board.get("bid_volume") or board.get("BestBidQty") or buy1.get("Qty"), 0.0)
     ask_qty = _sbr_safe_float(board.get("ask_qty") or board.get("AskQty") or board.get("ask_volume") or board.get("BestAskQty") or sell1.get("Qty"), 0.0)
     return bid, ask, bid_qty, ask_qty
