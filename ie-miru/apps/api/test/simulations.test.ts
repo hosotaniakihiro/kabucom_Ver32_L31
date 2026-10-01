@@ -32,3 +32,12 @@ describe('API: sell / rent / appraisal', () => {
     expect((await post('/v1/appraisal-requests', {})).status).toBe(400);
   });
 });
+
+describe('API: rebuild plan', () => {
+  it('returns plan with reference checks and disclaimer', async () => {
+    const { body } = await json(post('/v1/simulations/rebuild', { preset: 'three_story', landAreaM2: 100, coverageRatioPct: 60, floorAreaRatioPct: 150, useDistrict: '第一種低層住居専用地域' }));
+    expect(body.plan.floors).toBe(3);
+    expect(body.plan.checks.find((c: any) => c.key === 'far').status).toBe('exceeds');
+    expect(body.plan.notes[0]).toContain('「建築可能」であることを示すものではありません');
+  });
+});

@@ -5,3 +5,4 @@ import './features/sell';
 import './features/rent';
 import './features/arnote';
 import './features/fix';
+import './features/rebuild';

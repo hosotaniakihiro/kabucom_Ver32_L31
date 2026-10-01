@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import {
-  defaultBuyInput, defaultRentInput, defaultSellInput, simulateBuy, simulateRent, simulateSell,
+  defaultBuyInput, defaultRentInput, defaultSellInput, planRebuild, REBUILD_PRESETS, simulateBuy, simulateRent, simulateSell, type RebuildPreset,
   type BuyInput, type RentInput, type SellInput,
 } from '@ie-miru/domain';
 import { AppraisalProviderRegistry } from '@ie-miru/services';
@@ -72,5 +72,19 @@ export function registerSimulationRoutes(app: Hono<AppEnv>, appraisal = new Appr
       propertyValue: n(b.propertyValue, d.propertyValue),
     };
     return c.json({ input, result: simulateRent(input) });
+  });
+  app.post('/v1/simulations/rebuild', async (c) => {
+    const b = ((await c.req.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
+    const preset = (typeof b.preset === 'string' && b.preset in REBUILD_PRESETS ? b.preset : 'two_story') as RebuildPreset;
+    return c.json({
+      plan: planRebuild({
+        preset,
+        landAreaM2: nn(b.landAreaM2),
+        coverageRatioPct: nn(b.coverageRatioPct),
+        floorAreaRatioPct: nn(b.floorAreaRatioPct),
+        useDistrict: typeof b.useDistrict === 'string' ? b.useDistrict : null,
+        existingFootprintM2: nn(b.existingFootprintM2),
+      }),
+    });
   });
 }
