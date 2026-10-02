@@ -72,7 +72,31 @@ def cfg() -> Dict[str, Any]:
         "max_spread_pct": _env_f("SURGE_SHORT_MAX_SPREAD_PCT", 0.30),
         "max_premium_pct": _env_f("SURGE_SHORT_MAX_PREMIUM_PCT", 0.40),
         "retry_sec": _env_f("SURGE_SHORT_RETRY_SEC", 180.0),
+        # 2026-10-03: 踏み上げ対策。ストップ高まで この % 以上残っている時だけ売る。
+        "min_limit_dist_pct": _env_f("SURGE_SHORT_MIN_LIMIT_DIST_PCT", 8.0),
     }
+
+
+# ------------------------------------------------------------
+# 踏み上げ対策: ストップ高の値段 (東証の制限値幅、前日終値基準)
+#   TradingView 5 分足 5,390 回: 空売り後 14:50 以降ずっとストップ高に張り付いたのは 5.1%。
+#   張り付くと当日中に買い戻せず、翌日寄りで建値比 平均 +9.0% (90% 点 +18%、最悪 +176%) の損。
+#   張り付き率は ストップ高までの残りが 5% 以下で 6.6%、5〜8% で 3.5%、8〜12% で 2.7%、12〜20% で 1.1%。
+#   損切り (+5%) がストップ高より手前で必ず発動するよう、残り 8% 以上を条件にする。
+# ------------------------------------------------------------
+_PRICE_LIMITS = [
+    (100, 30), (200, 50), (500, 80), (700, 100), (1000, 150), (1500, 300), (2000, 400),
+    (3000, 500), (5000, 700), (7000, 1000), (10000, 1500), (15000, 3000), (20000, 4000),
+    (30000, 5000), (50000, 7000), (70000, 10000), (100000, 15000), (150000, 30000),
+    (200000, 40000), (300000, 50000), (500000, 70000), (700000, 100000), (1000000, 150000),
+]
+
+
+def limit_up_price(prev_close: float) -> float:
+    for upper, width in _PRICE_LIMITS:
+        if prev_close < upper:
+            return prev_close + width
+    return prev_close * 1.3
 
 
 # ------------------------------------------------------------
@@ -216,6 +240,17 @@ def _try_entry(sym: str, v: Dict[str, Any], st: Dict[str, Any], now: dt.datetime
     tv = float(v.get("trading_value") or 0)
     if price < c["min_price"]:
         return "skipped", "price_too_low", {"price": price}
+    chg = float(v.get("change_percentage") or 0)
+    # ranking の騰落率から前日終値を逆算する。端数で制限値幅の境目 (1,000 円など) をまたがないよう 1 円に丸める。
+    prev_close = float(round(price / (1 + chg / 100.0))) if chg > -100 else 0.0
+    if prev_close > 0:
+        lu = limit_up_price(prev_close)
+        dist = (lu / price - 1) * 100
+        if price >= lu * 0.999:
+            return "skipped", "at_limit_up", {"price": price, "limit_up": lu}
+        if dist < c["min_limit_dist_pct"]:
+            return "skipped", "too_close_to_limit_up", {"price": price, "prev_close": round(prev_close, 1),
+                                                         "limit_up": lu, "dist_pct": round(dist, 2)}
     if tv < c["min_trading_value"]:
         return "retry", "trading_value_low", {"trading_value": tv}
     try:
@@ -243,6 +278,8 @@ def _try_entry(sym: str, v: Dict[str, Any], st: Dict[str, Any], now: dt.datetime
     spread_pct = (ask - bid) / ((ask + bid) / 2) * 100
     if spread_pct > c["max_spread_pct"]:
         return "retry", "spread_too_wide", {"spread_pct": round(spread_pct, 3)}
+    if prev_close > 0 and (limit_up_price(prev_close) / bid - 1) * 100 < c["min_limit_dist_pct"]:
+        return "skipped", "too_close_to_limit_up_at_board", {"bid": bid, "limit_up": limit_up_price(prev_close)}
     qty = int(c["max_yen"] // (bid * 100)) * 100
     if qty <= 0:
         return "skipped", "too_expensive", {"bid": bid, "max_yen": c["max_yen"]}
