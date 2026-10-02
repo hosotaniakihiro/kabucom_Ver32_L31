@@ -655,6 +655,59 @@ def _et3_abs_stop_pct(current_default: float = 0.35) -> float:
     return max(_et3_env_float("ABSOLUTE_ENTRY_STOP_LOSS_PCT", current_default), 0.01)
 
 
+# ------------------------------------------------------------
+# 2026-10-02 昼: 損切り幅を日足 ATR に合わせる (ユーザー判断)。
+#   負けた決済 36 件の保有時間は中央値 1.2 分、72% が決済後 15 分以内に建値へ戻っていた
+#   (一律 -0.3% はノイズで切られる)。日足 ATR x 0.15 を 0.5〜1.5% に収める。日足が取れなければ 0.8%。
+#   EXIT_STOP_DAILY_ATR_ENABLED=0 で従来の一律に戻る。
+# ------------------------------------------------------------
+_DAILY_ATR_CACHE: Dict[str, Any] = {}
+
+
+def _daily_atr_pct(symbol: str) -> Optional[float]:
+    import datetime as _dt
+    key = f"{symbol}:{_dt.date.today()}"
+    if key in _DAILY_ATR_CACHE:
+        return _DAILY_ATR_CACHE[key]
+    val = None
+    try:
+        import sqlite3
+        from trading.daily.daily_signal_loader import _resolve_daily_db_path
+        con = sqlite3.connect(f"file:{_resolve_daily_db_path()}?mode=ro", uri=True, timeout=2.0)
+        try:
+            rows = con.execute(
+                "select high, low, close from stock_analysis_history where stock_code=? order by date desc limit 20",
+                (str(symbol),),
+            ).fetchall()
+        finally:
+            con.close()
+        rows = [r for r in rows[::-1] if r[0] and r[1] and r[2] and r[2] > 0]
+        trs = []
+        for (h, l, c), (_ph, _pl, pc) in zip(rows[1:], rows[:-1]):
+            tr = max(h - l, abs(h - pc), abs(l - pc))
+            if tr / c <= 0.4:   # 壊れた足 (株式分割など) を除く
+                trs.append(tr / c * 100.0)
+        if len(trs) >= 8:
+            v = sum(trs[-14:]) / len(trs[-14:])
+            if 0 < v <= 20:
+                val = v
+    except Exception:
+        logger.debug("[EXIT DAILY ATR] failed symbol=%s", symbol, exc_info=True)
+    _DAILY_ATR_CACHE[key] = val
+    return val
+
+
+def _et3_stop_pct_for(symbol: str, fallback: float) -> tuple[float, str]:
+    if str(os.getenv("EXIT_STOP_DAILY_ATR_ENABLED", "1")).strip().lower() in ("0", "false", "no", "off"):
+        return fallback, "fixed"
+    mult = _et3_env_float("EXIT_STOP_DAILY_ATR_MULT", 0.15)
+    lo, hi = _et3_env_float("EXIT_STOP_MIN_PCT", 0.5), _et3_env_float("EXIT_STOP_MAX_PCT", 1.5)
+    datr = _daily_atr_pct(symbol)
+    if datr is None:
+        return _et3_env_float("EXIT_STOP_NO_DAILY_ATR_PCT", 0.8), "no_daily_atr"
+    return min(max(datr * mult, lo), hi), f"daily_atr={datr:.2f}"
+
+
 def _et3_tick_size(price: float) -> float:
     # 簡易版。細かい呼値単位は銘柄区分で変わるため、まずは1円を標準にする。
     # 必要なら環境変数 EXIT_MARKET_SLIPPAGE_TICK_SIZE_YEN で上書きする。
@@ -708,10 +761,11 @@ def _judge_absolute_entry_stop_loss(*, symbol: str, side: str, entry_price: floa
     side_u = str(side or "").upper()
     entry = _et3_f(entry_price)
     cur = _et3_f(current_price)
-    pct = _et3_abs_stop_pct(ABSOLUTE_ENTRY_STOP_LOSS_PCT)
+    pct, pct_src = _et3_stop_pct_for(symbol, _et3_abs_stop_pct(ABSOLUTE_ENTRY_STOP_LOSS_PCT))
     if entry <= 0 or cur <= 0 or side_u not in {"BUY", "SELL"}:
         return False, "", {}
     cost = _et3_cost_detail(side_u, entry, cur)
+    cost["stop_pct_source"] = pct_src
     effective_price = cost["effective_exit_price"]
     if side_u == "BUY":
         line = entry * (1.0 - pct / 100.0)
@@ -773,14 +827,18 @@ def _judge_entry_trail_retrace_exit(*, symbol: str, pos: Dict[str, Any], side: s
         line = high * (1.0 - pct / 100.0)
         retrace = (high - effective_price) / high * 100.0 if high > 0 else 0.0
         detail = {"side": side_u, "entry_price": entry, "highest": high, "line": line, "retrace_pct": retrace, "threshold_pct": pct, **cost}
-        if high > entry and effective_price <= line:
+        # 2026-10-02 昼: 決済位置が建値以上の時だけ発動 (建値を少し超えた直後の押しで建値割れ決済しない)。
+        #   EXIT_TRAIL_REQUIRE_BREAKEVEN=0 で従来どおり。
+        be_ok = line >= entry or str(os.getenv("EXIT_TRAIL_REQUIRE_BREAKEVEN", "1")).strip().lower() in ("0", "false", "no", "off")
+        if high > entry and be_ok and effective_price <= line:
             return True, f"HIGH_0P2_TRAIL_EXIT_BUY_COST high={high:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
         return False, "", detail
 
     line = low * (1.0 + pct / 100.0)
     retrace = (effective_price - low) / low * 100.0 if low > 0 else 0.0
     detail = {"side": side_u, "entry_price": entry, "lowest": low, "line": line, "retrace_pct": retrace, "threshold_pct": pct, **cost}
-    if low < entry and effective_price >= line:
+    be_ok = line <= entry or str(os.getenv("EXIT_TRAIL_REQUIRE_BREAKEVEN", "1")).strip().lower() in ("0", "false", "no", "off")
+    if low < entry and be_ok and effective_price >= line:
         return True, f"LOW_0P2_TRAIL_EXIT_SELL_COST low={low:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
     return False, "", detail
 

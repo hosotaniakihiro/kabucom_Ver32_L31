@@ -1226,6 +1226,17 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
             "(低位株の大量株数は板を食う。9/28 の 7883 は 518円x700株で -4,000 円)",
             symbol, side, float(effective_price or 0.0), _before, int(qty), _max_qty,
         )
+    # 2026-10-02 昼: 1 回の金額を半分にする (ユーザー判断)。予算上限 (50 万円) は変えないので
+    #   高い銘柄が対象外にならない。100 株単位、最低 100 株。ENTRY_QTY_SCALE=1 で元に戻る。
+    try:
+        _scale = float(os.getenv("ENTRY_QTY_SCALE", "0.5") or 0.5)
+    except Exception:
+        _scale = 0.5
+    if 0 < _scale < 1 and int(qty or 0) > 0:
+        _before = int(qty)
+        qty = max(100, int((_before * _scale) // 100) * 100)
+        if qty != _before:
+            logger.warning("[ENTRY QTY SCALE] symbol=%s side=%s qty %d -> %d (scale=%.2f)", symbol, side, _before, qty, _scale)
     if qty <= 0:
         return _ng("QTY_ZERO", side=side, price=price, base_price=base_price, spread_pct=spread_pct, trading_value=trading_value)
 
