@@ -18,6 +18,8 @@ npm run e2e                # Web をビルド → Node API(DATA_MODE=mock) を�
 | Playwright E2E | **8** | 全件成功 |
 | 失敗 | **0** | |
 
+Windows 11 実機（2026-10-02, Node 24.18）でも typecheck・Vitest 288件・E2E 8件の全件成功を確認（ローカルディスク上・rollup は WASM 版）。
+
 追加の検証（自動テスト外・本セッションで実施）:
 - `wrangler deploy --dry-run`: Worker バンドル成功（約 224 KiB、D1/R2 バインディング認識）
 - `wrangler d1 migrations apply --local`: 0001〜0004 適用成功

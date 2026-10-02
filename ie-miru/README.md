@@ -22,6 +22,11 @@ AI参考査定・買う/売る/直す/貸す/建て替える の試算を表示�
 
 ## コマンド
 
+> **Windows の注意**
+> - npm workspaces はシンボリックリンクを使うので、NAS / SMB 共有（例: `W:`）上では `npm install` が `symlink UNKNOWN` で失敗する。ローカルディスク（例: `C:\tmp\ie-miru`）に clone して実行する。
+> - Smart App Control が rollup のネイティブモジュール（未署名 `.node`）をブロックするため、`package.json` の `overrides` で rollup を公式 WASM 版 `@rollup/wasm-node` に差し替えている（Linux/macOS でも同じく動く）。
+> - E2E の初回は `npx playwright install chromium` が必要。
+
 ```bash
 npm install
 npm run typecheck
