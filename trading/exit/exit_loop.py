@@ -98,6 +98,15 @@ def exit_loop_5s() -> None:
             pos = positions[symbol]
 
             try:
+                # 2026-10-03: 急騰銘柄の空売り (SURGE_SHORT) の建玉は、その戦略の
+                #   損切り (+5%) と時間決済 (60 分) だけで扱い、通常の決済ルールは通さない。
+                try:
+                    from trading.strategies.surge_short import handle_exit as _surge_handle_exit
+                    if _surge_handle_exit(symbol, pos, now) is not None:
+                        continue
+                except Exception:
+                    logger.exception("[EXIT LOOP] surge_short handle_exit failed symbol=%s", symbol)
+
                 # 通常のAI/トレーリング/時間EXITより先に、吹き上げ利確を確認する。
                 if _apply_blowoff_profit_take_safe(symbol, pos, regime):
                     continue

@@ -121,6 +121,12 @@ def start_scheduler_stack_before_restore() -> None:
     install_exit_order_sender_safe()
     register_exit_loop_safe()
     register_tonosama_entry_scheduler_safe()
+    # 2026-10-03: 急騰銘柄の空売り (trading/strategies/surge_short.py)
+    try:
+        from trading.strategies.surge_short import register_scheduler_safe as _register_surge_short
+        _register_surge_short()
+    except Exception:
+        logger.exception("[startup.scheduler] surge_short register failed")
     start_ranking_db_writer_safe()
     start_schedule_loop_early_safe()
     run_summary_tick_once_debug_safe()
