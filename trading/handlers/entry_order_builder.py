@@ -88,7 +88,9 @@ SELL_CREDIT_LIMIT_DOWN_TICK_ENABLED = str(os.getenv("SELL_CREDIT_LIMIT_DOWN_TICK
 }
 SELL_CREDIT_LIMIT_UP_TICK_WHEN_BOARD_MISSING = int(float(os.getenv("SELL_CREDIT_LIMIT_UP_TICK_WHEN_BOARD_MISSING", "0")))
 
-ENTRY_ORDER_5S_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_5S_GUARD_ENABLED", "1")).lower() not in {
+# 2026-10-02: 既定 OFF。5 秒足が push DB から取れるようになって (10/1 aed9434) 初めて効き始めたが
+#   効果は未検証 (10/2 午前に 7 件見送り)。検証が済むまで止める。戻すときは env で 1。
+ENTRY_ORDER_5S_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_5S_GUARD_ENABLED", "0")).lower() not in {
     "0", "false", "no", "off",
 }
 ENTRY_ORDER_REQUIRE_5S_DATA = str(os.getenv("ENTRY_ORDER_REQUIRE_5S_DATA", "0")).lower() in {

@@ -59,7 +59,9 @@ _BOARD_SETTINGS_ENV_DEFAULTS = {
     #   成行の平均損益が -0.142% -> -0.019% (前半/後半とも)。以前は bid/ask が逆で効いていなかった。
     #   2026-10-01 夕: 0.10 -> 0.05 (ユーザー判断で一任)。スプレッド ≤0.05% は前半 -0.009% / 後半 +0.020% と
     #   負けない範囲。勝てる根拠が見つかるまで回数を減らして負けを積まない。
-    "ENTRY_REST_FULL_BOARD_MAX_SPREAD_PCT": "0.05",
+    #   2026-10-02: 0.05 -> 0.10 (ユーザー判断)。0.05% では 10/2 午前の発注 2 件・約定 1 件で
+    #   検証にもならなかった。0.10% の過去期待値は -0.019% (ほぼトントン)。
+    "ENTRY_REST_FULL_BOARD_MAX_SPREAD_PCT": "0.10",
     "ENTRY_REST_FULL_BOARD_STRICT_GUARD": "1",
     "ENTRY_REST_FULL_BOARD_CACHE_SEC": "0.8",
     "ENTRY_REST_FULL_BOARD_MIN_INTERVAL_SEC": "0.7",
@@ -331,7 +333,7 @@ _BOARD_SAFETY_CLAMP_FLOAT_RANGES = {
     # Board guards
     "ENTRY_REST_FULL_BOARD_THICK_MIN_QTY": (100.0, 20000.0, 500.0),
     "EXIT_REST_FULL_BOARD_THICK_MIN_QTY": (100.0, 20000.0, 500.0),
-    "ENTRY_REST_FULL_BOARD_MAX_SPREAD_PCT": (0.02, 1.0, 0.05),
+    "ENTRY_REST_FULL_BOARD_MAX_SPREAD_PCT": (0.02, 1.0, 0.10),
     "EXIT_REST_FULL_BOARD_MAX_SPREAD_PCT": (0.02, 2.0, 0.15),
     "ENTRY_REST_FULL_BOARD_MIN_SAME_SIDE_TOTAL": (100.0, 100000.0, 300.0),
     "ENTRY_REST_FULL_BOARD_MAX_OPPOSITE_RATIO": (1.2, 20.0, 2.5),
