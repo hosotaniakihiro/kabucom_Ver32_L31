@@ -4,12 +4,12 @@
 
 ## A. すぐ必要（開発継続・検証）
 
-1. **GitHub へのプッシュ権限**: 本セッションからの `git push` が 403 で拒否された（Claude GitHub App がこのリポジトリに未インストール／未連携）。https://claude.ai/connect-github で GitHub を再連携し、`hosotaniakihiro/kabucom_Ver32_L31` に Claude GitHub App をインストールしてから、ブランチ `claude/ie-miru-phases-1-20-ukqz0z` を push する（ローカルにはコミット済み）。
+1. ~~**GitHub へのプッシュ権限**~~ → **2026-10-02 解決済み**（Windows 実機から push 成功）。: 本セッションからの `git push` が 403 で拒否された（Claude GitHub App がこのリポジトリに未インストール／未連携）。https://claude.ai/connect-github で GitHub を再連携し、`hosotaniakihiro/kabucom_Ver32_L31` に Claude GitHub App をインストールしてから、ブランチ `claude/ie-miru-phases-1-20-ukqz0z` を push する（ローカルにはコミット済み）。
 2. **不動産情報ライブラリ API キーの申請**（https://www.reinfolib.mlit.go.jp/ の API 利用申請）。取得後:
    - ローカル: `ie-miru/apps/api/.dev.vars` に `REINFOLIB_API_KEY=...`（git 管理外）
    - Cloudflare: `wrangler secret put REINFOLIB_API_KEY`
-3. **PLATEAU 建物データの配信元を決める**（利用規約確認込み）。MVT の URL テンプレートを `PLATEAU_MVT_URL` に設定（レイヤ名が必要なら `PLATEAU_MVT_LAYER`）。自前でタイル化する場合はその作業も。
-4. **開発環境のネットワーク許可**（任意）: Claude Code のクラウド環境設定で `www.reinfolib.mlit.go.jp`, `mreversegeocoder.gsi.go.jp`, `cyberjapandata.gsi.go.jp`, PLATEAU 配信ホストを許可すると、ライブ API での契約確認ができる。
+3. **PLATEAU 建物データの配信元を決める**（利用規約確認込み）。候補の実測結果は `IE_MIRU_DATA_SOURCES.md` §7。MVT の URL テンプレートを `PLATEAU_MVT_URL` に設定（レイヤ名が必要なら `PLATEAU_MVT_LAYER`）。自前でタイル化する場合はその作業も。
+4. ~~**開発環境のネットワーク許可**~~ → Windows 実機からは国土地理院・PLATEAU 候補・不動産情報ライブラリ（401=キー待ち）すべて到達できる。（元の記載）: Claude Code のクラウド環境設定で `www.reinfolib.mlit.go.jp`, `mreversegeocoder.gsi.go.jp`, `cyberjapandata.gsi.go.jp`, PLATEAU 配信ホストを許可すると、ライブ API での契約確認ができる。
 5. **ライブ API での属性名確認**: キー取得後、XPT002 / XKT002 / XKT025〜029 の実レスポンスと `packages/services/src/reinfolib/parse.ts`・`hazard/service.ts` の候補キーを突き合わせる（fixture は公開仕様の形状で作成）。
 
 ## B. iOS（Apple Developer 関連・課金を伴う可能性）
