@@ -85,13 +85,16 @@ _regulars: List[str] = []
 _regulars_ready = False
 
 
-def _compute_regulars(n: int = 50, days: int = 10, min_ticks: int = 200) -> List[str]:
+def _compute_regulars(n: int = 50, days: int = 10, min_ticks: int = 200,
+                      min_days: int = 3, min_range_pct: Optional[float] = None) -> List[str]:
     import datetime as dt
     import glob
     import re
     import sqlite3
     base = Path(os.environ.get("LOCALAPPDATA") or str(Path.home())) / "autostock"
-    cache = base / "runtime" / f"relay_regulars_{dt.date.today():%Y%m%d}.json"
+    if min_range_pct is None:
+        min_range_pct = float(os.getenv("PUSH_RELAY_REGULARS_MIN_RANGE_PCT", "2.5") or 2.5)
+    cache = base / "runtime" / f"relay_regulars_v2_{dt.date.today():%Y%m%d}.json"
     try:
         if cache.exists():
             return list(json.loads(cache.read_text(encoding="utf-8")).get("symbols") or [])[:n]
@@ -105,17 +108,28 @@ def _compute_regulars(n: int = 50, days: int = 10, min_ticks: int = 200) -> List
         try:
             con = sqlite3.connect(f"file:{f}?mode=ro", uri=True, timeout=2.0)
             try:
-                rows = con.execute("SELECT symbol, COUNT(*) FROM stream_data GROUP BY symbol").fetchall()
+                rows = con.execute("SELECT symbol, COUNT(*), MIN(price), MAX(price) FROM stream_data "
+                                   "WHERE price > 0 GROUP BY symbol").fetchall()
             finally:
                 con.close()
         except Exception:
             continue
-        for sym, cnt in rows:
-            if not sym or int(cnt or 0) < min_ticks:
+        for sym, cnt, mn, mx in rows:
+            if not sym or int(cnt or 0) < min_ticks or not mn or float(mn) <= 0:
                 continue
-            d, t = score.get(str(sym), (0, 0))
-            score[str(sym)] = (d + 1, t + int(cnt))
-    out = [s for s, _ in sorted(score.items(), key=lambda kv: (-kv[1][0], -kv[1][1]))][:n]
+            ranges = score.setdefault(str(sym), [])
+            ranges.append((float(mx) / float(mn) - 1) * 100)
+    # 2026-10-03: 値動きの小さい銘柄 (大型株で 1 日の値幅が 1% 前後) は常連にしない (ユーザー判断)。
+    #   直近 10 日の常連候補 50 のうち 15 が値幅中央値 2% 未満 (5401 0.88% / 7203 0.95% / 6501 1.20% ...)。
+    stat = {}
+    for sym, rs in score.items():
+        if len(rs) < min_days:
+            continue
+        med = sorted(rs)[len(rs) // 2]
+        if med >= min_range_pct:
+            stat[sym] = (len(rs), round(med, 2))
+    out = [s for s, _ in sorted(stat.items(), key=lambda kv: (-kv[1][0], -kv[1][1]))][:n]
+    score = stat
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps({"symbols": out, "files": [os.path.basename(x) for x in files],
