@@ -10,8 +10,8 @@
 # 銘柄の割り振り (rotation_core から split_targets_for_relay を呼ぶ):
 #   常連 = NAS 日足の直近 60 営業日で 値幅の平均が大きい 50 銘柄 (売買代金 10 億以上・300〜7,000 円、週 1 回)。
 #   日足が読めなければ push DB 10 日分で代用。
-#   中継がつながっていて常連が計算済みなら: 常連 50 (保有中・発注中を除く) を中継、
-#   本番の口座は 保有中・発注中 → 入れ替わる候補 (常連以外) で 50。
+#   中継がつながっていて常連が計算済みなら: 常連 50 を中継 (その日 1 日固定)、
+#   本番の口座は 常連以外の 保有中・発注中 → 入れ替わる候補 で 50。
 #   常連の計算前は 先頭 50 を自分、51〜100 番目を中継。中継がなければ従来どおり 50 銘柄だけ。
 #
 # 中継とのやりとり (改行区切りの JSON、TCP):
@@ -247,8 +247,11 @@ def split_targets_for_relay(targets: List[str]) -> List[str]:
     本番の口座は 保有中・発注中 → 残りの候補 (常連以外) の順で埋める。"""
     targets = [str(s) for s in (targets or []) if s]
     if _started and is_connected() and _regulars_ready:
-        must = _must_local_symbols()
-        remote = [s for s in _regulars if s not in must][:REMOTE_LIMIT]
+        # 2026-10-03 (ユーザー判断): 中継側の常連はその日 1 日変えない (保有中・発注中になっても中継側で受ける)。
+        #   本番の口座は常連以外だけを扱う (保有中・発注中 → 入れ替わる候補)。
+        #   中継が止まると常連の PUSH は途切れる。保有中の価格は exit_price_source の broker フォールバックで取る。
+        remote = list(_regulars[:REMOTE_LIMIT])
+        must = [s for s in _must_local_symbols() if s not in remote]
         local: List[str] = []
         for s in must + targets:
             if s not in remote and s not in local:
