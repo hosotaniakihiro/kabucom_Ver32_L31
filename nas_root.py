@@ -53,6 +53,20 @@ def _probe(path: str) -> bool:
         return False
 
 
+def _as_dir_root(root: str) -> str:
+    """"X:" のようなドライブ名だけなら末尾に区切りを付けて "X:" + 区切り にする。
+
+    2026-10-03: "X:" のままだと os.path.join("X:", "raw_data") や Path("X:") / "raw_data" が
+    "X:raw_data" (X ドライブの「カレントフォルダ」からの相対パス) になる。10/2 の yahoo_complement は
+    起動時に UNC の確認が一時的に失敗して "X:" に落ち、yahoo_backfill_status の書き込みが
+    "unable to open database file" で 1 日約 1.2 万回失敗していた。
+    """
+    r = str(root or "")
+    if len(r) == 2 and r[1] == ":":
+        return r + os.sep
+    return r
+
+
 def nas_root() -> str:
     """到達可能な NAS root 表記を返す (プロセス内で 1 回だけ判定)。
 
@@ -74,7 +88,7 @@ def nas_root() -> str:
 
         explicit = str(os.getenv("AUTOSTOCK_NAS_ROOT", "")).strip()
         if explicit:
-            _CACHE = explicit.rstrip("\\/")
+            _CACHE = _as_dir_root(explicit.rstrip("\\/"))
             logger.warning("[NAS ROOT] env 指定を使う root=%s", _CACHE)
             return _CACHE
 
@@ -87,7 +101,7 @@ def nas_root() -> str:
         ).strip().rstrip("\\/")
 
         if fallback and _probe(fallback + "\\"):
-            _CACHE = fallback
+            _CACHE = _as_dir_root(fallback)
             logger.warning(
                 "[NAS ROOT] UNC %s へ到達できないため %s を使う "
                 "(同一共有への二重 SMB セッションを避ける。"
@@ -112,7 +126,7 @@ def nas_path(*parts: str) -> str:
     """
     root = nas_root()
     tail = "\\".join(str(p).strip("\\/") for p in parts if str(p).strip("\\/"))
-    return (root + "\\" + tail) if tail else root
+    return (root.rstrip("\\/") + "\\" + tail) if tail else root
 
 
 def reset_cache_for_test() -> None:

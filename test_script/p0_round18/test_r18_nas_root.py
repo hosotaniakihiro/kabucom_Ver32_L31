@@ -84,10 +84,12 @@ check("nas_path() 引数なしは root", nr.nas_path() == nr.nas_root())
 
 nr.reset_cache_for_test()
 os.environ["AUTOSTOCK_NAS_ROOT"] = "Q:"
-check("AUTOSTOCK_NAS_ROOT が最優先", nr.nas_root() == "Q:")
+# 2026-10-03: ドライブ名だけのときは "Q:" + 区切り を返す ("Q:" だと os.path.join が "Q:raw_data" になる)
+check("AUTOSTOCK_NAS_ROOT が最優先", nr.nas_root() == "Q:\\")
 os.environ["AUTOSTOCK_NAS_ROOT"] = "Q:\\"
 nr.reset_cache_for_test()
-check("末尾の区切りは落とす", nr.nas_root() == "Q:")
+check("ドライブ名は区切り付きにそろえる", nr.nas_root() == "Q:\\")
+check("nas_path で区切りが重ならない", nr.nas_path("a", "b") == "Q:\\a\\b")
 del os.environ["AUTOSTOCK_NAS_ROOT"]
 nr.reset_cache_for_test()
 
