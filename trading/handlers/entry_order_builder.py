@@ -797,8 +797,30 @@ def _passive_limit_price(bid: float, ask: float, side: str) -> float:
     return math.floor(near / tick) * tick if side_u == "BUY" else math.ceil(near / tick) * tick
 
 
+def _take_sources() -> set:
+    """2026-10-03 (ユーザー判断): 急騰の初動を取りに行く source は 1 回目から相手側気配を取る。
+    買気配に並べて待つと、伸びる銘柄は値が逃げて約定せず、押し戻された銘柄だけ約定する
+    (殿様イナゴの検証 +0.29% は合図の時点で買えた前提)。ENTRY_TAKE_SOURCES= (空) で従来どおり。"""
+    return {x.strip().upper() for x in os.getenv("ENTRY_TAKE_SOURCES", "TONOSAMA").split(",") if x.strip()}
+
+
+def _is_take_entry(entry_row: Any = None, source: Any = None) -> bool:
+    take = _take_sources()
+    if not take:
+        return False
+    vals = [source]
+    try:
+        vals += [_entry_get(entry_row, "source", default=""), _entry_get(entry_row, "entry_type", default="")]
+    except Exception:
+        pass
+    return any(str(v or "").strip().upper() in take for v in vals)
+
+
 def _passive_no_touch(entry_row: Any) -> bool:
-    """C9: 初回 (summary_retry_round==0) は相手側気配に触れない (=約定を待つ)。"""
+    """C9: 初回 (summary_retry_round==0) は相手側気配に触れない (=約定を待つ)。
+    初動を取りに行く source (_is_take_entry) は対象外。"""
+    if _is_take_entry(entry_row):
+        return False
     return bool(ENTRY_PASSIVE_LIMIT_ENABLED and _passive_round_of(entry_row) <= 0)
 
 
@@ -3353,6 +3375,10 @@ def _rfb_patch_result(ret: dict, *, symbol: str, side: str, source: str, entry_r
     bid, ask = _rfb_safe_float(board.get("bid")), _rfb_safe_float(board.get("ask"))
     spread_pct = ((ask - bid) / ((ask + bid) / 2.0)) * 100.0
     max_spread = _rfb_env_float("ENTRY_REST_FULL_BOARD_MAX_SPREAD_PCT", _rfb_env_float("ENTRY_MAX_SPREAD_PCT", 0.15))
+    take = _is_take_entry(entry_row, source)
+    if take:
+        # 初動の銘柄はスプレッドが広がりやすい。取りに行く分の上限は別に持つ (既定 0.3%)。
+        max_spread = _rfb_env_float("ENTRY_TAKE_MAX_SPREAD_PCT", 0.30)
     if spread_pct > max_spread and _rfb_env_bool("ENTRY_REST_FULL_BOARD_STRICT_GUARD", True):
         return {"ok": False, "reason": "REST_FULL_BOARD_SPREAD_TOO_WIDE", "detail": {**detail, "bid": bid, "ask": ask, "spread_pct": spread_pct, "max_spread_pct": max_spread}}
 
@@ -3376,6 +3402,14 @@ def _rfb_patch_result(ret: dict, *, symbol: str, side: str, source: str, entry_r
     if _passive_no_touch(entry_row):
         touch = False
     new, mode, meta = _rfb_decide_price(board, side, touch=touch)
+    if take and ask > bid > 0:
+        # 1 回目から相手側気配を取る。成行は使わず、届くまでの値動きに備えて ENTRY_TAKE_TICKS (既定 2) 呼値まで。
+        k = max(0, int(_rfb_env_float("ENTRY_TAKE_TICKS", 2)))
+        t = _rfb_safe_float(meta.get("tick")) or _rfb_tick(ask)
+        raw = ask + k * t if side == "BUY" else bid - k * t
+        new = raw if _rfb_safe_float(meta.get("board_tick")) > 0 else _rfb_round(raw, side)
+        mode = f"REST_FULL_BOARD_TAKE_{'ASK_PLUS' if side == 'BUY' else 'BID_MINUS'}_{k}T"
+        touch = True
     if new <= 0:
         return ret
     detail["passive_no_touch"] = bool(touch is False)
