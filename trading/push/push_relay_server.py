@@ -8,6 +8,8 @@
 # 自分の websocket から届いたものと同じ on_message に流す (DB 保存・5 秒足・最新値すべて共通)。
 #
 # 銘柄の割り振り (rotation_core から split_targets_for_relay を呼ぶ):
+#   常連 = NAS 日足の直近 60 営業日で 値幅の平均が大きい 50 銘柄 (売買代金 10 億以上・300〜7,000 円、週 1 回)。
+#   日足が読めなければ push DB 10 日分で代用。
 #   中継がつながっていて常連が計算済みなら: 常連 50 (保有中・発注中を除く) を中継、
 #   本番の口座は 保有中・発注中 → 入れ替わる候補 (常連以外) で 50。
 #   常連の計算前は 先頭 50 を自分、51〜100 番目を中継。中継がなければ従来どおり 50 銘柄だけ。
@@ -139,11 +141,84 @@ def _compute_regulars(n: int = 50, days: int = 10, min_ticks: int = 200,
     return out
 
 
+def _compute_regulars_daily(n: int = 50) -> List[str]:
+    """2026-10-03 (ユーザー判断: もっと長い期間で選ぶ): NAS 日足 DB の直近 60 営業日で選ぶ。週 1 回。
+    売買代金の平均 >= 10 億円、株価 300〜7,000 円 (予算 50 万円・100 株で買える範囲)、40 日以上の足、
+    TR/終値 >= 40% の壊れた足は除き、1 日の値幅 (TR/終値) の平均が大きい順に n 銘柄。
+    10/3 試算: 候補 566、上位 50 の値幅平均 6〜15% (半導体・電線・新興株・9984 など)。"""
+    import datetime as dt
+    import sqlite3
+    days = int(float(os.getenv("PUSH_RELAY_REGULARS_DAYS", "60") or 60))
+    min_tv = float(os.getenv("PUSH_RELAY_REGULARS_MIN_TV", "1e9") or 1e9)
+    pmin = float(os.getenv("PUSH_RELAY_REGULARS_MIN_PRICE", "300") or 300)
+    pmax = float(os.getenv("PUSH_RELAY_REGULARS_MAX_PRICE", "7000") or 7000)
+    base = Path(os.environ.get("LOCALAPPDATA") or str(Path.home())) / "autostock"
+    y, w, _ = dt.date.today().isocalendar()
+    cache = base / "runtime" / f"relay_regulars_daily_{y}W{w:02d}.json"
+    try:
+        if cache.exists():
+            return list(json.loads(cache.read_text(encoding="utf-8")).get("symbols") or [])[:n]
+    except Exception:
+        pass
+    from trading.daily.daily_signal_loader import _resolve_daily_db_path
+    con = sqlite3.connect(f"file:{_resolve_daily_db_path()}?mode=ro", uri=True, timeout=10)
+    try:
+        dates = [r[0] for r in con.execute("SELECT DISTINCT date FROM stock_analysis_history "
+                                           "ORDER BY date DESC LIMIT ?", (days,))]
+        if len(dates) < 20:
+            return []
+        rows = con.execute("SELECT stock_code, date, high, low, close, volume FROM stock_analysis_history "
+                           "WHERE date >= ? ORDER BY stock_code, date", (dates[-1],)).fetchall()
+    finally:
+        con.close()
+    stat: dict = {}
+    prev_sym, prev_close = None, None
+    for sym, d, h, l, c, v in rows:
+        if sym != prev_sym:
+            prev_sym, prev_close = sym, None
+        if not (c and h and l and c > 0 and h >= l > 0):
+            continue
+        tr = max(h - l, abs(h - prev_close), abs(l - prev_close)) if prev_close else (h - l)
+        prev_close = c
+        trp = tr / c * 100
+        if trp >= 40:
+            continue
+        st = stat.setdefault(str(sym), {"n": 0, "tr": 0.0, "tv": 0.0, "price": 0.0})
+        st["n"] += 1
+        st["tr"] += trp
+        st["tv"] += c * float(v or 0)
+        st["price"] = c
+    cand = []
+    for sym, st in stat.items():
+        if st["n"] < 40:
+            continue
+        tv = st["tv"] / st["n"]
+        if tv < min_tv or not (pmin <= st["price"] <= pmax):
+            continue
+        cand.append((sym, st["tr"] / st["n"], tv, st["price"]))
+    cand.sort(key=lambda x: -x[1])
+    out = [c[0] for c in cand[:n]]
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"symbols": out, "period": [dates[-1], dates[0]], "candidates": len(cand),
+                                     "detail": {c[0]: {"atr_pct": round(c[1], 2), "tv_oku": round(c[2] / 1e8), "price": c[3]}
+                                                for c in cand[:n]}}, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+    return out
+
+
 def _load_regulars_bg() -> None:
     global _regulars, _regulars_ready
     try:
         n = int(os.getenv("PUSH_RELAY_REGULARS_COUNT", str(REMOTE_LIMIT)) or REMOTE_LIMIT)
-        _regulars = _compute_regulars(n=n)
+        try:
+            _regulars = _compute_regulars_daily(n=n)
+        except Exception:
+            logger.warning("[PUSH RELAY] daily regulars failed; fallback to push DB 10 days", exc_info=True)
+            _regulars = []
+        if not _regulars:
+            _regulars = _compute_regulars(n=n)
         _regulars_ready = bool(_regulars)
         logger.warning("[PUSH RELAY] regulars ready count=%d head=%s", len(_regulars), _regulars[:10])
     except Exception:

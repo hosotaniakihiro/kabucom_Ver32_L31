@@ -80,23 +80,35 @@ def _kabu_put(path: str, body: dict):
 
 
 def apply_register(symbols: list) -> None:
-    """登録をやり直す (全解除 → 最大 50 件を登録)。"""
+    """登録を合わせる。差分だけ解除・登録して、残る銘柄の受信を途切れさせない。
+    初回 (まだ何も登録していない) だけ全解除してから登録する。"""
     global _registered
     symbols = [str(s) for s in symbols if s][:50]
     with _reg_lock:
-        if symbols == _registered:
+        if set(symbols) == set(_registered):
             return
         try:
-            r = _kabu_put("/unregister/all", {})
-            log.info("unregister/all status=%s", getattr(r, "status_code", None))
-            if symbols:
-                r = _kabu_put("/register", {"Symbols": [{"Symbol": s, "Exchange": 1} for s in symbols]})
-                log.info("register count=%d status=%s body=%s", len(symbols), r.status_code, r.text[:200])
+            if not _registered:
+                r = _kabu_put("/unregister/all", {})
+                log.info("unregister/all status=%s", getattr(r, "status_code", None))
+                removed, added = [], symbols
+            else:
+                removed = [s for s in _registered if s not in symbols]
+                added = [s for s in symbols if s not in _registered]
+            if removed:
+                r = _kabu_put("/unregister", {"Symbols": [{"Symbol": s, "Exchange": 1} for s in removed]})
+                log.info("unregister count=%d status=%s", len(removed), r.status_code)
+            if added:
+                r = _kabu_put("/register", {"Symbols": [{"Symbol": s, "Exchange": 1} for s in added]})
+                log.info("register count=%d status=%s body=%s", len(added), r.status_code, r.text[:200])
                 if r.status_code != 200:
+                    # 差分で失敗したら次回は全部やり直す
+                    _registered = []
                     return
             _registered = symbols
             _stats["registered"] = len(symbols)
         except Exception:
+            _registered = []
             log.exception("register failed")
 
 
