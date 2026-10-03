@@ -1268,6 +1268,14 @@ def _pending_audit_scope_enabled() -> bool:
 
 
 def add_tonosama_pending(entry: dict[str, Any]) -> bool:
+    # 2026-10-03: 殿様イナゴの売りはどの条件でもコストを上回らなかった (backtest.db 24 日)。既定で止める。
+    try:
+        if str((entry or {}).get("side") or "").upper() == "SELL" and \
+                str(os.getenv("TONOSAMA_SELL_ENABLED", "0")).strip().lower() in ("0", "false", "no", "off"):
+            logger.info("[TONOSAMA SELL DISABLED] skip symbol=%s", (entry or {}).get("symbol"))
+            return False
+    except Exception:
+        pass
     if not _pending_audit_scope_enabled():
         return _add_tonosama_pending_core(entry)
     ok = False

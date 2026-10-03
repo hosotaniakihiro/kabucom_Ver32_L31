@@ -130,7 +130,9 @@ MIN_PRICE = _env_float_floor("TONOSAMA_MIN_PRICE", 300.0, 300.0)
 MIN_FINAL_SCORE = _env_float_floor("TONOSAMA_MIN_FINAL_SCORE", 2.3, 2.3)
 MIN_RAW_SCORE = _env_float("TONOSAMA_MIN_RAW_SCORE", 0.01)
 
-MIN_VOLUME_SURGE_RATIO = _env_float_floor("TONOSAMA_MIN_VOLUME_SURGE_RATIO", 3.0, 3.0)
+# 2026-10-03: 3 倍 -> 10 倍。backtest.db 24 日で 3 倍以上は 15 分後 +0.03% (効果なし)、
+#   10 倍以上は +0.33% / 60 分 +0.45% (前半 +0.20 / 後半 +0.55)。ユーザー承認。
+MIN_VOLUME_SURGE_RATIO = _env_float_floor("TONOSAMA_MIN_VOLUME_SURGE_RATIO", 10.0, 3.0)
 
 # Ver2.6: 0.30%では候補0が続いたため、0.20%へ緩和。
 MIN_PRICE_CHANGE_PCT = _env_float_floor("TONOSAMA_MIN_PRICE_CHANGE_PCT", 0.20, 0.20)

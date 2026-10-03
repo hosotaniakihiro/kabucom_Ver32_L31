@@ -106,6 +106,13 @@ def exit_loop_5s() -> None:
                         continue
                 except Exception:
                     logger.exception("[EXIT LOOP] surge_short handle_exit failed symbol=%s", symbol)
+                # 2026-10-03: 殿様イナゴ由来の買い建玉は 損切り 1.5% / 60 分 で扱う
+                try:
+                    from trading.strategies.tonosama_exit import handle_exit as _tonosama_handle_exit
+                    if _tonosama_handle_exit(symbol, pos, now) is not None:
+                        continue
+                except Exception:
+                    logger.exception("[EXIT LOOP] tonosama_exit handle_exit failed symbol=%s", symbol)
 
                 # 通常のAI/トレーリング/時間EXITより先に、吹き上げ利確を確認する。
                 if _apply_blowoff_profit_take_safe(symbol, pos, regime):

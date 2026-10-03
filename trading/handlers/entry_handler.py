@@ -469,6 +469,17 @@ def place_entry_buy(symbol: str, symbolname: str, price: Optional[float], reason
         _ensure_entry_inflight_set()
         _register_cancel_watch(order_id, p["symbol"], "BUY", p["qty"], p["price"], "ENTRY_BUY")
         logger.info("[ENTRY BUY SENT] symbol=%s type=%s oid=%s qty=%s reason=%s", p["symbol"], p["order_type"], order_id, p["qty"], p["reason"])
+        # 2026-10-03: 殿様イナゴ由来の建玉は専用の決済 (損切り 1.5% / 60 分) にする
+        try:
+            _is_tonosama = "TONOSAMA" in str(p.get("reason") or "").upper()
+            if not _is_tonosama:
+                from trading.entry.tonosama.pending_writer import has_tonosama_pending as _has_tp
+                _is_tonosama = bool(_has_tp(p["symbol"]))
+            if _is_tonosama:
+                from trading.strategies.tonosama_exit import record_entry as _tonosama_record
+                _tonosama_record(p["symbol"], order_id, p["price"], p["qty"], p["reason"])
+        except Exception:
+            logger.exception("[ENTRY BUY SENT] tonosama record failed symbol=%s", p["symbol"])
         return order_id
     except Exception:
         logger.exception("[ENTRY BUY EXCEPTION] %s", symbol)
