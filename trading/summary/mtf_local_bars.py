@@ -476,7 +476,21 @@ def get_bars(symbol, tf: int, now: Optional[dt.datetime] = None) -> pd.DataFrame
         bars.index.name = "datetime"
         bars = bars.reset_index()
         bars["symbol"] = sym
-        bars = _add_indicators_with_prevday(bars, _prev_bars_for(sym, tf, now.date()))
+        _prev = _prev_bars_for(sym, tf, now.date())
+        # 2026-10-03: 前日分と当日の PUSH の足の間に、当日の Yahoo 足 (登録前の分) を挟む。
+        #   読み込みは裏スレッド (trading.summary.yahoo_today_warmup)、ここはキャッシュだけ。
+        try:
+            from trading.summary import yahoo_today_warmup as _ytw
+            _ytd = _ytw.get_before(sym, tf, bars["datetime"].min()) if not bars.empty else None
+            if _ytd is not None and not _ytd.empty:
+                _ytd = _ytd.copy()
+                _ytd["symbol"] = sym
+                _prev = pd.concat([x for x in (_prev, _ytd) if x is not None and not x.empty],
+                                  ignore_index=True, sort=False)
+                _prev = _prev.sort_values("datetime").drop_duplicates("datetime", keep="last").reset_index(drop=True)
+        except Exception:
+            logger.debug("[MTF LOCAL BARS] yahoo today splice failed symbol=%s tf=%s", sym, tf, exc_info=True)
+        bars = _add_indicators_with_prevday(bars, _prev)
         # 旧 conditions_long/short のヘルパー (_is_bull 等) は *_price 列名を見る
         for k in ("open", "high", "low", "close"):
             bars[f"{k}_price"] = bars[k]

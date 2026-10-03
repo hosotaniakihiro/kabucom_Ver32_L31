@@ -1230,6 +1230,73 @@ def _with_intraday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
         return df
 
 
+def _yahoo_today_scope_enabled() -> bool:
+    """当日 Yahoo のウォームアップは売買判定をする main.py の中だけで使う (他プロセスの計算は変えない)。"""
+    if str(os.getenv("YAHOO_TODAY_WARMUP_ALL_PROCS", "0")).strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    try:
+        import sys as _sys
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in _sys.argv)
+        return "main.py" in argv and "main_database.py" not in argv
+    except Exception:
+        return False
+
+
+def _with_yahoo_today_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
+    """2026-10-03: 当日 DB の足でも足りない銘柄 (PUSH 登録直後など) に、当日の Yahoo 足を
+    「その銘柄の最初の足より前」の分だけ足す。読み込みは trading.summary.yahoo_today_warmup の
+    裏スレッドで、ここはキャッシュだけを見る (待たない・1 分足の予算 45 秒を食わない)。
+    行には _INTRADAY_WARMUP_COL を付け、計算後に落とす (保存しない)。"""
+    if not isinstance(df, pd.DataFrame) or df.empty or not _yahoo_today_scope_enabled():
+        return df
+    if "datetime" not in df.columns or "symbol" not in df.columns:
+        return df
+    try:
+        from trading.summary import yahoo_today_warmup as _ytw
+        if not _ytw.enabled():
+            return df
+        name = _normalize_interval_name(interval)
+        minutes = {"1min": 1, "3min": 3, "5min": 5}.get(name)
+        if not minutes:
+            return df
+        need = _intraday_required_bars(interval)
+        d = df.copy()
+        d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
+        d = d.dropna(subset=["datetime"])
+        if d.empty:
+            return df
+        d["symbol"] = d["symbol"].astype(str).str.strip()
+        first = d.groupby("symbol")["datetime"].min()
+        counts = d.groupby("symbol").size()
+        frames = []
+        for sym, n in counts.items():
+            if int(n) >= need:
+                continue
+            y = _ytw.get_before(sym, minutes, first.get(sym))
+            if y is None or y.empty:
+                continue
+            frames.append(y.tail(max(0, need - int(n))))
+        if not frames:
+            return df
+        w = pd.concat(frames, ignore_index=True, sort=False)
+        for k in ("open", "high", "low", "close"):
+            if f"{k}_price" in d.columns and f"{k}_price" not in w.columns:
+                w[f"{k}_price"] = w[k]
+        w[_INTRADAY_WARMUP_COL] = True
+        if _INTRADAY_WARMUP_COL not in d.columns:
+            d[_INTRADAY_WARMUP_COL] = False
+        out = pd.concat([w, d], ignore_index=True, sort=False)
+        out = out.sort_values(["symbol", "datetime"], kind="stable").reset_index(drop=True)
+        logger.warning(
+            "[IND YAHOO TODAY WARMUP] applied interval=%s symbols=%s yahoo_rows=%s need=%s save=0",
+            name, len(frames), len(w), need,
+        )
+        return out
+    except Exception:
+        logger.debug("[IND YAHOO TODAY WARMUP] failed interval=%s", interval, exc_info=True)
+        return df
+
+
 def _prevday_warmup_skip_intervals() -> frozenset[str]:
     """前日ウォームアップを走らせない interval。既定は 1 分足。
 
@@ -1644,6 +1711,7 @@ def add_all_indicators(
     _syms_in = _ind_safe_nunique(df, "symbol")
 
     df = _with_intraday_warmup(df, interval=interval)
+    df = _with_yahoo_today_warmup(df, interval=interval)
     _p1 = _ind_perf.perf_counter()
     _rows_intraday = _ind_safe_len(df)
 
