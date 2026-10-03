@@ -422,6 +422,13 @@ def start_force_cancel_loop(interval_sec=30):
 
                 if not order_id:
                     continue
+                # 2026-10-03: 急騰銘柄の空売り (SURGE_SHORT) が証券会社に置いた損切りの逆指値は取消さない
+                try:
+                    from trading.strategies.surge_short import protected_order_ids
+                    if str(order_id) in protected_order_ids():
+                        continue
+                except Exception:
+                    pass
 
                 is_limit = price not in (0, None)
                 is_open = qty and cum < qty

@@ -73,7 +73,12 @@ def cfg() -> Dict[str, Any]:
         "max_premium_pct": _env_f("SURGE_SHORT_MAX_PREMIUM_PCT", 0.40),
         "retry_sec": _env_f("SURGE_SHORT_RETRY_SEC", 180.0),
         # 2026-10-03: 踏み上げ対策。ストップ高まで この % 以上残っている時だけ売る。
-        "min_limit_dist_pct": _env_f("SURGE_SHORT_MIN_LIMIT_DIST_PCT", 8.0),
+        "min_limit_dist_pct": _env_f("SURGE_SHORT_MIN_LIMIT_DIST_PCT", 3.0),
+        # 2026-10-03: 利確 (建値から -5%) と、証券会社側の逆指値 (損切り) を使う。
+        "take_profit_pct": _env_f("SURGE_SHORT_TAKE_PROFIT_PCT", 5.0),
+        "broker_stop": _env_on("SURGE_SHORT_BROKER_STOP", True),
+        "backup_stop_pct": _env_f("SURGE_SHORT_BACKUP_STOP_PCT", 7.0),
+        "force_close": _hm("SURGE_SHORT_FORCE_CLOSE", "15:20"),
     }
 
 
@@ -82,7 +87,9 @@ def cfg() -> Dict[str, Any]:
 #   TradingView 5 分足 5,390 回: 空売り後 14:50 以降ずっとストップ高に張り付いたのは 5.1%。
 #   張り付くと当日中に買い戻せず、翌日寄りで建値比 平均 +9.0% (90% 点 +18%、最悪 +176%) の損。
 #   張り付き率は ストップ高までの残りが 5% 以下で 6.6%、5〜8% で 3.5%、8〜12% で 2.7%、12〜20% で 1.1%。
-#   損切り (+5%) がストップ高より手前で必ず発動するよう、残り 8% 以上を条件にする。
+#   張り付いた時の損も含めた 60 分損益: 制限なし +1.59% (最悪 -16.4%) / 残り 3% 以上 +1.12% (最悪 -7.0%)
+#   / 5% 以上 +0.79% / 8% 以上 +0.55%。ユーザー判断で 3% 以上 (10/3)。
+#   損切りの逆指値はストップ高の 1 刻み手前を上限にする (ストップ高に張り付く前に発動させる)。
 # ------------------------------------------------------------
 _PRICE_LIMITS = [
     (100, 30), (200, 50), (500, 80), (700, 100), (1000, 150), (1500, 300), (2000, 400),
@@ -289,20 +296,118 @@ def _try_entry(sym: str, v: Dict[str, Any], st: Dict[str, Any], now: dt.datetime
               "premium_pct": round(prem_pct, 3), "chg": float(v.get("change_percentage") or 0), "trading_value": tv}
     if not oid:
         return "skipped", "send_failed", detail
-    st.setdefault("trades", {})[sym] = {"order_ts": _ts(now), "order_id": str(oid), "price": bid, "qty": qty, **detail}
+    st.setdefault("trades", {})[sym] = {"order_ts": _ts(now), "order_id": str(oid), "price": bid, "qty": qty,
+                                        "limit_up": limit_up_price(prev_close) if prev_close > 0 else 0.0, **detail}
     return "ordered", "ok", {**detail, "order_id": str(oid)}
 
 
 # ------------------------------------------------------------
 # 決済 (exit_loop から呼ぶ)
+#   約定を見つけたら証券会社に「買い戻しの逆指値」を置く (建値 +5%、発動後は成行)。
+#   システムが止まっても取引所側で損切りされる。kabu には OCO が無いので、利確 (-5%) と
+#   時間決済 (60 分 / 15:20) はシステムが監視し、逆指値を取消してから買い戻す。
+#   逆指値を置けなかった時と、+7% でもまだ建玉が残っている時はシステムが成行で損切りする。
 # ------------------------------------------------------------
+def _broker_short_qty(symbol: str) -> Optional[int]:
+    """証券会社の建玉一覧から、この銘柄の売り建て残数。読めなければ None。"""
+    try:
+        from kabu_api.positions import get_positions
+        rows = get_positions()
+        if not isinstance(rows, list):
+            return None
+        q = 0
+        for r in rows:
+            if not isinstance(r, dict) or str(r.get("Symbol") or "") != str(symbol):
+                continue
+            if str(r.get("Side")) != "1":   # 1=売建
+                continue
+            q += int(float(r.get("LeavesQty") or 0))
+        return q
+    except Exception:
+        logger.warning("[SURGE SHORT] broker positions read failed symbol=%s", symbol, exc_info=True)
+        return None
+
+
+def _tick_up(price: float):
+    import math
+    try:
+        from utils_common import get_order_tick_size
+        t = float(get_order_tick_size(price))
+    except Exception:
+        t = 1.0
+    return math.ceil(price / t - 1e-9) * t, t
+
+
+def _place_broker_stop(symbol: str, pos: Dict[str, Any], t: Dict[str, Any], entry: float, c: Dict[str, Any]) -> Optional[str]:
+    qty = _broker_short_qty(symbol)
+    if not qty:
+        logger.warning("[SURGE SHORT] broker stop skipped (no broker short qty) symbol=%s qty=%s", symbol, qty)
+        return None
+    trig, tick = _tick_up(entry * (1 + c["stop_pct"] / 100.0))
+    lu = float(t.get("limit_up") or 0)
+    if lu > 0 and trig >= lu:
+        trig = lu - tick
+    try:
+        from kabu_api.close import Password
+        from kabu_api.send_order import send_order_common
+        exch = int(float((pos or {}).get("exchange") or 1))
+        if exch == 9:   # SOR は返済に使えない
+            exch = 1
+        mtt = int(float((pos or {}).get("margin_trade_type") or 3))
+        payload = {
+            "Password": Password, "Symbol": str(symbol), "Exchange": exch, "SecurityType": 1,
+            "Side": "2", "CashMargin": 3, "MarginTradeType": mtt, "DelivType": 2,
+            "AccountType": int(float((pos or {}).get("account_type") or 4)),
+            "Qty": int(qty), "ClosePositionOrder": 0,
+            "FrontOrderType": 30, "Price": 0, "ExpireDay": 0,
+            "ReverseLimitOrder": {"TriggerSec": 1, "TriggerPrice": float(trig), "UnderOver": 2,
+                                  "AfterHitOrderType": 1, "AfterHitPrice": 0},
+        }
+        res = send_order_common(payload)
+        oid = (res or {}).get("OrderId") if isinstance(res, dict) else None
+        logger.warning("[SURGE SHORT] broker stop %s symbol=%s qty=%s trigger=%.1f entry=%.1f limit_up=%.1f res=%s",
+                       "PLACED" if oid else "FAILED", symbol, qty, trig, entry, lu, res)
+        return str(oid) if oid else None
+    except Exception:
+        logger.exception("[SURGE SHORT] broker stop send failed symbol=%s", symbol)
+        return None
+
+
+def _cancel(order_id: str, symbol: str, reason: str) -> bool:
+    try:
+        from kabu_api.cancel_order import cancel_order_common
+        return bool(cancel_order_common(order_id, symbol=symbol, reason=reason))
+    except Exception:
+        logger.exception("[SURGE SHORT] cancel failed oid=%s", order_id)
+        return False
+
+
+def _update_trade(symbol: str, **kw) -> None:
+    with _LOCK:
+        st = _load()
+        tt = st.get("trades", {}).get(str(symbol))
+        if tt is not None:
+            tt.update(kw)
+            _save(st)
+
+
+def protected_order_ids() -> set:
+    """force_cancel_loop が取消してはいけない注文 (この戦略の逆指値)。"""
+    try:
+        with _LOCK:
+            st = _load()
+        return {str(t.get("stop_oid")) for t in (st.get("trades") or {}).values() if t.get("stop_oid")}
+    except Exception:
+        return set()
+
+
 def handle_exit(symbol: str, pos: Dict[str, Any], now: Optional[dt.datetime] = None) -> Optional[bool]:
     """この戦略の建玉なら True/False を返す (呼び出し側は以降の決済ルールを通さない)。
     この戦略の建玉でなければ None。"""
     try:
         with _LOCK:
             st = _load()
-            t = (st.get("trades") or {}).get(str(symbol))
+            t = dict((st.get("trades") or {}).get(str(symbol)) or {})
         if not t or t.get("closed"):
             return None
         side = str((pos or {}).get("side") or "").upper()
@@ -317,24 +422,48 @@ def handle_exit(symbol: str, pos: Dict[str, Any], now: Optional[dt.datetime] = N
         price = float(price or 0)
         if entry <= 0 or price <= 0:
             return False
+
+        # 約定後はじめて見えたら証券会社に逆指値を置く (3 回まで試す)
+        if c["broker_stop"] and not t.get("stop_oid") and int(t.get("stop_attempts") or 0) < 3:
+            oid = _place_broker_stop(symbol, pos, t, entry, c)
+            t["stop_attempts"] = int(t.get("stop_attempts") or 0) + 1
+            t["stop_oid"] = oid
+            _update_trade(symbol, stop_attempts=t["stop_attempts"], stop_oid=oid, entry_fill=entry)
+
+        stop_oid = t.get("stop_oid")
+        # 逆指値の発動ラインを超えたら、証券会社側で約定済みか確かめて記録を閉じる
+        if stop_oid and price >= entry * (1 + c["stop_pct"] / 100.0) and _broker_short_qty(symbol) == 0:
+            logger.warning("[SURGE SHORT] broker stop filled symbol=%s entry=%.1f price=%.1f", symbol, entry, price)
+            _update_trade(symbol, closed=True, exit_ts=_ts(now), exit_price=price, exit_reason="BROKER_STOP")
+            return True
         reason = None
-        if price >= entry * (1 + c["stop_pct"] / 100.0):
-            reason = f"SURGE_SHORT_STOP pct={c['stop_pct']:.1f} entry={entry:.1f} price={price:.1f}"
+        if not stop_oid and price >= entry * (1 + c["stop_pct"] / 100.0):
+            reason = f"SURGE_SHORT_STOP pct={c['stop_pct']:.1f} entry={entry:.1f} price={price:.1f} (system)"
+        elif stop_oid and price >= entry * (1 + c["backup_stop_pct"] / 100.0):
+            reason = f"SURGE_SHORT_BACKUP_STOP pct={c['backup_stop_pct']:.1f} entry={entry:.1f} price={price:.1f}"
+        elif c["take_profit_pct"] > 0 and price <= entry * (1 - c["take_profit_pct"] / 100.0):
+            reason = f"SURGE_SHORT_TAKE_PROFIT pct={c['take_profit_pct']:.1f} entry={entry:.1f} price={price:.1f}"
         elif now >= _pt(t["order_ts"]) + dt.timedelta(minutes=c["hold_min"]):
             reason = f"SURGE_SHORT_TIME hold={c['hold_min']:.0f}m entry={entry:.1f} price={price:.1f}"
+        elif now.time() >= c["force_close"]:
+            reason = f"SURGE_SHORT_FORCE_CLOSE at={c['force_close']} entry={entry:.1f} price={price:.1f}"
         if not reason:
             return False
+
+        # 逆指値を取消してから、建玉が残っていることを確かめて買い戻す (二重返済しない)
+        if stop_oid:
+            _cancel(stop_oid, symbol, reason.split()[0].lower())
+        left = _broker_short_qty(symbol)
+        if left == 0:
+            logger.warning("[SURGE SHORT] no broker short left (broker stop filled?) symbol=%s reason=%s", symbol, reason)
+            _update_trade(symbol, closed=True, exit_ts=_ts(now), exit_reason="BROKER_STOP_OR_GONE")
+            return True
         from trading.exit.exit_finalize import finalize_exit
         pnl = entry - price
         finalize_exit(symbol=symbol, price=price, reason=reason, cluster_id=0, regime=0, inago_state=0,
                       pnl=pnl, collapse_prob=0.0, ctx=None)
         logger.warning("[SURGE SHORT] EXIT symbol=%s reason=%s pnl_per_share=%.1f", symbol, reason, pnl)
-        with _LOCK:
-            st = _load()
-            tt = st.get("trades", {}).get(str(symbol))
-            if tt is not None:
-                tt.update(closed=True, exit_ts=_ts(now), exit_price=price, exit_reason=reason.split()[0])
-                _save(st)
+        _update_trade(symbol, closed=True, exit_ts=_ts(now), exit_price=price, exit_reason=reason.split()[0])
         return True
     except Exception:
         logger.exception("[SURGE SHORT] handle_exit failed symbol=%s", symbol)
@@ -370,4 +499,4 @@ def register_scheduler_safe() -> bool:
         return False
 
 
-__all__ = ["run_cycle", "handle_exit", "register_scheduler_safe", "cfg"]
+__all__ = ["run_cycle", "handle_exit", "register_scheduler_safe", "cfg", "protected_order_ids", "limit_up_price"]
