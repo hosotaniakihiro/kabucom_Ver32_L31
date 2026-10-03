@@ -714,16 +714,20 @@ def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.
         if pd.isna(latest_slot) or latest_slot.date() != today_date(now=now_i):
             logger.warning("[PUSH RAW DB FALLBACK] reject old latest_slot interval=%s latest_slot=%s today=%s", interval_i, latest_slot, today_date(now=now_i))
             return pd.DataFrame()
+        # 2026-10-03: stream_data の volume / trading_value は PUSH の当日累計 (TradingVolume)。
+        #   以前は最新の足の max をそのまま出来高にしていたので、この経路の足は「当日の累計」が
+        #   1 本の出来高になり、殿様イナゴの出来高急増倍率が 95 倍・8,975 倍のような値になっていた
+        #   (10/2 の 4462: 12:24/12:26/12:28 の足がすべて 49,900)。
+        #   1 本の出来高 = 足の中の累計の最大 - 直前の足までの累計の最大。直前が読込範囲に無ければ 足の中の 最大 - 最小。
+        for _c in ("volume", "trading_value"):
+            if _c in df.columns:
+                df[_c] = _safe_to_num(df[_c]).fillna(0.0)
+            else:
+                df[_c] = 0.0
+        _before = df[df["slot"] < latest_slot]
+        _prev_cum = _before.groupby("symbol")[["volume", "trading_value"]].max()
         df = df[df["slot"] == latest_slot].copy()
         df = df.sort_values(["symbol", "datetime"])
-        if "volume" in df.columns:
-            df["volume"] = _safe_to_num(df["volume"]).fillna(0.0)
-        else:
-            df["volume"] = 0.0
-        if "trading_value" in df.columns:
-            df["trading_value"] = _safe_to_num(df["trading_value"]).fillna(0.0)
-        else:
-            df["trading_value"] = 0.0
         if "symbolname" not in df.columns:
             df["symbolname"] = ""
 
@@ -738,7 +742,14 @@ def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.
             "close": grouped["price"].last(),
             "volume": grouped["volume"].max(),
             "trading_value": grouped["trading_value"].max(),
+            "_cum_min_volume": grouped["volume"].min(),
+            "_cum_min_trading_value": grouped["trading_value"].min(),
         }).reset_index(drop=True)
+        for _c in ("volume", "trading_value"):
+            _prev = out["symbol"].map(_prev_cum[_c]) if not _prev_cum.empty else pd.Series(float("nan"), index=out.index)
+            _base = _prev.where(_prev.notna() & (_prev > 0), out[f"_cum_min_{_c}"])
+            out[_c] = (out[_c] - _base).clip(lower=0.0)
+        out = out.drop(columns=["_cum_min_volume", "_cum_min_trading_value"])
         out = _same_day_push_rows(out, now_i=now_i, label=f"raw_db.out.interval{interval_i}")
         if out.empty or not _latest_is_today(out, now_i=now_i, label=f"raw_db.out.interval{interval_i}"):
             return pd.DataFrame()
