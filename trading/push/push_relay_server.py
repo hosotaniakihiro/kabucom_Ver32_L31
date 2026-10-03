@@ -241,6 +241,53 @@ def _must_local_symbols() -> List[str]:
     return out
 
 
+# ------------------------------------------------------------
+# 本番の口座 50 枠の入れ替え (2026-10-03 ユーザー判断: 入れ替え型)
+#   時分割ローテーション (A/B) は 9/18 実測で各銘柄の観測率 13% (実効は固定 50 の 1/4) だったので使わない。
+#   常に 50 銘柄を同時に受け、優先順は
+#     1) 保有中・発注中   2) 入れてから PUSH_LOCAL_MIN_STAY_SEC (既定 600 秒) 未満 (最大 40 枠)
+#     3) 候補の上位順 (残っている銘柄・新しく出てきた銘柄)。新顔のために PUSH_LOCAL_NEW_SLOTS (既定 10) 枠は空けておく
+#   入れて 10 分を過ぎ、上位から外れた銘柄は外す。
+# ------------------------------------------------------------
+_local_added_at: dict = {}
+
+
+def _sticky_local(must: List[str], targets: List[str], exclude: List[str]) -> List[str]:
+    now = time.time()
+    min_stay = float(os.getenv("PUSH_LOCAL_MIN_STAY_SEC", "600") or 600)
+    ex = set(exclude or [])
+    cand = [s for s in targets if s not in ex]
+    cand_set = set(cand)
+    current = [s for s in _local_added_at if s not in ex]
+    out: List[str] = []
+
+    def add(s):
+        if s and s not in out and s not in ex and len(out) < LOCAL_LIMIT:
+            out.append(s)
+
+    # 新しく上位に出てきた銘柄のための枠 (急騰・出来高急増を 10 分待たせない)
+    new_slots = int(float(os.getenv("PUSH_LOCAL_NEW_SLOTS", "10") or 10))
+    sticky_cap = max(0, LOCAL_LIMIT - new_slots)
+    for s in must:
+        add(s)
+    for s in sorted(current, key=lambda x: _local_added_at[x]):      # 2) 最低滞在時間内 (新顔の枠は残す)
+        if len(out) >= sticky_cap:
+            break
+        if now - _local_added_at[s] < min_stay:
+            add(s)
+    for s in cand:                                                    # 3) 候補順: 残っている銘柄も新顔も
+        add(s)
+    for s in list(_local_added_at):
+        if s not in out:
+            _local_added_at.pop(s, None)
+    for s in out:
+        _local_added_at.setdefault(s, now)
+    removed_new = [s for s in out if s not in cand_set and s not in must]
+    if removed_new and len(removed_new) > 0:
+        logger.debug("[PUSH LOCAL STICKY] kept_by_min_stay=%s", removed_new[:10])
+    return out
+
+
 def split_targets_for_relay(targets: List[str]) -> List[str]:
     """登録対象を 自分の口座 (戻り値、最大 50) と 中継 (最大 50) に分ける。
     常連が計算済みで中継がつながっていれば、常連 (保有中・発注中を除く) を中継へ、
@@ -252,15 +299,11 @@ def split_targets_for_relay(targets: List[str]) -> List[str]:
         #   中継が止まると常連の PUSH は途切れる。保有中の価格は exit_price_source の broker フォールバックで取る。
         remote = list(_regulars[:REMOTE_LIMIT])
         must = [s for s in _must_local_symbols() if s not in remote]
-        local: List[str] = []
-        for s in must + targets:
-            if s not in remote and s not in local:
-                local.append(s)
-        local = local[:LOCAL_LIMIT]
+        local = _sticky_local(must, targets, exclude=remote)
         set_remote_symbols(remote)
         return local
-    local = targets[:LOCAL_LIMIT]
-    remote = [s for s in targets[LOCAL_LIMIT:LOCAL_LIMIT + REMOTE_LIMIT] if s not in local]
+    local = _sticky_local(_must_local_symbols(), targets, exclude=[])
+    remote = [s for s in targets if s not in local][:REMOTE_LIMIT]
     if _started:
         set_remote_symbols(remote if is_connected() else [])
     return local
