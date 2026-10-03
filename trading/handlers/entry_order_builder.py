@@ -3052,7 +3052,7 @@ def _rfb_get_token() -> str | None:
         return None
 
 
-def _rfb_fetch_board(symbol: str, *, force: bool = False) -> dict | None:
+def _rfb_fetch_board_rest(symbol: str, *, force: bool = False) -> dict | None:
     now = time.monotonic()
     cache_sec = _rfb_env_float("ENTRY_REST_FULL_BOARD_CACHE_SEC", 0.8)
     cached = _RFB_CACHE.get(symbol)
@@ -3114,6 +3114,62 @@ def _rfb_fetch_board(symbol: str, *, force: bool = False) -> dict | None:
              "under_buy_qty": _rfb_safe_float(raw.get("UnderBuyQty"))}
     _RFB_CACHE[symbol] = (now, board)
     return dict(board)
+
+
+def _rfb_board_from_push_db(symbol: str) -> dict | None:
+    """2026-10-03: REST /board が使えない銘柄 (2 つ目の口座の中継で受けている銘柄など) は、
+    ローカル push DB の最新ティックの 10 本板で代わりに判定する。古すぎる (既定 15 秒) なら使わない。"""
+    if str(os.getenv("ENTRY_PUSH_BOARD_FALLBACK_ENABLED", "1")).strip().lower() in ("0", "false", "no", "off"):
+        return None
+    try:
+        import sqlite3
+        import datetime as _dt
+        from trading.push.push_db_location import push_db_path
+        p = push_db_path()
+        if not p or not os.path.exists(str(p)):
+            return None
+        cols = ", ".join([f"Buy{i}Price, Buy{i}Qty, Sell{i}Price, Sell{i}Qty" for i in range(1, 11)])
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=1.0)
+        try:
+            r = con.execute(f"SELECT datetime, OverSellQty, UnderBuyQty, {cols} FROM stream_data "
+                            "WHERE symbol=? ORDER BY rowid DESC LIMIT 1", (str(symbol),)).fetchone()
+        finally:
+            con.close()
+        if not r:
+            return None
+        ts = _dt.datetime.fromisoformat(str(r[0])[:26])
+        age = (_dt.datetime.now() - ts).total_seconds()
+        if age > _rfb_env_float("ENTRY_PUSH_BOARD_MAX_AGE_SEC", 15.0):
+            return None
+        bids, asks = [], []
+        for i in range(10):
+            bp, bq, ap, aq = r[3 + i * 4: 7 + i * 4]
+            if bp and bq and float(bp) > 0 and float(bq) > 0:
+                bids.append({"level": i + 1, "price": float(bp), "qty": float(bq)})
+            if ap and aq and float(ap) > 0 and float(aq) > 0:
+                asks.append({"level": i + 1, "price": float(ap), "qty": float(aq)})
+        if not bids or not asks:
+            return None
+        bid, ask = bids[0]["price"], asks[0]["price"]
+        if bid > ask:
+            bid, ask = ask, bid
+        if not (ask > bid > 0):
+            return None
+        return {"bid": bid, "ask": ask, "bids": bids, "asks": asks, "source": "push_db_board", "force": False,
+                "age_sec": round(age, 2), "over_sell_qty": float(r[1] or 0), "under_buy_qty": float(r[2] or 0)}
+    except Exception:
+        logger.debug("[REST FULL BOARD] push db board fallback failed symbol=%s", symbol, exc_info=True)
+        return None
+
+
+def _rfb_fetch_board(symbol: str, *, force: bool = False) -> dict | None:
+    board = _rfb_fetch_board_rest(symbol, force=force)
+    if board:
+        return board
+    fb = _rfb_board_from_push_db(symbol)
+    if fb:
+        logger.info("[REST FULL BOARD] push db board fallback symbol=%s age=%.1fs bid=%s ask=%s", symbol, fb["age_sec"], fb["bid"], fb["ask"])
+    return fb
 
 
 def _rfb_sum_qty(levels: list[dict], n: int) -> float:

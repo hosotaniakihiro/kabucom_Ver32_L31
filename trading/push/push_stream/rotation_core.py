@@ -429,6 +429,12 @@ def _rotation_worker() -> None:
 
             ws_wait_count = 0
             targets = resolve_register_targets()
+            # 2026-10-03: 2 つ目の口座の中継があれば 51〜100 番目をそちらに回し、ここは先頭 50 だけ登録する
+            try:
+                from trading.push.push_relay_server import split_targets_for_relay
+                targets = split_targets_for_relay(list(targets or []))
+            except Exception:
+                logger.exception("[push_stream] push relay split failed")
             if not targets:
                 empty_count += 1
                 if empty_count == 1 or empty_count % 15 == 0:

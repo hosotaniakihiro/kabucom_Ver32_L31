@@ -956,6 +956,12 @@ _PUSH_START_RETRY_SEC = float(os.environ.get("PUSH_START_RETRY_SEC", "20"))
 
 def run_forever() -> int:
     logger.info("[PUSH RUNTIME] START")
+    # 2026-10-03: 2 つ目の口座 (別 PC) の PUSH 中継の受信口 (settings.ini [push_relay])
+    try:
+        from trading.push.push_relay_server import start_relay_server_safe
+        start_relay_server_safe()
+    except Exception:
+        logger.exception("[PUSH RUNTIME] push relay server start failed")
     _trace = _push_start_trace()
     if _trace:
         _trace.trace(1, entrypoint="data_collectors.push_runtime.run_forever")

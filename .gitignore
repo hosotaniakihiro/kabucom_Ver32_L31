@@ -136,3 +136,7 @@ _backup_*/
 
 # トークン発行のランタイム情報 (token_tail / pid)。毎起動で書き換わる
 settings.ini.token_meta.json
+
+# 2026-10-03: PUSH 中継の設定 (2 つ目の口座の API パスワード)
+ops/push_relay/relay_agent.ini
+ops/push_relay/relay_agent.log*

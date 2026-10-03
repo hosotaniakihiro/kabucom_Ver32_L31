@@ -1,0 +1,13 @@
+# relay_agent.ini.example -> relay_agent.ini にコピーして編集する (relay_agent.ini は git に入れない)
+[kabu]
+# この PC の kabu Station の API パスワード (2 つ目の口座で設定したもの)
+api_password =
+port = 18080
+
+[main]
+# 本番 PC の LAN 上の IP アドレス (例: 192.168.0.10)
+host =
+port = 18090
+# 本番 PC の settings.ini [push_relay] secret と同じ文字列 (16 文字以上)
+secret =
+name = pc2
