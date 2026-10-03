@@ -430,6 +430,18 @@ def resolve_monitor_symbols() -> list[str]:
     #   無く、set の順序任せ (= 銘柄コード順) になる。
     merged = _sort_by_momentum(_d(merged))[:max_keep]
 
+    # 2026-10-03 (ユーザー要望): 前日の材料株 (株探【明日の好悪材料】) と夜間 PTS で動いた銘柄を、
+    #   朝 (既定 8:00〜10:00) は先頭に入れて確実に監視する。取得は materials_watch が裏で 1 日 1 回。
+    try:
+        from trading.watch import materials_watch as _mw
+
+        _pri = _mw.watch_symbols()
+        if _pri:
+            merged = _d(list(_pri) + merged)[:max_keep]
+            logger.info("[PUSH ROTATION TARGET TOPUP] materials watch first=%s", _pri)
+    except Exception:
+        logger.debug("[PUSH ROTATION TARGET TOPUP] materials watch failed", exc_info=True)
+
     if merged:
         level = logger.warning if len(merged) < min_keep else logger.info
         level(
