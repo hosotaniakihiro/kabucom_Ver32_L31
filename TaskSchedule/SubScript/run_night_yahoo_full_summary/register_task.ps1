@@ -21,7 +21,7 @@
 # ============================================================
 param(
     [string]$TaskName = "NightYahooDailyFullSummary",
-    [string]$Time     = "20:00",
+    [string]$Time     = "16:00",
     [switch]$WhatIf
 )
 
