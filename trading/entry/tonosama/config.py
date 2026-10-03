@@ -169,7 +169,26 @@ MIN_INTRABAR_RANGE_PCT = _env_float_floor("TONOSAMA_MIN_INTRABAR_RANGE_PCT", 0.1
 #     **最新の確定 1 分足の売買代金** = _latest_volume x close。
 #     turnover 列がある場合はそれを優先する。
 MIN_LATEST_VOLUME = _env_float_floor("TONOSAMA_MIN_LATEST_VOLUME", 10000.0, 10000.0)
-MIN_LATEST_TURNOVER = _env_float_floor("TONOSAMA_MIN_LATEST_TURNOVER", 3_000_000.0, 3_000_000.0)
+MIN_LATEST_TURNOVER = _env_float_floor("TONOSAMA_MIN_LATEST_TURNOVER", 20_000_000.0, 3_000_000.0)
+# 2026-10-03 (ユーザー判断): 直近 1 本の出来高は「株数」でなく「売買代金」で見る。
+#   株数だと 1 万円の銘柄で 3 万株 = 3 億円、100 円の銘柄なら 300 万円で通り、値がさ株がまず通らない
+#   (10/1〜10/2 は殿様イナゴ候補の 118/121 件が株数 3 万株未満で落ちていた)。
+#   既定は株数の下限を使わず MIN_LATEST_TURNOVER (直近 1 本の売買代金、既定 2,000 万円) だけ。
+#   従来の株数の下限に戻す: TONOSAMA_LATEST_VOLUME_SHARE_GUARD=1
+LATEST_VOLUME_SHARE_GUARD = str(os.getenv("TONOSAMA_LATEST_VOLUME_SHARE_GUARD", "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def latest_value_ok(volume, price) -> bool:
+    """直近 1 本の出来高の下限判定 (既定は売買代金 = 出来高 x 株価 >= MIN_LATEST_TURNOVER)。"""
+    try:
+        v, p = float(volume or 0.0), float(price or 0.0)
+    except Exception:
+        return False
+    if LATEST_VOLUME_SHARE_GUARD:
+        return v >= MIN_LATEST_VOLUME
+    if p <= 0:
+        return v > 0
+    return v * p >= MIN_LATEST_TURNOVER
 
 # ------------------------------------------------------------
 # BUY buying climax / high-chase guard

@@ -879,7 +879,9 @@ def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
     if "close" in x.columns:
         before = x.copy(); x = x[_num_series(x, "close") > MIN_PRICE]
         _log_filter_step(stage="primary", before=before, after=x, reason="close_below_min_price", threshold={"MIN_PRICE": MIN_PRICE}, sample_cols=sample_cols)
-    before = x.copy(); x = x[_num_series(x, "_latest_volume") >= MIN_LATEST_VOLUME]
+    # 2026-10-03: 株数の下限は既定で使わない (config.LATEST_VOLUME_SHARE_GUARD)。下の売買代金の下限で見る。
+    from .config import LATEST_VOLUME_SHARE_GUARD as _SHARE_GUARD
+    before = x.copy(); x = x[_num_series(x, "_latest_volume") >= (MIN_LATEST_VOLUME if _SHARE_GUARD else 1.0)]
     _log_filter_step(stage="primary", before=before, after=x, reason="latest_volume_low_flat_alert_guard", threshold={"MIN_LATEST_VOLUME": MIN_LATEST_VOLUME}, sample_cols=sample_cols)
     # 売買代金 (最新1分足) の下限。出来高だけだと低位株が通ってしまう。
     # _latest_turnover は _ensure_actual_movement_cols_core が必ず作るので

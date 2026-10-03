@@ -185,7 +185,14 @@ def _range_rescue_ok(features: dict, *, side: str, min_surge: float, effective_s
     reject_zero_5s = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", False)
     reject_same_climax = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_SAME_SIDE_CLIMAX", True)
 
-    base_ok = max_surge >= min_surge and rng >= min_range and vol >= min_volume
+    # 2026-10-03: 出来高は株数でなく売買代金で見る (config.latest_value_ok)。株数に戻す: TONOSAMA_LATEST_VOLUME_SHARE_GUARD=1
+    try:
+        from .config import latest_value_ok as _lv_ok, LATEST_VOLUME_SHARE_GUARD as _share
+        _px = safe_float(features.get("close"), 0.0) or safe_float(features.get("price"), 0.0) or safe_float(features.get("close_price"), 0.0)
+        vol_ok = (vol >= min_volume) if _share else _lv_ok(vol, _px)
+    except Exception:
+        vol_ok = vol >= min_volume
+    base_ok = max_surge >= min_surge and rng >= min_range and vol_ok
     if not base_ok:
         return False, f"range_rescue_base_ng surge={max_surge:.2f} range={rng:.3f} vol={vol:.0f}"
 

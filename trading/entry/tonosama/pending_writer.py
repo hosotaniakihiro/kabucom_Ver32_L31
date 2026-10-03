@@ -486,6 +486,10 @@ def _effective_zero_5sec_guard() -> tuple[bool, float]:
     モジュール定数を書き換えていた。読み手はこの guard 1 箇所だけなので、
     定数を破壊せずここで実効値に落とす。
     """
+    # 2026-10-03 (ユーザー判断): 検証に無い条件なので既定で外す (10/1〜10/2 は 44 件がこれで落ちていた)。
+    #   戻す: TONOSAMA_FINAL_5SEC_GUARD_ENABLED=1
+    if not _env_bool("TONOSAMA_FINAL_5SEC_GUARD_ENABLED", False):
+        return False, 0.0
     if _warning_relax_scope_enabled() and _relax_env_bool("TONOSAMA_FINAL_5SEC_OPTIONAL", True):
         return False, 0.0
     return REJECT_ZERO_5SEC_FINAL, MIN_FINAL_5SEC_CHANGE_PCT
@@ -837,9 +841,12 @@ def _climax_reject_reason_core(entry: dict[str, Any]) -> tuple[str | None, dict[
         cond = entry.get("entry_conditions") or {}
         side = str(entry.get("side") or cond.get("side") or "BUY").upper()
         symbol = normalize_symbol(entry.get("symbol"))
-        ma_reject, ma_info = _ranking_ma_reject_reason(symbol, side)
-        if ma_reject:
-            return ma_reject, ma_info
+        # 2026-10-03 (ユーザー判断): 検証 (出来高 10 倍・値動き 0.2〜1.2%・足の形) に無い条件なので既定で外す。
+        #   10/1〜10/2 は 53 件がこれで落ちていた。戻す: TONOSAMA_RANKING_MA_GUARD_ENABLED=1
+        if _env_bool("TONOSAMA_RANKING_MA_GUARD_ENABLED", False):
+            ma_reject, ma_info = _ranking_ma_reject_reason(symbol, side)
+            if ma_reject:
+                return ma_reject, ma_info
 
         surge = safe_float(cond.get("max_volume_surge_ratio"), 0.0)
         price_chg = safe_float(cond.get("max_price_change_pct"), 0.0)
@@ -857,7 +864,9 @@ def _climax_reject_reason_core(entry: dict[str, Any]) -> tuple[str | None, dict[
         dn3 = int(safe_float(cond.get("prev_3m_down_streak"), 0.0))
         dn5 = int(safe_float(cond.get("prev_5m_down_streak"), 0.0))
 
-        if latest_volume < MIN_FINAL_LATEST_VOLUME:
+        from .config import latest_value_ok as _lv_ok, LATEST_VOLUME_SHARE_GUARD as _share
+        _px = safe_float(entry.get("price"), 0.0) or safe_float(cond.get("close"), 0.0)
+        if (_share and latest_volume < MIN_FINAL_LATEST_VOLUME) or (not _share and not _lv_ok(latest_volume, _px)):
             return "latest_volume_low_final_guard", ma_info
 
         reject_zero_5sec, min_final_5sec = _effective_zero_5sec_guard()
@@ -1013,10 +1022,17 @@ def _alert_liq_should_reject(entry: dict[str, Any]) -> tuple[bool, str, dict[str
 
     if reject_missing and latest_volume <= 0 and volume_3m <= 0 and volume_5m <= 0:
         return True, "alert_volume_missing", detail
-    if latest_volume < min_latest_volume:
-        return True, "alert_latest_volume_low", detail
-    if recent_bar_volume < min_recent_bar_volume:
-        return True, "alert_recent_bar_volume_low", detail
+    # 2026-10-03: 株数の下限は既定で使わず、直近 1 本の売買代金で見る (config.latest_value_ok)。
+    from .config import latest_value_ok as _lv_ok, LATEST_VOLUME_SHARE_GUARD as _share, MIN_LATEST_TURNOVER as _min_lt
+    detail["latest_value"] = latest_volume * price
+    detail["min_latest_value"] = _min_lt
+    if _share:
+        if latest_volume < min_latest_volume:
+            return True, "alert_latest_volume_low", detail
+        if recent_bar_volume < min_recent_bar_volume:
+            return True, "alert_recent_bar_volume_low", detail
+    elif not _lv_ok(latest_volume, price):
+        return True, "alert_latest_value_low", detail
     if turnover < min_turnover:
         return True, "alert_turnover_low", detail
     return False, "ok", detail
