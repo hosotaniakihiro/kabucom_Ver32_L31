@@ -8,8 +8,9 @@
 # 自分の websocket から届いたものと同じ on_message に流す (DB 保存・5 秒足・最新値すべて共通)。
 #
 # 銘柄の割り振り (rotation_core から split_targets_for_relay を呼ぶ):
-#   登録対象を最大 100 銘柄まで解決し、先頭 50 (保有中などの保護銘柄が先) を自分の口座、
-#   51〜100 番目を中継に回す。中継がつながっていなければ従来どおり 50 銘柄だけ。
+#   中継がつながっていて常連が計算済みなら: 常連 50 (保有中・発注中を除く) を中継、
+#   本番の口座は 保有中・発注中 → 入れ替わる候補 (常連以外) で 50。
+#   常連の計算前は 先頭 50 を自分、51〜100 番目を中継。中継がなければ従来どおり 50 銘柄だけ。
 #
 # 中継とのやりとり (改行区切りの JSON、TCP):
 #   中継 -> ここ : {"type":"hello","secret":"...","name":"..."} / {"type":"push","data":{kabu PUSH}} / {"type":"ping"}
@@ -75,9 +76,97 @@ def stats() -> dict:
 # ------------------------------------------------------------
 # 銘柄の割り振り
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# 常連 50 銘柄 (2026-10-03 ユーザー判断: 常連は中継側、本番の口座は保有・発注中と入れ替わる候補に使う)
+#   直近 10 営業日の push DB で、その日に 200 ティック以上受信した日数が多い順 (同数ならティック数)。
+#   起動時に裏で計算し runtime/relay_regulars_YYYYMMDD.json に保存する。計算が済むまでは従来の割り振り。
+# ------------------------------------------------------------
+_regulars: List[str] = []
+_regulars_ready = False
+
+
+def _compute_regulars(n: int = 50, days: int = 10, min_ticks: int = 200) -> List[str]:
+    import datetime as dt
+    import glob
+    import re
+    import sqlite3
+    base = Path(os.environ.get("LOCALAPPDATA") or str(Path.home())) / "autostock"
+    cache = base / "runtime" / f"relay_regulars_{dt.date.today():%Y%m%d}.json"
+    try:
+        if cache.exists():
+            return list(json.loads(cache.read_text(encoding="utf-8")).get("symbols") or [])[:n]
+    except Exception:
+        pass
+    today = f"{dt.date.today():%Y%m%d}"
+    files = sorted(f for f in glob.glob(str(base / "push" / "push2*.db"))
+                   if re.search(r"push(\d{8})\.db$", f) and today not in f)[-days:]
+    score: dict = {}
+    for f in files:
+        try:
+            con = sqlite3.connect(f"file:{f}?mode=ro", uri=True, timeout=2.0)
+            try:
+                rows = con.execute("SELECT symbol, COUNT(*) FROM stream_data GROUP BY symbol").fetchall()
+            finally:
+                con.close()
+        except Exception:
+            continue
+        for sym, cnt in rows:
+            if not sym or int(cnt or 0) < min_ticks:
+                continue
+            d, t = score.get(str(sym), (0, 0))
+            score[str(sym)] = (d + 1, t + int(cnt))
+    out = [s for s, _ in sorted(score.items(), key=lambda kv: (-kv[1][0], -kv[1][1]))][:n]
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"symbols": out, "files": [os.path.basename(x) for x in files],
+                                     "score": {s: score[s] for s in out}}, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+    return out
+
+
+def _load_regulars_bg() -> None:
+    global _regulars, _regulars_ready
+    try:
+        n = int(os.getenv("PUSH_RELAY_REGULARS_COUNT", str(REMOTE_LIMIT)) or REMOTE_LIMIT)
+        _regulars = _compute_regulars(n=n)
+        _regulars_ready = bool(_regulars)
+        logger.warning("[PUSH RELAY] regulars ready count=%d head=%s", len(_regulars), _regulars[:10])
+    except Exception:
+        logger.exception("[PUSH RELAY] regulars compute failed")
+
+
+def _must_local_symbols() -> List[str]:
+    """本番の口座で必ず受ける銘柄 = 保有中 (P1) と 発注中・候補ファイル (P2)。"""
+    out: List[str] = []
+    try:
+        from trading.push.push_stream.protected_symbols import _priority_buckets
+        for label, syms in _priority_buckets():
+            if label.startswith(("P1_", "P2_")):
+                for s in syms or []:
+                    s = str(s)
+                    if s and s not in out:
+                        out.append(s)
+    except Exception:
+        logger.debug("[PUSH RELAY] protected buckets unavailable", exc_info=True)
+    return out
+
+
 def split_targets_for_relay(targets: List[str]) -> List[str]:
-    """登録対象を 自分の口座 (戻り値、最大 50) と 中継 (最大 50) に分ける。"""
+    """登録対象を 自分の口座 (戻り値、最大 50) と 中継 (最大 50) に分ける。
+    常連が計算済みで中継がつながっていれば、常連 (保有中・発注中を除く) を中継へ、
+    本番の口座は 保有中・発注中 → 残りの候補 (常連以外) の順で埋める。"""
     targets = [str(s) for s in (targets or []) if s]
+    if _started and is_connected() and _regulars_ready:
+        must = _must_local_symbols()
+        remote = [s for s in _regulars if s not in must][:REMOTE_LIMIT]
+        local: List[str] = []
+        for s in must + targets:
+            if s not in remote and s not in local:
+                local.append(s)
+        local = local[:LOCAL_LIMIT]
+        set_remote_symbols(remote)
+        return local
     local = targets[:LOCAL_LIMIT]
     remote = [s for s in targets[LOCAL_LIMIT:LOCAL_LIMIT + REMOTE_LIMIT] if s not in local]
     if _started:
@@ -214,6 +303,7 @@ def start_relay_server_safe() -> bool:
     # 登録対象を 100 銘柄まで解決させる (先頭 50 が自分、残りが中継)
     os.environ["PUSH_ROTATION_TARGET_MAX_KEEP"] = "100"
     _started = True
+    threading.Thread(target=_load_regulars_bg, daemon=True, name="push-relay-regulars").start()
     threading.Thread(target=_server_loop, args=(c["bind"], c["port"], c["secret"]), daemon=True,
                      name="push-relay-server").start()
     return True
