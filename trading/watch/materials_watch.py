@@ -15,7 +15,7 @@
 # 使い方 (rotation_stability.resolve_monitor_symbols から):
 #   watch_symbols() が MATERIALS_WATCH_START〜MATERIALS_WATCH_END (既定 08:00〜10:00) の間だけ
 #   優先銘柄 (最大 MATERIALS_WATCH_MAX、既定 15) を返す。並びは
-#   PTS で |変化率| が大きい順 (PTS 売買代金 >= MATERIALS_WATCH_PTS_MIN_VALUE_YEN、既定 500 万円、|変化率| >= 3%)
+#   PTS で |変化率| が大きい順 (|変化率| >= 5%・PTS 売買代金 >= 3,000 万円・株価 >= 200 円)
 #   → 好材料 → 悪材料。10 時以降は通常の候補と同じ扱い (当日の変化率で並ぶ) になる。
 #   売買の判断は変えない (監視に入れるだけ)。
 # 止め方: MATERIALS_WATCH_ENABLED=0
@@ -192,8 +192,11 @@ def _non_stock_symbols() -> set:
 
 
 def _build_watch(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    min_value = float(_env("MATERIALS_WATCH_PTS_MIN_VALUE_YEN", "5000000"))
-    min_chg = float(_env("MATERIALS_WATCH_PTS_MIN_CHG_PCT", "3"))
+    # 2026-10-03 (ユーザー判断): PTS は「変動率が大きく商いも多い」銘柄だけ。
+    #   10/2 夜の実測で |変化率| >= 5%・PTS 売買代金 >= 3,000 万円・株価 >= 200 円 は 4 銘柄 (3% / 500 万円だと 21 銘柄)。
+    min_value = float(_env("MATERIALS_WATCH_PTS_MIN_VALUE_YEN", "30000000"))
+    min_chg = float(_env("MATERIALS_WATCH_PTS_MIN_CHG_PCT", "5"))
+    min_price = float(_env("MATERIALS_WATCH_PTS_MIN_PRICE", "200"))
     kou = data.get("kouaku") or {}
     tag: Dict[str, str] = {}
     for x in kou.get("good") or []:
@@ -201,7 +204,8 @@ def _build_watch(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     for x in kou.get("bad") or []:
         tag.setdefault(x["symbol"], "悪材料")
     pts = [x for x in (data.get("pts_increase") or []) + (data.get("pts_decrease") or [])
-           if abs(x.get("chg_pct") or 0) >= min_chg and (x.get("value_yen") or 0) >= min_value]
+           if abs(x.get("chg_pct") or 0) >= min_chg and (x.get("value_yen") or 0) >= min_value
+           and (x.get("pts") or 0) >= min_price]
     pts.sort(key=lambda x: -abs(x["chg_pct"]))
     out: List[Dict[str, Any]] = []
     seen = set(_non_stock_symbols())
