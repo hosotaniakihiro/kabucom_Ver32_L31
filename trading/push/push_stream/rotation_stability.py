@@ -403,6 +403,132 @@ def _sort_by_momentum(symbols: list[str]) -> list[str]:
         pass
     return out
 
+_RECENT_MOVE_CACHE: dict[str, Any] = {"at": 0.0, "key": "", "moves": {}}
+
+
+def _recent_move_active(now: _dt.datetime) -> bool:
+    """寄りの値動きが落ち着いた後 (既定 10:00〜) だけ直近の動き順で選ぶ。"""
+    if not _b("PUSH_ROTATION_RECENT_MOVE_PRIORITY", True):
+        return False
+    start = str(os.environ.get("PUSH_ROTATION_RECENT_MOVE_START", "10:00")).strip() or "10:00"
+    return now.strftime("%H:%M") >= start
+
+
+def _recent_move_map(now: _dt.datetime) -> dict[str, float]:
+    """直近 N 分 (既定 15) の 1 分あたり平均変化率をランキング DB から求める。
+
+    ranking_snapshot_1min はローカル DB で 15 分ぶん 1.4 万行を 10ms 以下で読める。
+    分が抜けている箇所 (11:25 などで実際に抜ける) は分数で割って 1 分あたりに直す。
+    売買代金が下限 (既定 10 億円) 未満、株価が下限 (既定 200 円、エントリー下限と同じ) 未満の
+    銘柄は入れない。低位株は 1 ティックで率が跳ねるだけなので (8918 = 11 円で 0.9%/分)。
+    """
+    import time as _time
+
+    lookback = max(5, _i("PUSH_ROTATION_RECENT_MOVE_LOOKBACK_MIN", 15))
+    min_value = _f("PUSH_ROTATION_RECENT_MOVE_MIN_TRADING_VALUE", 1e9)
+    min_price = _f("PUSH_ROTATION_RECENT_MOVE_MIN_PRICE", 200.0)
+    key = f"{now:%Y%m%d}-{lookback}-{min_value}-{min_price}"
+    cache_sec = max(0.0, _f("PUSH_ROTATION_RECENT_MOVE_CACHE_SEC", 20.0))
+    if _RECENT_MOVE_CACHE["key"] == key and _time.time() - _RECENT_MOVE_CACHE["at"] < cache_sec:
+        return _RECENT_MOVE_CACHE["moves"]
+
+    from trading.ranking.ranking_db_location import ranking_db_path
+
+    path = ranking_db_path(now.date())
+    if not path.exists():
+        return {}
+    since = (now - _dt.timedelta(minutes=lookback + 1)).strftime("%Y-%m-%d %H:%M:%S")
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+    try:
+        rows = con.execute(
+            "SELECT symbol, datetime, MAX(COALESCE(current_price, price)), MAX(trading_value)"
+            " FROM ranking_snapshot_1min WHERE datetime >= ?"
+            " GROUP BY symbol, datetime ORDER BY symbol, datetime",
+            (since,),
+        ).fetchall()
+    finally:
+        con.close()
+
+    moves: dict[str, float] = {}
+    prev_sym, prev_t, prev_p = None, None, None
+    acc: list[float] = []
+    last_val = 0.0
+
+    def _flush(sym, acc, last_p, last_val):
+        if sym and acc and last_p and last_p >= min_price and last_val >= min_value:
+            moves[sym] = (sum(acc) / len(acc)) / last_p
+
+    for sym, dts, price, value in rows:
+        sym = str(sym).strip().upper()
+        try:
+            t = _dt.datetime.strptime(str(dts)[:16], "%Y-%m-%d %H:%M")
+            p = float(price or 0.0)
+        except Exception:
+            continue
+        if sym != prev_sym:
+            _flush(prev_sym, acc, prev_p, last_val)
+            prev_sym, prev_t, prev_p, acc = sym, None, None, []
+        if p <= 0:
+            continue
+        if prev_t is not None and prev_p:
+            gap = max(1.0, (t - prev_t).total_seconds() / 60.0)
+            acc.append(abs(p - prev_p) / gap)
+        prev_t, prev_p = t, p
+        last_val = float(value or 0.0)
+    _flush(prev_sym, acc, prev_p, last_val)
+
+    _RECENT_MOVE_CACHE.update(at=_time.time(), key=key, moves=moves)
+    return moves
+
+
+def _sort_by_recent_move(symbols: list[str], now: _dt.datetime | None = None) -> list[str]:
+    """10:00 以降は「直近 15 分の 1 分平均変化率」が大きい順に 50 枠を選ぶ (2026-10-05)。
+
+    寄り後はボラが急に縮み (10/5 は候補の 1 分 ATR 中央値が 9 時台 0.5% → 11 時台 0.13%)、
+    当日変化率で選んだ銘柄の多くがボラ判定 (ATR 0.15%) で落ちていた。
+    当日変化率は朝の動きの累積なので、昼には既に止まった銘柄が上に残る。
+    過去 26 営業日 × 10:00〜14:15 の 7 時点で比べると、その後 30 分の 1 分 ATR が
+    0.15% を超える銘柄の割合は 変化率順 28.4% → 直近の動き順 39.4%、182 回中 97% で上回った。
+
+    候補はいまの monitor 候補 + ランキングに出ている売買代金 10 億円以上の銘柄。
+    保有銘柄 (protected) は先頭に残す。直近の値が取れない銘柄は元の順で後ろに付ける。
+    PUSH_ROTATION_RECENT_MOVE_PRIORITY=0 で無効 (当日変化率順だけに戻る)。
+    """
+    now = now or _dt.datetime.now()
+    if not symbols or not _recent_move_active(now):
+        return symbols
+    try:
+        moves = _recent_move_map(now)
+    except Exception:
+        logger.debug("[PUSH ROTATION TARGET TOPUP] recent move map failed", exc_info=True)
+        return symbols
+    if not moves:
+        return symbols
+
+    try:
+        from .protected_symbols import resolve_protected_push_symbols
+
+        protected = [s for s in _d_core(resolve_protected_push_symbols() or ()) if s]
+    except Exception:
+        protected = []
+
+    # _d は PUSH_ROTATION_TARGET_MAX_KEEP で切り詰めるので、並べ替える前は _d_core を使う
+    pool = _d_core(list(symbols) + list(moves.keys()))
+    ranked = sorted((s for s in pool if s in moves), key=lambda s: moves[s], reverse=True)
+    rest = [s for s in symbols if s not in moves]
+    out = _d([s for s in protected if s in set(pool)] + ranked + rest)
+
+    try:
+        logger.info(
+            "[PUSH ROTATION TARGET TOPUP] recent move sort applied n=%d scored=%d added=%d head=%s",
+            len(out), len(ranked), len([s for s in ranked if s not in set(symbols)]),
+            [(s, round(moves.get(s, 0.0) * 100, 3)) for s in out[:5]],
+        )
+    except Exception:
+        pass
+    return out
+
+
 def resolve_monitor_symbols() -> list[str]:
     from . import rotation_core, rotation_symbols
 
@@ -428,7 +554,9 @@ def resolve_monitor_symbols() -> list[str]:
     # 2026-09-25: 切り捨てる前に当日変化率 (絶対値) で並べ替える。
     #   ここを通らないと ACTIVE の約 90 銘柄から 50 枠を選ぶ優先順位が
     #   無く、set の順序任せ (= 銘柄コード順) になる。
-    merged = _sort_by_momentum(_d(merged))[:max_keep]
+    merged = _sort_by_momentum(_d(merged))
+    # 2026-10-05: 10:00 以降は直近 15 分の動き順で上書きする (寄り後はボラが縮むため)。
+    merged = _sort_by_recent_move(merged)[:max_keep]
 
     # 2026-10-03 (ユーザー要望): 前日の材料株 (株探【明日の好悪材料】) と夜間 PTS で動いた銘柄を、
     #   朝 (既定 8:00〜10:00) は先頭に入れて確実に監視する。取得は materials_watch が裏で 1 日 1 回。
