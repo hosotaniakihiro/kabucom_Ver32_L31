@@ -516,13 +516,119 @@ def _sort_by_recent_move(symbols: list[str], now: _dt.datetime | None = None) ->
     pool = _d_core(list(symbols) + list(moves.keys()))
     ranked = sorted((s for s in pool if s in moves), key=lambda s: moves[s], reverse=True)
     rest = [s for s in symbols if s not in moves]
-    out = _d([s for s in protected if s in set(pool)] + ranked + rest)
+    # ここで切り詰めると後段 (_drop_wide_spread) で後ろへ回した銘柄が枠内に残るので _d_core
+    out = _d_core([s for s in protected if s in set(pool)] + ranked + rest)
 
     try:
         logger.info(
             "[PUSH ROTATION TARGET TOPUP] recent move sort applied n=%d scored=%d added=%d head=%s",
             len(out), len(ranked), len([s for s in ranked if s not in set(symbols)]),
             [(s, round(moves.get(s, 0.0) * 100, 3)) for s in out[:5]],
+        )
+    except Exception:
+        pass
+    return out
+
+
+_SPREAD_CACHE: dict[str, Any] = {"at": 0.0, "spreads": {}}
+
+
+def _recent_spread_map(symbols: list[str], now: _dt.datetime) -> dict[str, float]:
+    """直近 N 分 (既定 5) の最良気配スプレッド (%) の中央値を板情報 DB から求める。
+
+    order_book は 1 日 1GB あり datetime 単独の索引が無い (全走査 4 秒) ので、
+    (symbol, datetime) の索引で銘柄ごとに引く。板が記録されていない銘柄
+    (= まだ PUSH 登録していない銘柄) は返さない。
+    """
+    import statistics
+    import time as _time
+
+    cache_sec = max(0.0, _f("PUSH_ROTATION_SPREAD_CACHE_SEC", 20.0))
+    cached = _SPREAD_CACHE["spreads"]
+    fresh = _time.time() - _SPREAD_CACHE["at"] < cache_sec
+    todo = [s for s in symbols if not (fresh and s in cached)]
+    if fresh and not todo:
+        return cached
+    if not fresh:
+        cached = {}
+
+    from trading.push.order_book_db_location import order_book_db_path
+
+    path = order_book_db_path(now.date())
+    if not path.exists():
+        return cached
+    lookback = max(1, _i("PUSH_ROTATION_SPREAD_LOOKBACK_MIN", 5))
+    since = (now - _dt.timedelta(minutes=lookback)).strftime("%Y-%m-%d %H:%M:%S")
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+    try:
+        for sym in todo:
+            rows = con.execute(
+                "SELECT sequence, MAX(CASE WHEN side='BUY' THEN price END),"
+                " MIN(CASE WHEN side='SELL' THEN price END)"
+                " FROM order_book WHERE symbol=? AND datetime>=? AND level=1 AND price>0"
+                " GROUP BY sequence",
+                (sym, since),
+            ).fetchall()
+            sps = [
+                (ask - bid) / ((ask + bid) / 2.0) * 100.0
+                for _, bid, ask in rows
+                if bid and ask and ask > bid
+            ]
+            if sps:
+                cached[sym] = statistics.median(sps)
+    finally:
+        con.close()
+    _SPREAD_CACHE.update(at=_time.time() if not fresh else _SPREAD_CACHE["at"], spreads=cached)
+    return cached
+
+
+def _drop_wide_spread(symbols: list[str], now: _dt.datetime | None = None) -> list[str]:
+    """直近のスプレッドが広い銘柄を監視枠から後ろへ回す (2026-10-05)。
+
+    最後の FINAL ENTRY SAFETY GUARD が ENTRY_MAX_SPREAD_PCT (0.20%) 超を必ず弾くので、
+    そういう銘柄に PUSH 枠を使っても発注に届かない。10/5 後場は 13:56〜引けまで
+    約定ゼロで、最終段の却下は SPREAD_TOO_WIDE が最多 (4288 / 2962 / 338A が繰り返し)。
+    板情報 DB 15 日分では、今 0.20% 超の銘柄は 10〜20 分後も 77.5% が 0.20% 超
+    (今 0.20% 以下なら 8.7%)。登録銘柄の 32% がこの状態だった。
+
+    除外ではなく末尾へ回すので、枠が余れば使われる。板が未記録の銘柄
+    (未登録) はそのまま残し、登録後に広いと分かれば次の周回で後ろへ回る。
+    保有・候補 (protected) は動かさない。PUSH_ROTATION_SPREAD_FILTER=0 で無効。
+    """
+    now = now or _dt.datetime.now()
+    if not symbols or not _b("PUSH_ROTATION_SPREAD_FILTER", True):
+        return symbols
+    start = str(os.environ.get("PUSH_ROTATION_SPREAD_FILTER_START", "09:10")).strip() or "09:10"
+    if now.strftime("%H:%M") < start:
+        return symbols
+    max_sp = _f("PUSH_ROTATION_MAX_SPREAD_PCT", _f("ENTRY_MAX_SPREAD_PCT", 0.20))
+    try:
+        spreads = _recent_spread_map(list(symbols), now)
+    except Exception:
+        logger.debug("[PUSH ROTATION TARGET TOPUP] spread map failed", exc_info=True)
+        return symbols
+    if not spreads:
+        return symbols
+    wide = [s for s in symbols if spreads.get(s, 0.0) > max_sp]
+    if not wide:
+        return symbols
+    # 保有銘柄の解決は証券 API を叩く (約 0.6 秒) ので、広い銘柄があるときだけ
+    try:
+        from .protected_symbols import resolve_protected_push_symbols
+
+        protected = set(_d_core(resolve_protected_push_symbols() or ()))
+    except Exception:
+        protected = set()
+    wide = [s for s in wide if s not in protected]
+    if not wide:
+        return symbols
+    wide_set = set(wide)
+    out = [s for s in symbols if s not in wide_set] + wide
+    try:
+        logger.info(
+            "[PUSH ROTATION TARGET TOPUP] wide spread moved back n=%d known=%d max=%.2f%% wide=%s",
+            len(wide), len(spreads), max_sp,
+            [(s, round(spreads[s], 3)) for s in wide[:10]],
         )
     except Exception:
         pass
@@ -556,7 +662,9 @@ def resolve_monitor_symbols() -> list[str]:
     #   無く、set の順序任せ (= 銘柄コード順) になる。
     merged = _sort_by_momentum(_d(merged))
     # 2026-10-05: 10:00 以降は直近 15 分の動き順で上書きする (寄り後はボラが縮むため)。
-    merged = _sort_by_recent_move(merged)[:max_keep]
+    merged = _sort_by_recent_move(merged)
+    # 2026-10-05: 直近のスプレッドが 0.20% 超の銘柄は最後のガードで必ず弾かれるので後ろへ回す。
+    merged = _drop_wide_spread(merged)[:max_keep]
 
     # 2026-10-03 (ユーザー要望): 前日の材料株 (株探【明日の好悪材料】) と夜間 PTS で動いた銘柄を、
     #   朝 (既定 8:00〜10:00) は先頭に入れて確実に監視する。取得は materials_watch が裏で 1 日 1 回。
