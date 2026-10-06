@@ -3,7 +3,8 @@
 # 2026-10-03: 急騰銘柄の空売り (SURGE_SHORT)
 # ------------------------------------------------------------
 # 当日はじめて前日終値 +12% を超えた銘柄を、一般信用デイトレで空売りし、
-# 60 分後に買い戻す。+5% 逆行したら損切り。
+# 30 分後に買い戻す (10/6 に 60 -> 30)。+5% 逆行したら損切り。
+# 含み益 1% 超から 0.5% 戻したらトレール利確 (10/6)。
 #
 # 根拠 (2026-10-02 検証):
 #   TradingView 5 分足 2015〜2025 / 1,531 銘柄 / 5,390 回:
@@ -14,7 +15,7 @@
 #
 # 構成:
 #   run_cycle()   : 20 秒ごと (main.py の schedule)。候補を探して発注する。
-#   handle_exit() : exit_loop の先頭で呼ぶ。この戦略の建玉なら 損切り/時間 だけで決済し、
+#   handle_exit() : exit_loop の先頭で呼ぶ。この戦略の建玉なら 損切り/トレール/利確/時間 だけで決済し、
 #                   通常の決済ルール (日足 ATR 損切り・トレール・blowoff など) は通さない。
 #   状態は %LOCALAPPDATA%\autostock\runtime\surge_short_YYYYMMDD.json (再起動しても残る)。
 #
@@ -62,7 +63,14 @@ def cfg() -> Dict[str, Any]:
         "chg_pct": _env_f("SURGE_SHORT_MIN_CHANGE_PCT", 12.0),
         "start": _hm("SURGE_SHORT_START", "09:15"),
         "end": _hm("SURGE_SHORT_END", "14:30"),
-        "hold_min": _env_f("SURGE_SHORT_HOLD_MIN", 60.0),
+        # 2026-10-06: 60 -> 30 分 (資金を寝かせない、ユーザー判断)。トレールと合わせて
+        #   TV 5 分足 5,055 回: 1 回 +0.84% -> +0.88%、平均保有 34 -> 15 分、保有 1 時間あたり +1.5% -> +3.6%。
+        "hold_min": _env_f("SURGE_SHORT_HOLD_MIN", 30.0),
+        # 2026-10-06: トレール利確。含み益が trail_start% を超えたら、最安値から trail_back% 戻した所で買い戻す。
+        #   436A (10/6) は最大 +2.4% の含み益が 60 分の時間切れで -670 円になった。
+        #   TV 5 分足 (買戻し 0.2% 不利で計算): トレールなし +0.84% 勝率 62% / 1.0・0.5 で +0.93% 勝率 77%。
+        "trail_start_pct": _env_f("SURGE_SHORT_TRAIL_START_PCT", 1.0),
+        "trail_back_pct": _env_f("SURGE_SHORT_TRAIL_BACK_PCT", 0.5),
         "stop_pct": _env_f("SURGE_SHORT_STOP_PCT", 5.0),
         "max_yen": _env_f("SURGE_SHORT_MAX_YEN", 300000.0),
         "max_per_day": int(_env_f("SURGE_SHORT_MAX_PER_DAY", 5)),
@@ -431,6 +439,10 @@ def handle_exit(symbol: str, pos: Dict[str, Any], now: Optional[dt.datetime] = N
             _update_trade(symbol, stop_attempts=t["stop_attempts"], stop_oid=oid, entry_fill=entry)
 
         stop_oid = t.get("stop_oid")
+        # 保有中の最安値 (トレール用、再起動しても残るよう状態ファイルに持つ)
+        best = min(float(t.get("best_price") or entry), price)
+        if best < float(t.get("best_price") or entry):
+            _update_trade(symbol, best_price=best)
         # 逆指値の発動ラインを超えたら、証券会社側で約定済みか確かめて記録を閉じる
         if stop_oid and price >= entry * (1 + c["stop_pct"] / 100.0) and _broker_short_qty(symbol) == 0:
             logger.warning("[SURGE SHORT] broker stop filled symbol=%s entry=%.1f price=%.1f", symbol, entry, price)
@@ -441,6 +453,10 @@ def handle_exit(symbol: str, pos: Dict[str, Any], now: Optional[dt.datetime] = N
             reason = f"SURGE_SHORT_STOP pct={c['stop_pct']:.1f} entry={entry:.1f} price={price:.1f} (system)"
         elif stop_oid and price >= entry * (1 + c["backup_stop_pct"] / 100.0):
             reason = f"SURGE_SHORT_BACKUP_STOP pct={c['backup_stop_pct']:.1f} entry={entry:.1f} price={price:.1f}"
+        elif (c["trail_start_pct"] > 0 and best <= entry * (1 - c["trail_start_pct"] / 100.0)
+              and price >= best * (1 + c["trail_back_pct"] / 100.0)):
+            reason = (f"SURGE_SHORT_TRAIL start={c['trail_start_pct']:.1f} back={c['trail_back_pct']:.1f} "
+                      f"entry={entry:.1f} best={best:.1f} price={price:.1f}")
         elif c["take_profit_pct"] > 0 and price <= entry * (1 - c["take_profit_pct"] / 100.0):
             reason = f"SURGE_SHORT_TAKE_PROFIT pct={c['take_profit_pct']:.1f} entry={entry:.1f} price={price:.1f}"
         elif now >= _pt(t["order_ts"]) + dt.timedelta(minutes=c["hold_min"]):
