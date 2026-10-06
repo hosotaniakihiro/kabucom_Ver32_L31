@@ -987,7 +987,9 @@ def _midday_scale() -> tuple[float, float, str]:
         return 1.0, 1.0, ""
     try:
         now = dt.datetime.now().time()
-        s = str(os.environ.get("VOL_FILTER_MIDDAY_START", "") or "11:00").strip()
+        # 2026-10-06: 10 時で分ける (ユーザー判断)。寄り後の 1 時間を過ぎると値動きが細り、
+        #   10:00〜10:15 の ATR_1M_FILTER_NG 26 件のうち 11 件が 0.8 倍なら通る水準だった。
+        s = str(os.environ.get("VOL_FILTER_MIDDAY_START", "") or "10:00").strip()
         # 2026-09-30: 14:00 で打ち切ると後場の薄い時間帯に基準が戻り、
         #   14 時台の 5 分値幅の通過率が 66% まで落ちた。大引けまで延長 (ユーザー判断)。
         e = str(os.environ.get("VOL_FILTER_MIDDAY_END", "") or "15:30").strip()
