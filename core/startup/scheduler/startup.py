@@ -127,6 +127,12 @@ def start_scheduler_stack_before_restore() -> None:
         _register_surge_short()
     except Exception:
         logger.exception("[startup.scheduler] surge_short register failed")
+    # 2026-10-06: セリングクライマックスの買い (trading/strategies/selling_climax.py)
+    try:
+        from trading.strategies.selling_climax import register_scheduler_safe as _register_selling_climax
+        _register_selling_climax()
+    except Exception:
+        logger.exception("[startup.scheduler] selling_climax register failed")
     start_ranking_db_writer_safe()
     start_schedule_loop_early_safe()
     run_summary_tick_once_debug_safe()

@@ -106,6 +106,13 @@ def exit_loop_5s() -> None:
                         continue
                 except Exception:
                     logger.exception("[EXIT LOOP] surge_short handle_exit failed symbol=%s", symbol)
+                # 2026-10-06: セリングクライマックスの買い建玉は 損切り 1% / 30 分 で扱う
+                try:
+                    from trading.strategies.selling_climax import handle_exit as _climax_handle_exit
+                    if _climax_handle_exit(symbol, pos, now) is not None:
+                        continue
+                except Exception:
+                    logger.exception("[EXIT LOOP] selling_climax handle_exit failed symbol=%s", symbol)
                 # 2026-10-03: 殿様イナゴ由来の買い建玉は 損切り 1.5% / 60 分 で扱う
                 try:
                     from trading.strategies.tonosama_exit import handle_exit as _tonosama_handle_exit
