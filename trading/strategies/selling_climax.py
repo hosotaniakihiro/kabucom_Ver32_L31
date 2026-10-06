@@ -15,14 +15,15 @@
 #   328 回 (1 銘柄 1 日 1 回)、損切りのすべり 0.2% と往復コスト 0.1% を引いて +0.36%、勝率 51%、
 #   前半 12 日 +0.63% / 後半 12 日 +0.28%。同じ時間帯に条件なしで買うと ±0%。
 #   10/6 の 593A (13:06、出来高 24.8 倍) は 30 分後 +1.03%。
-#   期間外 (push 実気配 9/26〜) の確認は未了。まず少量 (既定 100 株) で動かす。
+#   期間外 (push 実気配 9/26〜10/6、売り気配で買い・買い気配で売り) は 45 回 -0.23%・勝率 33% で負け。
+#   シグナルの 57% はスプレッド 0.20% 超で見送り。→ 既定は発注せず、検知と記録だけ (observed)。
 #
 # 構成:
 #   run_cycle()   : 20 秒ごと。push DB を rowid で差分読みし、銘柄ごとの 1 分足 (終値・出来高) を作って判定。
 #   handle_exit() : exit_loop の先頭で呼ぶ。この戦略の建玉なら 損切り/時間 だけで決済する。
 #   状態は %LOCALAPPDATA%\autostock\runtime\selling_climax_YYYYMMDD.json (再起動しても残る)。
 #
-# 止め方: SELLING_CLIMAX_ENABLED=0 (新規だけ止まる。保有中の決済は続く)。
+# 発注するには SELLING_CLIMAX_ENABLED=1 (既定 0。0 でも検知と記録は続き、保有中の決済も続く)。
 # ============================================================
 from __future__ import annotations
 
@@ -63,7 +64,10 @@ def _hm(name: str, default: str) -> dt.time:
 
 def cfg() -> Dict[str, Any]:
     return {
-        "enabled": _env_on("SELLING_CLIMAX_ENABLED", True),
+        # 2026-10-06: 期間外 (push 実気配 9/26〜10/6) で 45 回 -0.23% (ランダム買い -0.16%)、勝率 33%。
+        #   1 分足 (8/17〜9/25) の +0.36% は終値売買で、実気配のスプレッドに負けた。既定は発注しない。
+        #   無効でもシグナルは検知して状態ファイルに記録する (status=observed、前向きの検証用)。
+        "enabled": _env_on("SELLING_CLIMAX_ENABLED", False),
         "start": _hm("SELLING_CLIMAX_START", "09:15"),
         "end": _hm("SELLING_CLIMAX_END", "14:30"),
         "drop30_pct": _env_f("SELLING_CLIMAX_DROP30_PCT", 2.0),
@@ -266,7 +270,7 @@ def run_cycle(now: Optional[dt.datetime] = None) -> None:
     except Exception:
         logger.warning("[SELLING CLIMAX] bars update failed", exc_info=True)
         return
-    if not c["enabled"] or not (c["start"] <= now.time() <= c["end"]):
+    if not (c["start"] <= now.time() <= c["end"]):
         return
     cur_min = now.replace(second=0, microsecond=0)
     # 確定したばかりの足だけを見る (足の終わり = cur_min)
@@ -287,6 +291,9 @@ def run_cycle(now: Optional[dt.datetime] = None) -> None:
             st["signals"][sym] = {"ts": _ts(now), **sig, "status": "new"}
             changed = True
             logger.warning("[SELLING CLIMAX] signal symbol=%s %s", sym, sig)
+            if not c["enabled"]:
+                st["signals"][sym].update(status="observed", reason="disabled")
+                continue
             result, reason, detail = _try_entry(sym, sig, st, now, c)
             st["signals"][sym].update(status=result, reason=reason, detail=detail)
             logger.warning("[SELLING CLIMAX] %s symbol=%s reason=%s detail=%s", result.upper(), sym, reason, detail)
