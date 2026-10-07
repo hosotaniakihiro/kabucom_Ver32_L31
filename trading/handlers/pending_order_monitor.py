@@ -246,12 +246,14 @@ def _is_board_adverse(symbol: str, side: str, order_price: Any) -> tuple[bool, s
         ticks = max(0, int(ENTRY_CANCEL_BOARD_ADVERSE_TICKS))
         side_u = str(side or "").upper()
         detail = {"bid": bid, "ask": ask, "order_price": px, "tick": tick, "ticks": ticks}
-        # BUY: 売り気配が指値より大きく上へ離れたら、置いていかれた/追いかけ危険として取消。
-        if side_u == "BUY" and ask > 0 and ask >= px + tick * ticks:
-            return True, "buy_ask_moved_away", detail
-        # SELL: 買い気配が指値より大きく下へ離れたら、置いていかれた/追いかけ危険として取消。
-        if side_u == "SELL" and bid > 0 and bid <= px - tick * ticks:
-            return True, "sell_bid_moved_away", detail
+        # 2026-10-07: 「置いていかれた」は自分と同じ側の気配で見る。反対側の気配で見ると、買気配に置いた指値を
+        #   スプレッドが 2 刻みあるだけで取り消していた (3436: 指値 3728 = 買気配、売気配 3730)。
+        # BUY: 買い気配が指値より上へ離れたら (自分より高い買いが並んだ = 置いていかれた) 取消。
+        if side_u == "BUY" and bid > 0 and bid >= px + tick * ticks:
+            return True, "buy_bid_moved_away", detail
+        # SELL: 売り気配が指値より下へ離れたら取消。
+        if side_u == "SELL" and ask > 0 and ask <= px - tick * ticks:
+            return True, "sell_ask_moved_away", detail
         return False, "ok", detail
     except Exception:
         logger.debug("[ENTRY CANCEL WATCH] board adverse check failed symbol=%s", symbol, exc_info=True)

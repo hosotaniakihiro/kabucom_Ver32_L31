@@ -244,6 +244,15 @@ def _side_ok(vals: Dict[str, float], side: str, mas, tf_s: str, *, require_order
             lo, hi = _env_f("MTF_GATE_RSI_BUY_MIN", 50.0), _env_f("MTF_GATE_RSI_BUY_MAX", 80.0)  # 2026-09-15 夕: 75→80
         else:
             lo, hi = _env_f("MTF_GATE_RSI_SELL_MIN", 20.0), _env_f("MTF_GATE_RSI_SELL_MAX", 50.0)  # 2026-09-15 夕: 25→20
+        # 2026-10-07 (ユーザー判断): 売りは「買われ過ぎ (RSI 70 以上) からの反落」も通す。MACD は見ない
+        #   (検証した母集団が RSI で止めた候補そのものなので、同じ条件にする)。
+        #   9/15〜10/7 の 14 日、RSI で止めた売り候補の 15 分後 (実気配・コスト込み):
+        #   RSI 50〜60 は -0.3〜-0.6% / 60〜70 は ±0 前後 / 70〜80 は +0.84% 勝率 70% / 80 超は +1.69% 勝率 70%
+        #   (10/7 を除いても 70 超は約 +1%、8〜9 日に分散)。
+        ob = _env_f("MTF_GATE_RSI_SELL_OVERBOUGHT", 70.0)
+        if side == "SELL" and ob > 0 and rsi >= ob:
+            return True, (f"{tf_s}:ok_overbought rsi={rsi:.1f}>={ob:.0f} c={close:.1f}"
+                          f" macd={_f(vals.get('macd'), float('nan')):.2f}/{_f(vals.get('signal'), float('nan')):.2f}")
         if not (lo <= rsi <= hi):
             return False, f"{tf_s}:rsi {rsi:.1f} not in [{lo:.0f},{hi:.0f}]"
     if _env_bool("MTF_GATE_MACD_ENABLED", True):
