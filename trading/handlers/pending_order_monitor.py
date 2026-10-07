@@ -233,7 +233,16 @@ def _is_board_adverse(symbol: str, side: str, order_price: Any) -> tuple[bool, s
             return False, "board_missing", {}
         bid = float(snap.get("best_bid") or 0.0)
         ask = float(snap.get("best_ask") or 0.0)
-        tick = _tick_size(px)
+        # 2026-10-07: 表の呼値は TOPIX100 用 (3,000 円以下 0.5 円) なので、ふつうの銘柄の 1 円スプレッドを
+        #   「2 刻み離れた」と数え、買気配で置いた指値を発注 0.03 秒後に取り消していた (10/7 は 13 件、3103/2726/593A ...)。
+        #   板に並んだ値段の間隔 (実際の刻み) を使い、取れない時だけ表に頼る。
+        diffs = []
+        for lad in (snap.get("sell") or [], snap.get("buy") or []):
+            ps = sorted({float(x.get("price") or 0) for x in lad if isinstance(x, dict) and float(x.get("price") or 0) > 0})
+            diffs += [round(b - a, 6) for a, b in zip(ps, ps[1:]) if b - a > 0]
+        if ask > bid > 0:
+            diffs.append(round(ask - bid, 6))
+        tick = max(min(diffs), _tick_size(px)) if diffs else _tick_size(px)
         ticks = max(0, int(ENTRY_CANCEL_BOARD_ADVERSE_TICKS))
         side_u = str(side or "").upper()
         detail = {"bid": bid, "ask": ask, "order_price": px, "tick": tick, "ticks": ticks}
