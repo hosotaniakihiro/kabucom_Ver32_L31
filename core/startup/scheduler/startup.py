@@ -127,6 +127,12 @@ def start_scheduler_stack_before_restore() -> None:
         _register_surge_short()
     except Exception:
         logger.exception("[startup.scheduler] surge_short register failed")
+    # 2026-10-07: ストップ高タッチ後の崩れ売り (記録だけ、trading/strategies/limitup_fade.py)
+    try:
+        from trading.strategies.limitup_fade import register_scheduler_safe as _register_limitup_fade
+        _register_limitup_fade()
+    except Exception:
+        logger.exception("[startup.scheduler] limitup_fade register failed")
     # 2026-10-06: セリングクライマックスの買い (trading/strategies/selling_climax.py)
     try:
         from trading.strategies.selling_climax import register_scheduler_safe as _register_selling_climax
