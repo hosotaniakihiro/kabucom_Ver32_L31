@@ -456,7 +456,10 @@ def handle_exit(symbol: str, pos: Dict[str, Any], now: Optional[dt.datetime] = N
         elif stop_oid and price >= entry * (1 + c["backup_stop_pct"] / 100.0):
             reason = f"SURGE_SHORT_BACKUP_STOP pct={c['backup_stop_pct']:.1f} entry={entry:.1f} price={price:.1f}"
         elif (c["trail_start_pct"] > 0 and best <= entry * (1 - c["trail_start_pct"] / 100.0)
-              and price >= best * (1 + c["trail_back_pct"] / 100.0)):
+              and price >= best * (1 + c["trail_back_pct"] / 100.0)
+              # 2026-10-07: 建値より上まで戻ったらトレールでは切らない (4493: 38 秒で -1.15% → 建値超えで -1,700 円)。
+              # 利益を残すための仕組みなので、損になる位置では通常の保有 (30 分 / 逆指値) に戻す。
+              and price < entry):
             reason = (f"SURGE_SHORT_TRAIL start={c['trail_start_pct']:.1f} back={c['trail_back_pct']:.1f} "
                       f"entry={entry:.1f} best={best:.1f} price={price:.1f}")
         elif c["take_profit_pct"] > 0 and price <= entry * (1 - c["take_profit_pct"] / 100.0):
