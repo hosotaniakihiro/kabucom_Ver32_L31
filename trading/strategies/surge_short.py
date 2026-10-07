@@ -89,6 +89,9 @@ def cfg() -> Dict[str, Any]:
         "broker_stop": _env_on("SURGE_SHORT_BROKER_STOP", True),
         "backup_stop_pct": _env_f("SURGE_SHORT_BACKUP_STOP_PCT", 7.0),
         "force_close": _hm("SURGE_SHORT_FORCE_CLOSE", "15:20"),
+        # 2026-10-07: 板の厚み (売り 5 本・買い 5 本の金額の少ない方) がこれ未満ならトレールを使わない。
+        #   4493 = 2,800 株 x 2,950 円 ≒ 830 万円 (数秒で ±0.5%)、5801 = 1 万株超 x 4,660 円 ≒ 5,000 万円。
+        "thin_board_yen": _env_f("SURGE_SHORT_THIN_BOARD_YEN", 2e7),
     }
 
 
@@ -188,6 +191,38 @@ def _board(symbol: str) -> Optional[Dict[str, Any]]:
         return _rfb_fetch_board(symbol, force=True)
     except Exception:
         logger.debug("[SURGE SHORT] board failed symbol=%s", symbol, exc_info=True)
+        return None
+
+
+def _push_quote(symbol: str) -> Optional[Dict[str, Any]]:
+    """PUSH DB の最新の気配 (ask / bid、何秒前か) と板の厚み (直近 1 分の中央値、円)。取れなければ None。"""
+    try:
+        import sqlite3
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+        p = Path(base) / "autostock" / "push" / f"push{dt.date.today():%Y%m%d}.db"
+        if not p.exists():
+            return None
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = con.execute(
+                "select datetime, Sell1Price, Buy1Price,"
+                " coalesce(Sell1Qty,0)+coalesce(Sell2Qty,0)+coalesce(Sell3Qty,0)+coalesce(Sell4Qty,0)+coalesce(Sell5Qty,0),"
+                " coalesce(Buy1Qty,0)+coalesce(Buy2Qty,0)+coalesce(Buy3Qty,0)+coalesce(Buy4Qty,0)+coalesce(Buy5Qty,0)"
+                " from stream_data_raw where symbol=? order by datetime desc limit 60", (str(symbol),)).fetchall()
+        finally:
+            con.close()
+        rows = [r for r in rows if r[1] and r[2] and float(r[1]) > float(r[2]) > 0]
+        if not rows:
+            return None
+        last = dt.datetime.fromisoformat(str(rows[0][0])[:26])
+        cutoff = last - dt.timedelta(seconds=60)
+        depth = sorted(min(float(r[3]) * float(r[1]), float(r[4]) * float(r[2]))
+                       for r in rows if dt.datetime.fromisoformat(str(r[0])[:26]) >= cutoff)
+        return {"ask": float(rows[0][1]), "bid": float(rows[0][2]),
+                "age": (dt.datetime.now() - last).total_seconds(),
+                "depth_yen": depth[len(depth) // 2] if depth else None}
+    except Exception:
+        logger.debug("[SURGE SHORT] push quote failed symbol=%s", symbol, exc_info=True)
         return None
 
 
@@ -441,8 +476,18 @@ def handle_exit(symbol: str, pos: Dict[str, Any], now: Optional[dt.datetime] = N
             _update_trade(symbol, stop_attempts=t["stop_attempts"], stop_oid=oid, entry_fill=entry)
 
         stop_oid = t.get("stop_oid")
+        # 2026-10-07: トレールは買い戻せる値 (売り気配) で見る。最後の約定値は一瞬飛ぶ
+        # (4493: 約定値は 2915 = -1.15% まで付いたが、売り気配は 2927 = -0.75% 止まりでトレールは本来始まっていない)。
+        q = _push_quote(symbol)
+        tp = q["ask"] if q and q["age"] <= 15 else price
+        # 板が薄い銘柄はトレールを使わず時間で持つ (4493: 5 本計 2,800 株で数秒に ±0.5% 振れた)。最初に見た板で決めて固定する
+        if "thin_board" not in t and q and q.get("depth_yen") is not None:
+            t["thin_board"] = bool(q["depth_yen"] < c["thin_board_yen"])
+            _update_trade(symbol, thin_board=t["thin_board"], depth_yen=round(q["depth_yen"]))
+            logger.warning("[SURGE SHORT] board depth symbol=%s depth_yen=%.0f thin=%s (trail %s)", symbol,
+                           q["depth_yen"], t["thin_board"], "OFF" if t["thin_board"] else "ON")
         # 保有中の最安値 (トレール用、再起動しても残るよう状態ファイルに持つ)
-        best = min(float(t.get("best_price") or entry), price)
+        best = min(float(t.get("best_price") or entry), tp)
         if best < float(t.get("best_price") or entry):
             _update_trade(symbol, best_price=best)
         # 逆指値の発動ラインを超えたら、証券会社側で約定済みか確かめて記録を閉じる
@@ -455,13 +500,14 @@ def handle_exit(symbol: str, pos: Dict[str, Any], now: Optional[dt.datetime] = N
             reason = f"SURGE_SHORT_STOP pct={c['stop_pct']:.1f} entry={entry:.1f} price={price:.1f} (system)"
         elif stop_oid and price >= entry * (1 + c["backup_stop_pct"] / 100.0):
             reason = f"SURGE_SHORT_BACKUP_STOP pct={c['backup_stop_pct']:.1f} entry={entry:.1f} price={price:.1f}"
-        elif (c["trail_start_pct"] > 0 and best <= entry * (1 - c["trail_start_pct"] / 100.0)
-              and price >= best * (1 + c["trail_back_pct"] / 100.0)
+        elif (c["trail_start_pct"] > 0 and not t.get("thin_board")
+              and best <= entry * (1 - c["trail_start_pct"] / 100.0)
+              and tp >= best * (1 + c["trail_back_pct"] / 100.0)
               # 2026-10-07: 建値より上まで戻ったらトレールでは切らない (4493: 38 秒で -1.15% → 建値超えで -1,700 円)。
               # 利益を残すための仕組みなので、損になる位置では通常の保有 (30 分 / 逆指値) に戻す。
-              and price < entry):
+              and tp < entry):
             reason = (f"SURGE_SHORT_TRAIL start={c['trail_start_pct']:.1f} back={c['trail_back_pct']:.1f} "
-                      f"entry={entry:.1f} best={best:.1f} price={price:.1f}")
+                      f"entry={entry:.1f} best={best:.1f} ask={tp:.1f} last={price:.1f}")
         elif c["take_profit_pct"] > 0 and price <= entry * (1 - c["take_profit_pct"] / 100.0):
             reason = f"SURGE_SHORT_TAKE_PROFIT pct={c['take_profit_pct']:.1f} entry={entry:.1f} price={price:.1f}"
         elif now >= _pt(t["order_ts"]) + dt.timedelta(minutes=c["hold_min"]):
