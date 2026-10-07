@@ -2317,6 +2317,17 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[st
     if float(srow.get("daily_pnl") or 0.0) <= symbol_max_loss:
         return True, "SYMBOL_DAILY_LOSS_LIMIT", {"symbol": symbol, "side": side_u, "max_loss": symbol_max_loss, **srow}
 
+    # 2026-10-07: 約定しなかった (受け身指値が 4 秒で取消された) 発注まで回数に数えていて、
+    #   2 回出しただけでその銘柄は当日入れなくなっていた (485A / 3436、13 時台に 11 件)。
+    #   回数上限は「実際に約定して返済した回数」で見る。発注の連打だけは別の上限 (既定 6 回) で止める。
+    if _env_bool("ENTRY_DAILY_LIMIT_COUNT_FILLED_ONLY", True):
+        symbol_seen_entries = entry_count
+        max_sends = _env_int("ENTRY_MAX_DAILY_SENDS_PER_SYMBOL", 6)
+        if max_sends > 0 and entry_sent_count >= max_sends:
+            return True, "SYMBOL_DAILY_SEND_LIMIT", {
+                "symbol": symbol, "side": side_u, "max_sends": max_sends, **srow,
+            }
+
     if effective_max_entries > 0 and symbol_seen_entries >= effective_max_entries:
         return True, "SYMBOL_DAILY_ENTRY_LIMIT", {
             "symbol": symbol,
