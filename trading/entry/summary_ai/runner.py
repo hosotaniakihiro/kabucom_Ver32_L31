@@ -37,7 +37,7 @@ import logging
 import math
 import os
 from functools import wraps
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import pandas as pd
 
@@ -265,6 +265,87 @@ def _wsf_interval_availability() -> dict:
     return out
 
 
+def _wsf_num(rec: Any, *keys: str) -> Optional[float]:
+    for k in keys:
+        try:
+            v = rec.get(k)
+            if v is None or pd.isna(v):
+                continue
+            return float(v)
+        except Exception:
+            continue
+    return None
+
+
+def _wsf_relax_frames() -> dict:
+    """緩和判定用に 3m/5m の最新確定足 (銘柄ごと 1 本) と 1m の足を 1 回だけ取る。"""
+    import datetime as _dt
+    from . import mtf_attach as _ma
+
+    now = _dt.datetime.now()
+    out: dict = {"now": now}
+    for tf in (3, 5):
+        try:
+            fr, _src = _ma._load_tf_frame(tf)
+            out[tf] = _ma._latest_completed_rows(fr, tf, now, require_completed=True)[0] if fr is not None else {}
+        except Exception:
+            out[tf] = {}
+    try:
+        fr1, _src = _ma._load_tf_frame(1)
+        out[1] = fr1 if isinstance(fr1, pd.DataFrame) else None
+    except Exception:
+        out[1] = None
+    return out
+
+
+def _wsf_relax_check(symbol: str, side: str, frames: dict) -> Tuple[bool, str]:
+    """2026-10-08 (ユーザー判断「3m/5m に同じ方向の動きが無い、は厳しすぎる」): ①+②+③ の組み合わせ。
+
+    ① 3m/5m が逆向き (買いなら売り点数 > 0 かつ 買い点数より大きい) なら落とす。中立 (0) は通す。
+    ② 値動き: 直近の確定 3m (無ければ 5m) 足が陽線 (売りは陰線) か、終値が VWAP の上 (売りは下) なら OK。
+    ③ 3m/5m の確定足が両方無いときは 1 分足の直近 3 本 (終値 4 本) の向きで代える。それも無ければ落とす。
+    """
+    from .mtf_attach import normalize_symbol
+
+    sym = normalize_symbol(symbol)
+    buy = str(side or "BUY").upper() != "SELL"
+    recs = {tf: (frames.get(tf) or {}).get(sym) for tf in (3, 5)}
+    have = {tf: r for tf, r in recs.items() if r is not None}
+    for tf, r in have.items():
+        b = abs(_wsf_num(r, "buy_score", "score_buy") or 0.0)
+        s = abs(_wsf_num(r, "sell_score", "score_sell") or 0.0)
+        own, opp = (b, s) if buy else (s, b)
+        if opp > 0 and opp > own:
+            return False, f"opposite_{tf}m(own={own:.2f},opp={opp:.2f})"
+    if have:
+        tf = 3 if 3 in have else 5
+        r = have[tf]
+        o, c, vw = _wsf_num(r, "open", "open_price"), _wsf_num(r, "close", "close_price"), _wsf_num(r, "vwap")
+        if o is None or c is None:
+            return False, f"no_ohlc_{tf}m"
+        candle = (c >= o) if buy else (c <= o)
+        above = bool(vw and vw > 0 and ((c >= vw) if buy else (c <= vw)))
+        if candle or above:
+            return True, f"{tf}m_{'candle' if candle else 'vwap'}_ok"
+        return False, f"{tf}m_candle_vwap_against(o={o},c={c},vwap={vw})"
+    df1 = frames.get(1)
+    if df1 is None or df1.empty or "symbol" not in df1.columns:
+        return False, "no_1m"
+    try:
+        g = df1[df1["symbol"].map(normalize_symbol) == sym]
+        dtc = "datetime" if "datetime" in g.columns else None
+        if dtc:
+            g = g.assign(_t=pd.to_datetime(g[dtc], errors="coerce")).dropna(subset=["_t"]).sort_values("_t")
+            g = g[g["_t"] + pd.Timedelta(minutes=1) <= pd.Timestamp(frames["now"])]
+        closes = [float(x) for x in g["close"].tail(4).tolist() if pd.notna(x)]
+    except Exception:
+        return False, "1m_error"
+    if len(closes) < 4:
+        return False, f"1m_short({len(closes)})"
+    ok = closes[-1] >= closes[0] if buy else closes[-1] <= closes[0]
+    return (True, "1m_3bar_ok") if ok else (False, f"1m_3bar_against({closes[0]}->{closes[-1]})")
+
+
 def run_ai_gate_for_candidates(*args: Any, **kwargs: Any):
     results = _run_ai_gate_for_candidates_base(*args, **kwargs)
     if not isinstance(results, list):
@@ -277,8 +358,27 @@ def run_ai_gate_for_candidates(*args: Any, **kwargs: Any):
     out = []
     changed = []
     kinds: dict = {}
+    relax_on = _env_bool("SUMMARY_AI_MTF_RELAX_ENABLED", True)
+    frames = None
+    relaxed: list = []
+    relax_ng: list = []
     for row in results:
         if isinstance(row, dict) and bool(row.get("allow")) and _wsf_zero_confirm_reason(str(row.get("reason") or "")):
+            if relax_on:
+                try:
+                    if frames is None:
+                        frames = _wsf_relax_frames()
+                    ok, why = _wsf_relax_check(str(row.get("symbol") or ""), str(row.get("side") or row.get("ai_side") or "BUY"), frames)
+                except Exception:
+                    logger.debug("[SUMMARY AI WEAK FILTER RELAX] check failed", exc_info=True)
+                    ok, why = False, "relax_error"
+                if ok:
+                    new_row = dict(row)
+                    new_row["reason"] = f"{new_row.get('reason', '')}|mtf_relaxed:{why}"
+                    relaxed.append((str(row.get("symbol") or ""), str(row.get("side") or ""), why))
+                    out.append(new_row)
+                    continue
+                relax_ng.append((str(row.get("symbol") or ""), why))
             new_row = dict(row)
             new_row["allow"] = False
             kind = _wsf_reason_kind(str(row.get("reason") or ""))
@@ -300,6 +400,9 @@ def run_ai_gate_for_candidates(*args: Any, **kwargs: Any):
             "availability=%s source=%s count=%s symbols=%s",
             kind, kinds or "-", missing or "-", avail or "-", source, len(changed), changed[:20],
         )
+    if relaxed or relax_ng:
+        logger.warning("[SUMMARY AI WEAK FILTER RELAX] source=%s pass=%d ng=%d pass_detail=%s ng_detail=%s",
+                       source, len(relaxed), len(relax_ng), relaxed[:10], relax_ng[:10])
     return out
 
 
