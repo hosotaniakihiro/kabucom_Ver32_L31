@@ -45,7 +45,8 @@ def _env_f(name: str, default: float) -> float:
 
 
 def _enabled() -> bool:
-    return str(os.getenv("THEME_SHORT_GUARD_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+    # 2026-10-08 09:50: 既定 OFF (ユーザー判断「空売り停止しなくていい」)。使う時は THEME_SHORT_GUARD_ENABLED=1
+    return str(os.getenv("THEME_SHORT_GUARD_ENABLED", "0")).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _base() -> Path:
