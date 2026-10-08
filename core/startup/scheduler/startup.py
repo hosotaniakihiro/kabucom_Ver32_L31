@@ -133,6 +133,12 @@ def start_scheduler_stack_before_restore() -> None:
         _register_limitup_fade()
     except Exception:
         logger.exception("[startup.scheduler] limitup_fade register failed")
+    # 2026-10-08: テーマ別の資金流入を 5 分ごとに記録 (売買しない、trading/monitors/theme_flow.py)
+    try:
+        from trading.monitors.theme_flow import register_scheduler_safe as _register_theme_flow
+        _register_theme_flow()
+    except Exception:
+        logger.exception("[startup.scheduler] theme_flow register failed")
     # 2026-10-06: セリングクライマックスの買い (trading/strategies/selling_climax.py)
     try:
         from trading.strategies.selling_climax import register_scheduler_safe as _register_selling_climax
