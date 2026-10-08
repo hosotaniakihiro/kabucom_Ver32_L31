@@ -270,7 +270,9 @@ def run_cycle(now: Optional[dt.datetime] = None) -> None:
                                sym, seen["chg"], v.get("current_price"), float(v.get("trading_value") or 0))
             if seen["status"] != "new":
                 continue
-            if now - _pt(seen["first_ts"]) > dt.timedelta(seconds=c["retry_sec"]):
+            # テーマ待ち (theme_short_guard) は期限切れにしない。テーマが崩れた後にまだ +X% 以上なら売る
+            if (seen.get("last_retry_reason") != "theme_short_guard"
+                    and now - _pt(seen["first_ts"]) > dt.timedelta(seconds=c["retry_sec"])):
                 seen.update(status="skipped", reason="retry_expired"); changed = True
                 continue
             result, reason, detail = _try_entry(sym, v, st, now, c)
@@ -307,6 +309,14 @@ def _try_entry(sym: str, v: Dict[str, Any], st: Dict[str, Any], now: dt.datetime
                                                          "limit_up": lu, "dist_pct": round(dist, 2)}
     if tv < c["min_trading_value"]:
         return "retry", "trading_value_low", {"trading_value": tv}
+    # 2026-10-08: テーマ (セキュリティ関連) が揃って崩れるまで売らない。3927 は +13% で売って 8 分後に +5% 損切り。
+    try:
+        from trading.filters.theme_short_guard import block_reason as _theme_block
+        tb = _theme_block(sym, "SELL")
+    except Exception:
+        tb = None
+    if tb:
+        return "retry", "theme_short_guard", {"detail": tb}
     try:
         from trading.entry.daily_risk_guard import should_allow_new_entry
         dec = should_allow_new_entry(sym)

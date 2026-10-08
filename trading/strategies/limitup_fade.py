@@ -238,6 +238,12 @@ def run_cycle(now: Optional[dt.datetime] = None) -> None:
                         why = f"time={bar_close}"
                     elif x["touch_ts"].startswith("before:"):
                         why = "touch_before_watch(stuck_unknown)"
+                    else:
+                        try:
+                            from trading.filters.theme_short_guard import block_reason as _theme_block
+                            why = _theme_block(sym, "SELL")
+                        except Exception:
+                            why = None
                     if why:
                         x["status"] = "skipped"; x["skip"] = why
                         logger.warning("[LIMITUP FADE] SKIP symbol=%s close=%.1f limit_up=%.1f reason=%s", sym, last, lu, why)

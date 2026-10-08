@@ -1114,6 +1114,16 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
     if _day_ng is not None:
         return _day_ng
 
+    # 2026-10-08: テーマ (セキュリティ関連) に一斉に買いが入っている間は、その銘柄を空売りしない (ユーザー判断)。
+    try:
+        from trading.filters.theme_short_guard import block_reason as _theme_block
+        _tb = _theme_block(symbol, side)
+    except Exception:
+        _tb = None
+    if _tb:
+        logger.warning("[THEME SHORT GUARD] reject symbol=%s side=%s source=%s %s", symbol, side, source, _tb)
+        return _ng("THEME_SHORT_GUARD", symbol=symbol, side=str(side or "").upper(), detail=_tb)
+
     if source == "SUMMARY_AI":
         board = _get_board_with_retry(symbol, source=source, side=side)
         if board:
