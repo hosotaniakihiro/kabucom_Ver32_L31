@@ -311,11 +311,15 @@ def _wsf_relax_check(symbol: str, side: str, frames: dict) -> Tuple[bool, str]:
     buy = str(side or "BUY").upper() != "SELL"
     recs = {tf: (frames.get(tf) or {}).get(sym) for tf in (3, 5)}
     have = {tf: r for tf, r in recs.items() if r is not None}
+    # 3m/5m の点数は買い・売りのどちらか片方だけがプラスになる作りで中立 (両方 0) はほぼ無い
+    # (10/8 の 3 分足 2,788 本中 40 本)。「逆向き > 0」で落とすと元のゲートと同じになるので、
+    # 強い逆向き (既定 3.0 = 最低エントリー点数。3 分足で 3 以上は全体の 1.7%) だけ落とす。
+    opp_min = _env_float("SUMMARY_AI_MTF_RELAX_OPP_MIN", 3.0)
     for tf, r in have.items():
         b = abs(_wsf_num(r, "buy_score", "score_buy") or 0.0)
         s = abs(_wsf_num(r, "sell_score", "score_sell") or 0.0)
         own, opp = (b, s) if buy else (s, b)
-        if opp > 0 and opp > own:
+        if opp >= opp_min and opp > own:
             return False, f"opposite_{tf}m(own={own:.2f},opp={opp:.2f})"
     if have:
         tf = 3 if 3 in have else 5
