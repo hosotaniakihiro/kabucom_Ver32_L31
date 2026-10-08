@@ -14,6 +14,7 @@ from __future__ import annotations
 import collections
 import csv
 import datetime as dt
+import json
 import logging
 import os
 import threading
@@ -97,10 +98,55 @@ def snapshot(lm: Dict[str, Dict[str, Any]] | None = None) -> List[Dict[str, Any]
     return out
 
 
+def _hot_path() -> Path:
+    return _base() / "flow" / "hot_symbols.json"
+
+
+def _write_hot(rows: List[Dict[str, Any]], now: dt.datetime, lm: Dict[str, Dict[str, Any]]) -> None:
+    """2026-10-08 (ユーザー要望): PUSH 50 枠で優先する銘柄を書き出す。読むのは push_receiver 側の rotation。
+    上位 THEME_FLOW_HOT_THEMES テーマ (スコア 1.0 以上) の銘柄のうち、当日 +HOT_MIN_CHG% 以上で動いているもの。
+    株価 200 円未満・売買代金 HOT_MIN_TV 未満は入れない (低位株・薄い銘柄はスプレッドで負ける)。"""
+    min_chg = _env_f("THEME_FLOW_HOT_MIN_CHG", 2.0)
+    min_tv = _env_f("THEME_FLOW_HOT_MIN_TV", 5e8)
+    k = int(_env_f("THEME_FLOW_HOT_THEMES", 3))
+    hot: Dict[str, Dict[str, Any]] = {}
+    for r in [r for r in rows if r["score"] >= 1.0][:k]:
+        for s in themes().get(r["theme"], ()):
+            v = lm.get(s)
+            if not v or s in hot:
+                continue
+            chg, px, tv = _f(v, "change_percentage"), _f(v, "current_price"), _f(v, "trading_value")
+            if chg >= min_chg and px >= 200 and tv >= min_tv:
+                hot[s] = {"theme": r["theme"], "chg": round(chg, 2)}
+    syms = sorted(hot, key=lambda s: -hot[s]["chg"])[: int(_env_f("THEME_FLOW_HOT_MAX", 10))]
+    p = _hot_path()
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"at": now.strftime("%Y-%m-%d %H:%M:%S"), "symbols": syms,
+                               "detail": {s: hot[s] for s in syms}}, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def hot_symbols(max_age_min: float | None = None) -> List[str]:
+    """PUSH 枠で優先する銘柄。古い (既定 15 分超) か無効なら空。"""
+    try:
+        if str(os.getenv("THEME_FLOW_PUSH_PRIORITY", "1")).strip().lower() in ("0", "false", "no", "off"):
+            return []
+        d = json.loads(_hot_path().read_text(encoding="utf-8"))
+        at = dt.datetime.strptime(d["at"], "%Y-%m-%d %H:%M:%S")
+        age = (dt.datetime.now() - at).total_seconds() / 60
+        if age > (max_age_min if max_age_min is not None else _env_f("THEME_FLOW_HOT_MAX_AGE_MIN", 15)):
+            return []
+        return [str(s) for s in d.get("symbols") or []]
+    except Exception:
+        return []
+
+
 def run_cycle() -> List[Dict[str, Any]]:
     with _LOCK:
         t0 = time.time()
-        rows = snapshot()
+        from trading.ranking.active_symbols.ranking_source import build_liquidity_map
+        lm = build_liquidity_map() or {}
+        rows = snapshot(lm)
         now = dt.datetime.now()
         d = _base() / "flow"
         d.mkdir(parents=True, exist_ok=True)
@@ -113,6 +159,10 @@ def run_cycle() -> List[Dict[str, Any]]:
                 w.writeheader()
             for i, r in enumerate(rows[: int(_env_f("THEME_FLOW_TOP_N", 15))], 1):
                 w.writerow({"time": f"{now:%H:%M}", "rank": i, **r})
+        try:
+            _write_hot(rows, now, lm)
+        except Exception:
+            logger.exception("[THEME FLOW] hot symbols write failed")
         head = "; ".join(f"{r['theme']} {r['risers']}/{r['members']} 上昇{int(r['up_ratio']*100)}% 平均{r['avg_chg']:+.1f}%"
                          for r in rows[:6])
         logger.warning("[THEME FLOW] %s themes=%d elapsed=%.1fs top: %s", f"{now:%H:%M}", len(rows), time.time() - t0, head or "-")

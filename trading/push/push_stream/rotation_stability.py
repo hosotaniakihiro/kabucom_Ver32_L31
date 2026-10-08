@@ -663,6 +663,23 @@ def resolve_monitor_symbols() -> list[str]:
     merged = _sort_by_momentum(_d(merged))
     # 2026-10-05: 10:00 以降は直近 15 分の動き順で上書きする (寄り後はボラが縮むため)。
     merged = _sort_by_recent_move(merged)
+    # 2026-10-08 (ユーザー要望): 資金が入っているテーマの銘柄 (theme_flow が 5 分ごとに書く、最大 10) を
+    #   保有銘柄のすぐ後ろに入れて確実に監視する。THEME_FLOW_PUSH_PRIORITY=0 で無効。
+    try:
+        from trading.monitors.theme_flow import hot_symbols as _hot_symbols
+
+        _hot = _d_core(_hot_symbols())
+        if _hot:
+            try:
+                from .protected_symbols import resolve_protected_push_symbols
+
+                _prot = [s for s in _d_core(resolve_protected_push_symbols() or ()) if s]
+            except Exception:
+                _prot = []
+            merged = _d_core(_prot + _hot + merged)
+            logger.info("[PUSH ROTATION TARGET TOPUP] theme flow hot first=%s protected=%d", _hot, len(_prot))
+    except Exception:
+        logger.debug("[PUSH ROTATION TARGET TOPUP] theme flow hot failed", exc_info=True)
     # 2026-10-05: 直近のスプレッドが 0.20% 超の銘柄は最後のガードで必ず弾かれるので後ろへ回す。
     merged = _drop_wide_spread(merged)[:max_keep]
 
