@@ -141,6 +141,64 @@ def hot_symbols(max_age_min: float | None = None) -> List[str]:
         return []
 
 
+def _outflow(rows: List[Dict[str, Any]], now: dt.datetime, lm: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """2026-10-08 (ユーザー要望): 資金が抜けたテーマを判定して記録する (売買には使わない。今夜検証)。
+    一度スコア 1.0 以上になったテーマ (= 資金が入った) について、ピーク時に +RISE% 以上だった銘柄が
+    当日最大上昇幅の GIVEBACK (既定 4 割) 以上を失ったか、テーマのスコアがピークの半分以下に落ちたら OUT。
+    スコアがピークの 8 割まで戻ったら IN に戻す。ランキングから消えた銘柄は分からないので数えない。
+    状態は flow/theme_state_YYYYMMDD.json (再起動しても当日のピークは残る)。"""
+    rise = _env_f("THEME_FLOW_RISE_PCT", 5.0)
+    give = _env_f("THEME_FLOW_OUT_GIVEBACK", 0.4)
+    drop = _env_f("THEME_FLOW_OUT_SCORE_RATIO", 0.5)
+    sp = _base() / "flow" / f"theme_state_{now:%Y%m%d}.json"
+    try:
+        st = json.loads(sp.read_text(encoding="utf-8")) if sp.exists() else {}
+    except Exception:
+        st = {}
+    peak: Dict[str, Any] = st.setdefault("peak", {})
+    symmax: Dict[str, float] = st.setdefault("symmax", {})
+    state: Dict[str, str] = st.setdefault("state", {})
+    for s, v in lm.items():
+        c = _f(v, "change_percentage")
+        if c > symmax.get(s, -999.0):
+            symmax[s] = c
+    cur = {r["theme"]: r for r in rows}
+    for r in rows:
+        if r["score"] >= 1.0 and r["score"] > peak.get(r["theme"], {}).get("score", 0):
+            mem = [s for s in themes().get(r["theme"], ()) if s in lm and _f(lm[s], "change_percentage") >= rise]
+            peak[r["theme"]] = {"score": r["score"], "at": f"{now:%H:%M}", "risers": mem}
+    out_rows = []
+    for t, pk in peak.items():
+        sc = cur.get(t, {}).get("score", 0.0)
+        known = [s for s in pk["risers"] if s in lm]
+        gave = [s for s in known if _f(lm[s], "change_percentage") <= symmax.get(s, 0) * (1 - give)]
+        prev = state.get(t, "IN")
+        if prev == "IN" and (sc <= pk["score"] * drop or (known and len(gave) * 2 >= len(known))):
+            state[t] = "OUT"
+        elif prev == "OUT" and sc >= pk["score"] * 0.8 and len(gave) * 2 < max(1, len(known)):
+            state[t] = "IN"
+        row = {"time": f"{now:%H:%M}", "theme": t, "state": state.get(t, "IN"), "peak": pk["score"], "peak_at": pk["at"],
+               "score": sc, "risers": len(pk["risers"]), "known": len(known), "gave_back": len(gave),
+               "detail": " ".join(f"{s}({_f(lm[s], 'change_percentage'):+.1f}/{symmax.get(s, 0):+.1f})" for s in known[:6])}
+        out_rows.append(row)
+        if state.get(t, "IN") != prev:
+            logger.warning("[THEME FLOW] %s theme=%s peak=%.2f@%s score=%.2f gave_back=%d/%d %s",
+                           "OUTFLOW (資金が抜けた)" if state[t] == "OUT" else "INFLOW AGAIN (また資金が入った)",
+                           t, pk["score"], pk["at"], sc, len(gave), len(known), row["detail"])
+    tmp = sp.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, sp)
+    if out_rows:
+        p = _base() / "flow" / f"theme_outflow_{now:%Y%m%d}.csv"
+        new = not p.exists()
+        with open(p, "a", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(out_rows[0].keys()))
+            if new:
+                w.writeheader()
+            w.writerows(out_rows)
+    return out_rows
+
+
 def run_cycle() -> List[Dict[str, Any]]:
     with _LOCK:
         t0 = time.time()
@@ -163,6 +221,10 @@ def run_cycle() -> List[Dict[str, Any]]:
             _write_hot(rows, now, lm)
         except Exception:
             logger.exception("[THEME FLOW] hot symbols write failed")
+        try:
+            _outflow(rows, now, lm)
+        except Exception:
+            logger.exception("[THEME FLOW] outflow check failed")
         head = "; ".join(f"{r['theme']} {r['risers']}/{r['members']} 上昇{int(r['up_ratio']*100)}% 平均{r['avg_chg']:+.1f}%"
                          for r in rows[:6])
         logger.warning("[THEME FLOW] %s themes=%d elapsed=%.1fs top: %s", f"{now:%H:%M}", len(rows), time.time() - t0, head or "-")
@@ -229,6 +291,16 @@ if __name__ == "__main__":
         print("| テーマ | 最初 | 最後 | 記録回数 | 上位5回数 | 最大スコア | その時の銘柄 |")
         for t, a in sorted(agg.items(), key=lambda kv: (-kv[1]["top5"], -kv[1]["max"]))[:20]:
             print(f"| {t} | {a['first']} | {a['last']} | {a['n']} | {a['top5']} | {a['max']:.2f} | {a['top']} |")
+        po = _base() / "flow" / f"theme_outflow_{day}.csv"
+        if po.exists():
+            seen: Dict[str, str] = {}
+            print("\n## 資金が抜けた / また入った (状態が変わった時刻)")
+            with open(po, encoding="utf-8-sig") as f:
+                for r in csv.DictReader(f):
+                    if seen.get(r["theme"], "IN") != r["state"]:
+                        print(f"- {r['time']} {r['theme']} → {r['state']} (ピーク {r['peak']}@{r['peak_at']} 今 {r['score']} "
+                              f"崩れ {r['gave_back']}/{r['known']}) {r['detail']}")
+                    seen[r["theme"]] = r["state"]
     elif "--loop" in sys.argv:   # システムを再起動せずに今日の分を取る用
         while dt.datetime.now().hour * 100 + dt.datetime.now().minute < 1531:
             if _in_session(dt.datetime.now()):
