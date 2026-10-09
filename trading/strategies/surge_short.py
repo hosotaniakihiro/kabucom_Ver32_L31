@@ -73,6 +73,10 @@ def cfg() -> Dict[str, Any]:
         "trail_back_pct": _env_f("SURGE_SHORT_TRAIL_BACK_PCT", 0.5),
         "stop_pct": _env_f("SURGE_SHORT_STOP_PCT", 5.0),
         "max_yen": _env_f("SURGE_SHORT_MAX_YEN", 300000.0),
+        # 2026-10-09: 1 回の損失の上限 (損切り stop_pct で計算、ユーザー判断)。0 で無効。
+        #   634A (10/9) は 2,760 円 x 100 株が +5% 損切りで -13,800 円、3927 (10/8) は -11,811 円。
+        #   最低 100 株なので 5,000 円だと 1,000 円を超える銘柄は売らない。
+        "max_loss_yen": _env_f("SURGE_SHORT_MAX_LOSS_YEN", 5000.0),
         "max_per_day": int(_env_f("SURGE_SHORT_MAX_PER_DAY", 5)),
         "max_open": int(_env_f("SURGE_SHORT_MAX_OPEN", 3)),
         "min_trading_value": _env_f("SURGE_SHORT_MIN_TRADING_VALUE", 1e8),
@@ -347,6 +351,11 @@ def _try_entry(sym: str, v: Dict[str, Any], st: Dict[str, Any], now: dt.datetime
     qty = int(c["max_yen"] // (bid * 100)) * 100
     if qty <= 0:
         return "skipped", "too_expensive", {"bid": bid, "max_yen": c["max_yen"]}
+    if c["max_loss_yen"] > 0:
+        qty = min(qty, int(c["max_loss_yen"] // (bid * c["stop_pct"] / 100.0 * 100)) * 100)
+        if qty <= 0:
+            return "skipped", "loss_cap_too_small", {"bid": bid, "max_loss_yen": c["max_loss_yen"],
+                                                      "loss_per_100": round(bid * c["stop_pct"], 1)}
     from trading.handlers.entry_handler import place_entry_sell
     oid = place_entry_sell(sym, sym, bid, "SURGE_SHORT", order_type="LIMIT", qty=qty)
     detail = {"bid": bid, "ask": ask, "spread_pct": round(spread_pct, 3), "qty": qty,
