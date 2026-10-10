@@ -319,11 +319,23 @@ def mtf_ma_gate(symbol: Any, side: Any, entry_row: Optional[Dict[str, Any]] = No
 
     results = []
     details = []
+    # 2026-10-09: ANY だと 3m が通れば 5m が買われ過ぎでも買っていた。
+    #   実気配 16 日の検証で「5m RSI>=80 でゲート通過」の買いは 15 分後 -0.81% (n=88、勝率 23%)。
+    #   買いだけ、5m の RSI がこの値以上なら止める (検証したのは 5m だけ)。0 で無効。
+    buy_veto_rsi = _env_f("MTF_GATE_BUY_VETO_RSI", 80.0)
+    veto = ""
     for tf in confirm_tfs:
-        ok, det = _side_ok(_tf_values(sym, tf, entry_row), side_u, mas, _TF_MAP[tf], require_order=require_order)
+        vals = _tf_values(sym, tf, entry_row)
+        ok, det = _side_ok(vals, side_u, mas, _TF_MAP[tf], require_order=require_order)
         results.append(ok)
         details.append(det)
+        if side_u == "BUY" and tf == 5 and buy_veto_rsi > 0:
+            r = _f(vals.get("rsi"), float("nan"))
+            if r == r and r >= buy_veto_rsi:
+                veto = f"{_TF_MAP[tf]}:rsi {r:.1f}>={buy_veto_rsi:.0f}"
     detail_s = ";".join(details)
+    if veto:
+        return False, f"MTF_MA_BUY_OVERBOUGHT_VETO {veto} {detail_s}"
 
     if not any(r is not None for r in results):
         if allow_no_data:
