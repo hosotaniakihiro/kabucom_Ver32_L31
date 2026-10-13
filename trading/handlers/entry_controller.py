@@ -1648,7 +1648,7 @@ def _apply_ma5_third_bar_slope_guard(symbol: str, scored_candidates: list[dict])
         kept = []
         skipped = []
         for item in list(scored_candidates or []):
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or item.get("tonosama_validated"):
                 kept.append(item)
                 continue
             ok, diag = _ma5_third_bar_passes_guard(item)
@@ -1839,6 +1839,41 @@ def _build_scored_candidates(
                     except Exception:
                         logger.exception("SELL_TONOSAMA failed symbol=%s", symbol)
                         continue
+
+            # 2026-10-13: 検証どおりの殿様イナゴ (trading/entry/tonosama/validated_signal.py) は、検証に無い
+            #   汎用ゲート (殿様 AI モデル / ATR / RANGE_5M / 3m5m MA・点数 / AI ゲート / MA5 3 本目) を通さない。
+            #   日次リスク・時間帯・板・発注直前の当日騰落/スプレッド/板ガードは _execute_best_candidate 側で残る。
+            #   戻すなら TONOSAMA_BYPASS_GENERIC_GATES=0。
+            if side == "BUY" and tonosama_required:
+                try:
+                    from trading.entry.tonosama import validated_signal as _tv
+                    _tv_on = _tv.bypass_enabled() and _tv.is_validated_entry(entry, entry_row)
+                except Exception:
+                    logger.exception("[TONOSAMA VALIDATED] bypass check failed symbol=%s", symbol)
+                    _tv_on = False
+                if _tv_on:
+                    _tv_reason = _safe_str(entry.get("tonosama_validated_reason") or entry_row.get("tonosama_validated_reason") or "TONOSAMA_VALIDATED")
+                    entry_row["tonosama_validated"] = True
+                    ai = {"ok": True, "decision": "BUY", "confidence": 1.0, "lot_multiplier": 1.0,
+                          "reason": _tv_reason, "tonosama_validated": True}
+                    logger.warning("[TONOSAMA VALIDATED] bypass generic gates symbol=%s %s", symbol, _tv_reason)
+                    scored_candidates.append(
+                        {
+                            "symbol": symbol,
+                            "entry": entry,
+                            "entry_row": entry_row,
+                            "entry_type": entry_type,
+                            "side": side,
+                            "ai": ai,
+                            "ai_msg": "TONOSAMA_VALIDATED",
+                            "priority_score": 1000.0 + _safe_float(entry.get("final_score"), 0.0),
+                            "confidence": 1.0,
+                            "score_buy": _safe_float(entry.get("score_buy"), 0.0),
+                            "score_sell": 0.0,
+                            "tonosama_validated": True,
+                        }
+                    )
+                    continue
 
             if side == "BUY" and tonosama_required:
                 try:
@@ -3112,14 +3147,18 @@ def _execute_best_candidate_core(item: dict, boost_active: bool) -> bool:
         _log_skip(symbol, reason, side=side)
         return False
 
+    # 2026-10-13: 検証どおりの殿様イナゴは、検証に無い流動性/反転/ハードガードを通さない
+    #   (自前で直近 1 分足の売買代金 >= 2,000 万円を見ている)。時間帯・板・日次リスクは残す。
+    _tv_item = bool(item.get("tonosama_validated"))
+
     # 2. 時間帯/流動性/反転/板ガード
     if not _final_guard_entry_time_ok(symbol, side):
         _log_skip(symbol, "time_guard_ng", side=side)
         return False
-    if not _final_guard_liquidity_ok(entry_row, symbol, side):
+    if not _tv_item and not _final_guard_liquidity_ok(entry_row, symbol, side):
         _log_skip(symbol, "liquidity_guard_ng", side=side)
         return False
-    if not _final_guard_recent_reverse_ok(entry_row, symbol, side):
+    if not _tv_item and not _final_guard_recent_reverse_ok(entry_row, symbol, side):
         _log_skip(symbol, "recent_reverse_guard_ng", side=side)
         return False
     if not _final_guard_board_ok(entry_row, item, symbol, side):
@@ -3127,12 +3166,12 @@ def _execute_best_candidate_core(item: dict, boost_active: bool) -> bool:
         return False
 
     # 3. 出来高/値動きハードガード (SUMMARY_AI高スコア救済つき)
-    if not _hard_guard_ok(item):
+    if not _tv_item and not _hard_guard_ok(item):
         _log_skip(symbol, "liquidity_movement_hard_guard_ng", side=side)
         return False
 
     # 4. 直近summary DB流動性ガード
-    if not _recent_liq_ok(entry_row, symbol, side):
+    if not _tv_item and not _recent_liq_ok(entry_row, symbol, side):
         _log_skip(symbol, "recent_liquidity_guard_ng", side=side)
         return False
 

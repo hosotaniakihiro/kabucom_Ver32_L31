@@ -472,7 +472,9 @@ def place_entry_buy(symbol: str, symbolname: str, price: Optional[float], reason
         # 2026-10-03: 殿様イナゴ由来の建玉は専用の決済 (損切り 1.5% / 60 分) にする
         try:
             _is_tonosama = "TONOSAMA" in str(p.get("reason") or "").upper()
-            if not _is_tonosama:
+            # 2026-10-13: 「同じ銘柄に殿様の pending がある」だけで記録すると、SUMMARY_AI の注文まで
+            #   殿様扱いになる (10/8 の 6203)。既定では理由の文字列だけで判定する。
+            if not _is_tonosama and os.getenv("TONOSAMA_RECORD_BY_PENDING", "0").strip() == "1":
                 from trading.entry.tonosama.pending_writer import has_tonosama_pending as _has_tp
                 _is_tonosama = bool(_has_tp(p["symbol"]))
             if _is_tonosama:

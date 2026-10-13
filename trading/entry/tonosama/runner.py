@@ -1395,7 +1395,13 @@ def tonosama_loop() -> int:
                 time.perf_counter() - started,
             )
             return 0
-        registered = build_tonosama_entries()
+        # 2026-10-13: 検証どおりの定義 (validated_signal) に切り替え。旧来の build_tonosama_entries は
+        #   出来高を累計で扱っていたうえ検証に無いゲートで全部落ちていた。戻すなら TONOSAMA_VALIDATED_SIGNAL=0。
+        from trading.entry.tonosama import validated_signal as _tv
+        if _tv.enabled():
+            registered = _tv.run_once()
+        else:
+            registered = build_tonosama_entries()
         logger.info("[TONOSAMA LOOP] done registered=%s elapsed=%.3fs", registered, time.perf_counter() - started)
         return registered
     except Exception:
