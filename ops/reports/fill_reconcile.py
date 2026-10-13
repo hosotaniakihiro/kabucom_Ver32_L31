@@ -261,6 +261,12 @@ def build_report(orders: list[dict], ymd: str, annual_pct: float, only_day: bool
     closes: dict[str, list[tuple[str, float, float]]] = {}
     sides: dict[str, set] = {}
     fee_map: dict[str, float] = {}
+    # 2026-10-13: 同じ日に買いと売り建ての両方がある銘柄 (6323 など) は、新規/返済の平均同士を
+    #   引くと損益が壊れる (6323 実 +8,470 が -3,365 と出た)。売買の向き付き金額 (売りで受取、
+    #   買いで支払) を足し、数量が釣り合う日はこちらを正とする。
+    cash: dict[str, float] = {}
+    netq: dict[str, float] = {}
+    new_amt: dict[str, dict[str, float]] = {}
     skipped_other_day = 0
     for o in orders:
         sym = str(o.get("Symbol") or "").strip()
@@ -276,6 +282,12 @@ def build_report(orders: list[dict], ymd: str, annual_pct: float, only_day: bool
         if q <= 0:
             continue
         fee_map[sym] = fee_map.get(sym, 0.0) + fees(o)
+        sgn = 1.0 if str(o.get("Side")) == "1" else -1.0
+        cash[sym] = cash.get(sym, 0.0) + sgn * q * px
+        netq[sym] = netq.get(sym, 0.0) + sgn * q
+        if cm == CASH_MARGIN_NEW:
+            d = new_amt.setdefault(sym, {"BUY": 0.0, "SELL": 0.0})
+            d["SELL" if sgn > 0 else "BUY"] += q * px
         if cm == CASH_MARGIN_NEW:
             news.setdefault(sym, []).append((q, px))
             sides.setdefault(sym, set()).add("SELL" if str(o.get("Side")) == "1" else "BUY")
@@ -296,6 +308,10 @@ def build_report(orders: list[dict], ymd: str, annual_pct: float, only_day: bool
         gross = (cavg - navg) * q * (1 if side == "BUY" else -1)
         rate = annual_pct if side == "BUY" else lending_pct
         carry = navg * q * (rate / 365.0) / 100.0
+        if abs(netq.get(sym, 0.0)) < 1e-9 and nq == cq:
+            gross = cash.get(sym, 0.0)
+            d = new_amt.get(sym, {})
+            carry = (d.get("BUY", 0.0) * annual_pct + d.get("SELL", 0.0) * lending_pct) / 365.0 / 100.0
         fee = fee_map.get(sym, 0.0)
         return {"side": side, "navg": navg, "cavg": cavg, "q": q, "gross": gross,
                 "carry": carry, "fee": fee, "net": gross - carry - fee,
