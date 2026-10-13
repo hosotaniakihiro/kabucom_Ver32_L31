@@ -153,6 +153,17 @@ def apply_tonosama_exit_if_needed(
     if not TONOSAMA_EXIT_ENABLED:
         return False
 
+    # 2026-10-13: この判定は建玉の出どころを見ずに全建玉へ掛かっていた。通常の買い (SUMMARY_AI 等) が
+    #   「高値から -0.5% で全決済」で売られていた (10/13 の 3132 / 5246 / 6136。5246 は 32 秒で決済)。
+    #   殿様イナゴとして記録された建玉だけに限る。以前の全建玉適用に戻すなら TONOSAMA_EXIT_POLICY_ALL_POSITIONS=1。
+    if not _env_bool("TONOSAMA_EXIT_POLICY_ALL_POSITIONS", False):
+        try:
+            from trading.strategies.tonosama_exit import is_recorded
+            if not is_recorded(symbol):
+                return False
+        except Exception:
+            return False
+
     if judge_tonosama_exit is None:
         logger.warning("[TONOSAMA EXIT] policy unavailable")
         return False

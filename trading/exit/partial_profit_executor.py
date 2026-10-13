@@ -174,7 +174,8 @@ def _build_close_payload(*, symbol: str, close_side: str, qty: int, exchange: in
         "SecurityType": 1,
         "Side": int(side_num),
         "CashMargin": 3,
-        "MarginTradeType": 1,
+        # 2026-10-13: 本番の新規は一般信用デイトレ (3)。1 固定だと「建玉が選択されていません」で全件 400 だった。
+        "MarginTradeType": int(os.getenv("KABU_DAYTRADE_MARGIN_TYPE", "3") or 3),
         "DelivType": 2,
         "AccountType": 4,
         "Qty": int(qty),
@@ -286,6 +287,12 @@ def execute_partial_profit(
     """
     symbol = _normalize_symbol(symbol)
     if not symbol:
+        return False
+    # 2026-10-13: 一部利確の注文は既定で出さない (ユーザー判断: 利確はトレーリング主体)。
+    #   10/1〜10/13 は MarginTradeType の誤りで全件拒否されており、実質この状態で運用していた。
+    #   出すときは PARTIAL_PROFIT_ORDERS_ENABLED=1。
+    if str(os.getenv("PARTIAL_PROFIT_ORDERS_ENABLED", "0")).strip().lower() not in {"1", "true", "yes", "on"}:
+        logger.info("[PARTIAL PROFIT] orders disabled symbol=%s reason=%s", symbol, str(reason)[:80])
         return False
 
     if not isinstance(pos, dict):

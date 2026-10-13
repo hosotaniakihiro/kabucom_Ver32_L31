@@ -81,6 +81,16 @@ def record_entry(symbol: str, order_id: str, price: Optional[float], qty: Option
     logger.warning("[TONOSAMA EXIT] recorded symbol=%s oid=%s price=%s qty=%s", symbol, order_id, price, qty)
 
 
+def is_recorded(symbol: str) -> bool:
+    """殿様イナゴ由来として記録された建玉か (当日、未決済)。"""
+    try:
+        with _LOCK:
+            t = (_load().get("trades") or {}).get(str(symbol)) or {}
+        return bool(t) and not t.get("closed")
+    except Exception:
+        return False
+
+
 def handle_exit(symbol: str, pos: Dict[str, Any], now: Optional[dt.datetime] = None) -> Optional[bool]:
     """この建玉なら True/False (呼び出し側は以降の決済ルールを通さない)。そうでなければ None。"""
     if not _enabled():
