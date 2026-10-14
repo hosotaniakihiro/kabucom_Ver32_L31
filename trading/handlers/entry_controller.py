@@ -2313,10 +2313,10 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[st
         return False, "", {}
 
     # 2026-10-14: 同じ銘柄の制限を緩和 (ユーザー判断)。回数 2->4 (勝ち銘柄 4->6)、1 回負けたら停止 -> 停止しない、
-    #   銘柄ごとの損失上限 -1,500 -> -5,000 円 (負け続ける銘柄はここで止まる)、発注回数 6->10。
+    #   銘柄ごとの損失上限 -1,500 -> -5,000 円 (10/14 夜に -3,000 円 + 1 日 2 敗で停止へ締め直し)、発注回数 6->10。
     max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 4)
     winning_max_entries = _env_int("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES", 6)
-    symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -5000.0)
+    symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -3000.0)
     stop_after_first_loss = _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", False)
     stop_after_first_loss_only_net_negative = _env_bool("ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE", True)
     global_max_loss = _env_float("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", -50000.0)
@@ -2350,6 +2350,11 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[st
     if stop_after_first_loss and loss_count >= 1:
         if not (stop_after_first_loss_only_net_negative and winning_symbol and daily_pnl > 0):
             return True, "SYMBOL_STOP_AFTER_FIRST_LOSS", {"symbol": symbol, "side": side_u, "winning_symbol": winning_symbol, **srow}
+
+    # 2026-10-14 夜: 緩和初日に 593A が後場の入り直し 7 回で -3,530 円。1 日 2 敗でその銘柄を止める (0 で無効)。
+    max_symbol_losses = _env_int("ENTRY_SYMBOL_MAX_DAILY_LOSSES", 2)
+    if max_symbol_losses > 0 and loss_count >= max_symbol_losses:
+        return True, "SYMBOL_DAILY_LOSS_COUNT_LIMIT", {"symbol": symbol, "side": side_u, "max_losses": max_symbol_losses, **srow}
 
     if float(srow.get("daily_pnl") or 0.0) <= symbol_max_loss:
         return True, "SYMBOL_DAILY_LOSS_LIMIT", {"symbol": symbol, "side": side_u, "max_loss": symbol_max_loss, **srow}

@@ -615,7 +615,8 @@ def _day_change_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any):
     if side_u == "BUY" and day >= buy_max:
         # 2026-10-14: ユーザー判断。+10% 以上でもストップ高まで距離があれば買う。
         #   距離 = (ストップ高 - 現値) / 現値。前日終値は 現値 / (1 + 騰落率) で戻す。0 で無効 (従来どおり全部止める)。
-        min_dist = _env_float_safe("ENTRY_DAY_CHANGE_BUY_ALLOW_LIMIT_DIST_PCT", 5.0)
+        #   2026-10-14 夜: 既定 5 -> 0 (無効)。実気配の検証でこの帯の買いは -0.07〜-0.12% (ユーザー判断で戻す)。
+        min_dist = _env_float_safe("ENTRY_DAY_CHANGE_BUY_ALLOW_LIMIT_DIST_PCT", 0.0)
         if min_dist > 0:
             try:
                 px = float(_epi_first(entry_row, ("close_price", "close", "price", "current_price"), 0.0) or 0.0)
