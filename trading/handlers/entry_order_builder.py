@@ -573,6 +573,15 @@ def _day_change_pct(symbol: Any, entry_row: Any):
         return None
 
 
+def _env_float_safe(name: str, default: float) -> float:
+    import os
+    try:
+        v = os.getenv(name)
+        return float(v) if v not in (None, "") else float(default)
+    except Exception:
+        return float(default)
+
+
 def _day_change_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any):
     """当日すでに大きく動いた側へ乗るのを止める (2026-09-25)。
 
@@ -604,6 +613,24 @@ def _day_change_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any):
         return None
 
     if side_u == "BUY" and day >= buy_max:
+        # 2026-10-14: ユーザー判断。+10% 以上でもストップ高まで距離があれば買う。
+        #   距離 = (ストップ高 - 現値) / 現値。前日終値は 現値 / (1 + 騰落率) で戻す。0 で無効 (従来どおり全部止める)。
+        min_dist = _env_float_safe("ENTRY_DAY_CHANGE_BUY_ALLOW_LIMIT_DIST_PCT", 5.0)
+        if min_dist > 0:
+            try:
+                px = float(_epi_first(entry_row, ("close_price", "close", "price", "current_price"), 0.0) or 0.0)
+            except Exception:
+                px = 0.0
+            if px > 0 and day > -100:
+                from trading.strategies.surge_short import limit_up_price
+                prev_close = px / (1.0 + day / 100.0)
+                dist = (limit_up_price(prev_close) - px) / px * 100.0
+                if dist >= min_dist:
+                    logger.warning(
+                        "[ENTRY DAY CHANGE] allow symbol=%s side=BUY day_change=%+.2f%% limit_up_dist=%.2f%%>=%.1f%%",
+                        symbol, day, dist, min_dist,
+                    )
+                    return None
         limit = buy_max
     elif side_u == "SELL" and day <= sell_min:
         limit = sell_min
@@ -3964,7 +3991,7 @@ _EFF_ENV_DEFAULTS = {
 }
 
 _EFF_SCALPING_DEFAULTS = {
-'ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL':'2','ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY':'1','ENTRY_WINNING_SYMBOL_REENTRY_ENABLED':'1','ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES':'4','ENTRY_WINNING_SYMBOL_MIN_DAILY_PNL':'1','ENTRY_WINNING_SYMBOL_REQUIRE_WIN_GT_LOSS':'1','ENTRY_WINNING_SYMBOL_IGNORE_SENT_ONLY':'1','ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE':'1',
+'ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL':'4','ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY':'1','ENTRY_WINNING_SYMBOL_REENTRY_ENABLED':'1','ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES':'6','ENTRY_WINNING_SYMBOL_MIN_DAILY_PNL':'1','ENTRY_WINNING_SYMBOL_REQUIRE_WIN_GT_LOSS':'1','ENTRY_WINNING_SYMBOL_IGNORE_SENT_ONLY':'1','ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE':'1',
         'RANGE_5M_FILTER_NG_FAIL_OPEN':'1','LOW_MOVE_TONOSAMA_MIN_RANGE_PCT':'0.005','LOW_MOVE_TONOSAMA_STRONG_RANGE_PCT':'0.010','LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE':'0.005','LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE':'0.010','LOW_MOVE_RANKING_MIN_RANGE_PCT_HIGH_PRICE':'0.005','LOW_MOVE_RANKING_MIN_RANGE_PCT_LOW_PRICE':'0.008','LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW':'55.0','LOW_MOVE_RANKING_MIN_ABS_SLOPE':'0.0005','LOW_MOVE_TONOSAMA_MIN_ABS_SLOPE':'0.00005','LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE':'0.0001','LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE':'0.00015',
         'ENTRY_ORDER_MIN_RANGE_PCT':'0.005','ENTRY_ORDER_MIN_ATR_RATIO':'0.0025','ENTRY_ORDER_REQUIRE_ATR':'0','ENTRY_ORDER_REQUIRE_HIGH_LOW':'0','ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH':'1.0','ENTRY_DIRECTION_CONFIRM_STRICT':'0','ENTRY_ORDER_SHORT_MTF_NEUTRAL_MIN_SCORE':'1.0','ENTRY_ORDER_SHORT_MTF_NEUTRAL_EPS':'0.0',
 }

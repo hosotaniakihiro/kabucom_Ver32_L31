@@ -2312,10 +2312,12 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[st
         logger.exception("[ENTRY DAILY RISK] db read failed symbol=%s -> fail-open", symbol)
         return False, "", {}
 
-    max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 2)
-    winning_max_entries = _env_int("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES", 4)
-    symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -1500.0)
-    stop_after_first_loss = _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", True)
+    # 2026-10-14: 同じ銘柄の制限を緩和 (ユーザー判断)。回数 2->4 (勝ち銘柄 4->6)、1 回負けたら停止 -> 停止しない、
+    #   銘柄ごとの損失上限 -1,500 -> -5,000 円 (負け続ける銘柄はここで止まる)、発注回数 6->10。
+    max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 4)
+    winning_max_entries = _env_int("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES", 6)
+    symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -5000.0)
+    stop_after_first_loss = _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", False)
     stop_after_first_loss_only_net_negative = _env_bool("ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE", True)
     global_max_loss = _env_float("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", -50000.0)
     global_max_trades = _env_int("ENTRY_GLOBAL_MAX_DAILY_TRADES", 30)
@@ -2357,7 +2359,7 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[st
     #   回数上限は「実際に約定して返済した回数」で見る。発注の連打だけは別の上限 (既定 6 回) で止める。
     if _env_bool("ENTRY_DAILY_LIMIT_COUNT_FILLED_ONLY", True):
         symbol_seen_entries = entry_count
-        max_sends = _env_int("ENTRY_MAX_DAILY_SENDS_PER_SYMBOL", 6)
+        max_sends = _env_int("ENTRY_MAX_DAILY_SENDS_PER_SYMBOL", 10)
         if max_sends > 0 and entry_sent_count >= max_sends:
             return True, "SYMBOL_DAILY_SEND_LIMIT", {
                 "symbol": symbol, "side": side_u, "max_sends": max_sends, **srow,
