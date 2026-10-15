@@ -129,9 +129,12 @@ def _load_ranking_raw(symbol: str, day: dt.date, since: str, *, exclusive: bool)
         con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=1.0)
         try:
             con.execute("PRAGMA busy_timeout=1000")
+            # 2026-10-15: rank_type='売買代金急増' の行は trading_volume が常に 0 で、各分の最後に入る。
+            #   下の drop_duplicates(keep="last") がそれを拾い、足の出来高が全部 0 になって
+            #   FINAL_LIQ_LATEST_VOLUME_LOW:0<3000 で発注直前に落ちていた (7453, 7689)。
             df = pd.read_sql_query(
                 "SELECT datetime, current_price AS price, trading_volume AS volume FROM ranking_snapshot_1min "
-                f"WHERE symbol=? AND datetime {op} ? ORDER BY datetime",
+                f"WHERE symbol=? AND datetime {op} ? AND trading_volume > 0 ORDER BY datetime, rowid",
                 con, params=(symbol, since),
             )
         finally:
