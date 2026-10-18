@@ -31,6 +31,8 @@ from typing import Callable, Optional
 
 import pandas as pd
 
+from database.sqlite.summary_write_lock import summary_write_lock
+
 from .constants import (
     YAHOO_SUMMARY_LOCK_TIMEOUT_SEC,
     YAHOO_SUMMARY_SKIP_IF_BUSY,
@@ -432,8 +434,9 @@ def _direct_sqlite_upsert_summary_df(df: pd.DataFrame, *, interval: int, db_path
             tuple(_to_sqlite_value(row.get(c)) for c in cols)
             for _, row in work[cols].iterrows()
         ]
-        con.executemany(insert_sql, records)
-        con.commit()
+        with summary_write_lock(f"YAHOO DIRECT {table}"):
+            con.executemany(insert_sql, records)
+            con.commit()
 
         logger.info(
             "[YAHOO SAVE][DIRECT] summary sqlite upsert done interval=%s table=%s rows=%s before=%s dropped_dup=%s conflict=%s db=%s source=%s latest=%s cols=%s",

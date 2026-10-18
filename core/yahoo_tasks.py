@@ -139,6 +139,33 @@ def _is_before_start_time(now: dt.datetime) -> bool:
     return now.time() < YAHOO_START_TIME
 
 
+# ------------------------------------------------------------
+# 引け後の時間帯 (2026-10-19)
+# ------------------------------------------------------------
+# 引け後の Yahoo 補完は 1 日分を毎回まとめて upsert する (1 分足 1 万行超)。
+# これが summary_database / push_receiver の引け後の書き込みと重なった直後に
+# summary DB が壊れていた (9/10, 9/17, 9/24, 10/05, 10/07, 10/16)。
+# 他プロセスの書き込みが落ち着く YAHOO_POSTCLOSE_START まで待ち、
+# YAHOO_POSTCLOSE_END で止める (従来は夜通し毎分、同じ 1 日分を書き直していた)。
+# yahoo_minutely_complement_job は失敗しても例外を上げないので、
+# 「1 回成功したら終わり」にはせず、窓の中では毎分やり直す。
+# YAHOO_POSTCLOSE_START_HHMM=15:30 / END=23:59 で従来に近い動きに戻せる。
+YAHOO_MARKET_CLOSE_TIME = dt.time(15, 30)
+YAHOO_POSTCLOSE_START_TIME = _env_time_hhmm("YAHOO_POSTCLOSE_START_HHMM", "16:15")
+YAHOO_POSTCLOSE_END_TIME = _env_time_hhmm("YAHOO_POSTCLOSE_END_HHMM", "16:45")
+
+
+def _postclose_skip_reason(now: dt.datetime) -> str:
+    t = now.time()
+    if t < YAHOO_MARKET_CLOSE_TIME:
+        return ""
+    if t < YAHOO_POSTCLOSE_START_TIME:
+        return f"引け後 {YAHOO_POSTCLOSE_START_TIME:%H:%M} までは他プロセスの summary 書き込みと重ねない"
+    if t >= YAHOO_POSTCLOSE_END_TIME:
+        return f"引け後の補完時間 ({YAHOO_POSTCLOSE_START_TIME:%H:%M}-{YAHOO_POSTCLOSE_END_TIME:%H:%M}) を過ぎた"
+    return ""
+
+
 def _is_worker_alive() -> bool:
     try:
         return _yahoo_worker_thread is not None and _yahoo_worker_thread.is_alive()
@@ -330,6 +357,10 @@ def _yahoo_wrapper():
     now = dt.datetime.now()
     if _is_before_start_time(now):
         logger.info("⏳ Yahoo補完: %s までは実行しません（スキップ）", YAHOO_START_TIME.strftime("%H:%M"))
+        return
+    reason = _postclose_skip_reason(now)
+    if reason:
+        logger.info("⏳ Yahoo補完: スキップ (%s)", reason)
         return
     started = _start_yahoo_worker(now)
     if not started:

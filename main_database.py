@@ -786,8 +786,15 @@ def _wal_checkpoint_once(force_mode: str | None = None, db_path: "Path | None" =
             # checkpoint 前に journal_mode を設定し直す必要はない。
             # 既に WAL ならこの行が locking protocol / malformed を拾うだけ損。
             _md_ensure_journal_mode_wal_if_needed(conn, "checkpoint")
-            result = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
-            conn.commit()
+            # checkpoint は WAL の中身を .db 本体へ書き戻す = 書き込み。
+            # 引け後は他プロセスの summary 書き込みと重ねない (summary_write_lock.py)。
+            import contextlib
+            from database.sqlite.summary_write_lock import is_summary_target, summary_write_lock
+
+            lock = summary_write_lock(f"{label} WAL CHECKPOINT") if is_summary_target(db_path) else contextlib.nullcontext()
+            with lock:
+                result = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+                conn.commit()
         finally:
             conn.close()
         logger.info(

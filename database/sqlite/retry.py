@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import random
@@ -36,6 +37,8 @@ import time
 from typing import Any, Optional
 
 from sqlalchemy import text
+
+from database.sqlite.summary_write_lock import is_summary_target, summary_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -165,9 +168,16 @@ def run_sql_many_with_retry(
     last_err: Exception | None = None
     use_immediate = USE_BEGIN_IMMEDIATE_DEFAULT if use_begin_immediate is None else bool(use_begin_immediate)
 
+    # 2026-10-19: summary DB は引け後に複数プロセスの書き込みが重なって壊れていた。
+    # 1 トランザクションずつプロセス間 mutex で囲む (summary_write_lock.py 参照)。
+    if is_summary_target(table_name):
+        write_lock = lambda: summary_write_lock(f"{log_prefix} {table_name} chunk={chunk_no}/{total_chunks}")  # noqa: E731
+    else:
+        write_lock = contextlib.nullcontext
+
     for attempt in range(1, retry + 1):
         try:
-            with engine.connect() as conn:
+            with write_lock(), engine.connect() as conn:
                 prepare_sqlite_connection(conn)
 
                 if use_immediate:
