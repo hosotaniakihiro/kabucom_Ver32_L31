@@ -2404,8 +2404,16 @@ def _final_guard_entry_time_ok(symbol: str, side: str) -> bool:
     now = dt.datetime.now().time()
     bh, bm = _final_guard_parse_hhmm(os.getenv("ENTRY_NO_NEW_BEFORE", "09:05"), 9, 5)
     ah, am = _final_guard_parse_hhmm(os.getenv("ENTRY_NO_NEW_AFTER", "15:20"), 15, 20)
-    if now < dt.time(bh, bm) or now >= dt.time(ah, am):
+    if now < dt.time(bh, bm):
         return False
+    if now >= dt.time(ah, am):
+        # 2026-10-19: ENTRY_NO_NEW_AFTER (15:00) 以降は制度信用なら新規してよい (ユーザー判断)。
+        #   信用区分は kabu_api/send_order.send_order_common が 15:00 以降の新規を制度 (MarginTradeType=1) に書き換える。
+        #   日計りの強制決済 (15:24:30) は MarginTradeType=3 だけが対象なので、制度の建玉は持ち越しになる。
+        if not _env_bool("ENTRY_AFTER_CUTOFF_SEIDO_ENABLED", True):
+            return False
+        sh2, sm2 = _final_guard_parse_hhmm(os.getenv("ENTRY_SEIDO_NO_NEW_AFTER", "15:24"), 15, 24)
+        return now < dt.time(sh2, sm2)
     if _env_bool("ENTRY_LUNCH_GUARD_ENABLED", True):
         sh, sm = _final_guard_parse_hhmm(os.getenv("ENTRY_LUNCH_BLOCK_START", "11:30"), 11, 30)
         eh, em = _final_guard_parse_hhmm(os.getenv("ENTRY_LUNCH_BLOCK_END", "12:30"), 12, 30)

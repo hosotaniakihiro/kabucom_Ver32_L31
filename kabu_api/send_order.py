@@ -471,6 +471,19 @@ def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
         _set_last_send_order_error(payload, {"Code": "ENTRY_BUY_DISABLED", "Message": "credit new buy disabled"}, status_code="LOCAL")
         return None
 
+    # 2026-10-19: ENTRY_NO_NEW_AFTER (15:00) 以降の信用新規は制度信用 (MarginTradeType=1) で出す (ユーザー判断)。
+    #   一般信用デイトレ (3) は日計りで当日中に返済が必要なため。制度の建玉は 15:24:30 の強制決済の対象外で持ち越しになる。
+    try:
+        if (_is_credit_new_order_payload(payload) and int(payload.get("MarginTradeType") or 0) != 1
+                and _env_bool("ENTRY_AFTER_CUTOFF_SEIDO_ENABLED", True)):
+            hh, mm = [int(x) for x in str(os.getenv("ENTRY_NO_NEW_AFTER", "15:00")).split(":")[:2]]
+            if dt.datetime.now().time() >= dt.time(hh, mm):
+                logger.warning("[ENTRY SEIDO AFTER CUTOFF] symbol=%s side=%s MarginTradeType %s -> 1 (制度信用、持ち越し)",
+                               _safe_symbol(payload), payload.get("Side"), payload.get("MarginTradeType"))
+                payload["MarginTradeType"] = 1
+    except Exception:
+        logger.exception("[ENTRY SEIDO AFTER CUTOFF] margin type rewrite failed")
+
     if _credit_new_suppressed_now(payload):
         _set_last_send_order_error(payload, {"Code": "LOCAL_SUPPRESS", "Message": "credit new local suppress"}, status_code="LOCAL")
         return None
