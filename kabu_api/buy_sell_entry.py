@@ -350,7 +350,26 @@ def _audit_order_sent_safe(**kwargs) -> None:
         pass
 
 
+def _buy_entry_disabled(payload) -> bool:
+    """2026-10-19: 信用の新規買いを止める (ユーザー判断)。ENTRY_BUY_ENABLED=1 で戻す。
+
+    過去 18 日の実売買で 買い 215 回 -62,140 円 / 売り 32 回 +45,240 円。5 分足 6 か月の検証でも
+    順張り・逆張りのどの買い方もコスト負け (ops/research/buy_style_scan.py)。
+    新規 (CashMargin=2) の買い (Side=2) だけ。返済の買い戻しは kabu_api.close 側なので止まらない。
+    """
+    try:
+        if str(os.getenv("ENTRY_BUY_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on"):
+            return False
+        return isinstance(payload, dict) and int(payload.get("CashMargin") or 0) == 2 and str(payload.get("Side")) == "2"
+    except Exception:
+        return False
+
+
 def _send_order(payload, symbol):
+    if _buy_entry_disabled(payload):
+        logger.warning("[ENTRY BUY DISABLED] 新規買いを送らない symbol=%s qty=%s price=%s (ENTRY_BUY_ENABLED=1 で戻す)",
+                       symbol, payload.get("Qty"), payload.get("Price"))
+        return {"OrderId": None, "Code": -1, "Message": "ENTRY_BUY_DISABLED"}
     side = _audit_side_from_payload(payload if isinstance(payload, dict) else {})
     order_type = _audit_order_type_from_payload(payload if isinstance(payload, dict) else {})
     qty = _audit_payload_get(payload, "Qty", 0)

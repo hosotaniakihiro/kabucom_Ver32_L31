@@ -462,6 +462,15 @@ def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
     if _block_if_market_closed(payload):
         return None
 
+    # 2026-10-19: 信用の新規買いを止める (ユーザー判断)。ENTRY_BUY_ENABLED=1 で戻す。
+    #   過去 18 日の実売買で 買い 215 回 -62,140 円 / 売り 32 回 +45,240 円。返済 (CashMargin=3) は止めない。
+    if (_is_credit_new_order_payload(payload) and str(payload.get("Side")) == "2"
+            and not _env_bool("ENTRY_BUY_ENABLED", False)):
+        logger.warning("[ENTRY BUY DISABLED] 新規買いを送らない symbol=%s qty=%s price=%s (ENTRY_BUY_ENABLED=1 で戻す)",
+                       _safe_symbol(payload), payload.get("Qty"), payload.get("Price"))
+        _set_last_send_order_error(payload, {"Code": "ENTRY_BUY_DISABLED", "Message": "credit new buy disabled"}, status_code="LOCAL")
+        return None
+
     if _credit_new_suppressed_now(payload):
         _set_last_send_order_error(payload, {"Code": "LOCAL_SUPPRESS", "Message": "credit new local suppress"}, status_code="LOCAL")
         return None

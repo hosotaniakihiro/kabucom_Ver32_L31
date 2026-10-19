@@ -2302,7 +2302,8 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[st
         return False, "", {}
     symbol = normalize_symbol(symbol)
     side_u = str(side or "").upper()
-    if side_u == "BUY" and not _env_bool("ENTRY_BUY_ENABLED", True):
+    # 2026-10-19: 既定で新規買いを止める (ユーザー判断)。kabu_api/buy_sell_entry._buy_entry_disabled と同じ env。
+    if side_u == "BUY" and not _env_bool("ENTRY_BUY_ENABLED", False):
         return True, "BUY_DISABLED_BY_DAILY_RISK_PATCH", {"symbol": symbol, "side": side_u}
 
     try:
