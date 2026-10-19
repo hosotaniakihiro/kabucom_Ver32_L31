@@ -33,6 +33,22 @@ from token_manager import get_valid_token
 
 logger = logging.getLogger(__name__)
 
+import contextlib as _contextlib
+import contextvars as _contextvars
+
+# 2026-10-19: 新規注文の信用区分を呼び出し側で決める (1=制度、3=一般デイトレ)。
+#   with margin_trade_type_override(1): place_entry_sell(...) のように使う。スレッド/コンテキストごと。
+_FORCED_MARGIN_TRADE_TYPE: "_contextvars.ContextVar[int | None]" = _contextvars.ContextVar("forced_margin_trade_type", default=None)
+
+
+@_contextlib.contextmanager
+def margin_trade_type_override(margin_trade_type: int):
+    token = _FORCED_MARGIN_TRADE_TYPE.set(int(margin_trade_type))
+    try:
+        yield
+    finally:
+        _FORCED_MARGIN_TRADE_TYPE.reset(token)
+
 API_URL = "http://localhost:18080/kabusapi"
 
 TRADE_RESTRICT_SEC = 1800
@@ -471,6 +487,16 @@ def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
         _set_last_send_order_error(payload, {"Code": "ENTRY_BUY_DISABLED", "Message": "credit new buy disabled"}, status_code="LOCAL")
         return None
 
+    # 2026-10-19: 呼び出し側が信用区分を指定した新規 (OVEREXT_SHORT の制度信用など)。margin_trade_type_override 参照。
+    try:
+        _forced = _FORCED_MARGIN_TRADE_TYPE.get()
+        if _forced and _is_credit_new_order_payload(payload) and int(payload.get("MarginTradeType") or 0) != int(_forced):
+            logger.warning("[MARGIN TYPE OVERRIDE] symbol=%s side=%s MarginTradeType %s -> %s",
+                           _safe_symbol(payload), payload.get("Side"), payload.get("MarginTradeType"), _forced)
+            payload["MarginTradeType"] = int(_forced)
+    except Exception:
+        logger.exception("[MARGIN TYPE OVERRIDE] failed")
+
     # 2026-10-19: ENTRY_NO_NEW_AFTER (15:00) 以降の信用新規は制度信用 (MarginTradeType=1) で出す (ユーザー判断)。
     #   一般信用デイトレ (3) は日計りで当日中に返済が必要なため。制度の建玉は 15:24:30 の強制決済の対象外で持ち越しになる。
     try:
@@ -481,6 +507,12 @@ def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
                 logger.warning("[ENTRY SEIDO AFTER CUTOFF] symbol=%s side=%s MarginTradeType %s -> 1 (制度信用、持ち越し)",
                                _safe_symbol(payload), payload.get("Side"), payload.get("MarginTradeType"))
                 payload["MarginTradeType"] = 1
+                # 15:24:30 の強制決済で返済されないよう持ち越し登録する (制度は全区分が強制決済の対象)
+                try:
+                    from trading.strategies.overnight_holds import register as _register_overnight
+                    _register_overnight(_safe_symbol(payload), "ENTRY_AFTER_CUTOFF_SEIDO", days=3)
+                except Exception:
+                    logger.exception("[ENTRY SEIDO AFTER CUTOFF] overnight register failed")
     except Exception:
         logger.exception("[ENTRY SEIDO AFTER CUTOFF] margin type rewrite failed")
 

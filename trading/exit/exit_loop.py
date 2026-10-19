@@ -106,6 +106,13 @@ def exit_loop_5s() -> None:
                         continue
                 except Exception:
                     logger.exception("[EXIT LOOP] surge_short handle_exit failed symbol=%s", symbol)
+                # 2026-10-19: 日足の上がりすぎ売り (OVEREXT_SHORT) の建玉は 翌営業日 15:15 の時間決済と逆指値だけで扱う
+                try:
+                    from trading.strategies.overext_short import handle_exit as _overext_handle_exit
+                    if _overext_handle_exit(symbol, pos, now) is not None:
+                        continue
+                except Exception:
+                    logger.exception("[EXIT LOOP] overext_short handle_exit failed symbol=%s", symbol)
                 # 2026-10-06: セリングクライマックスの買い建玉は 損切り 1% / 30 分 で扱う
                 try:
                     from trading.strategies.selling_climax import handle_exit as _climax_handle_exit

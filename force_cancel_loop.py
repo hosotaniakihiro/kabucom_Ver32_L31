@@ -429,6 +429,13 @@ def start_force_cancel_loop(interval_sec=30):
                         continue
                 except Exception:
                     pass
+                # 2026-10-19: OVEREXT_SHORT の逆指値も取消さない
+                try:
+                    from trading.strategies.overext_short import protected_order_ids as _overext_protected
+                    if str(order_id) in _overext_protected():
+                        continue
+                except Exception:
+                    pass
 
                 is_limit = price not in (0, None)
                 is_open = qty and cum < qty

@@ -127,6 +127,12 @@ def start_scheduler_stack_before_restore() -> None:
         _register_surge_short()
     except Exception:
         logger.exception("[startup.scheduler] surge_short register failed")
+    # 2026-10-19: 日足で上がりすぎた銘柄の崩れ売り、制度信用で翌日まで持つ (trading/strategies/overext_short.py)
+    try:
+        from trading.strategies.overext_short import register_scheduler_safe as _register_overext_short
+        _register_overext_short()
+    except Exception:
+        logger.exception("[startup.scheduler] overext_short register failed")
     # 2026-10-07: ストップ高タッチ後の崩れ売り (記録だけ、trading/strategies/limitup_fade.py)
     try:
         from trading.strategies.limitup_fade import register_scheduler_safe as _register_limitup_fade

@@ -238,6 +238,16 @@ def _is_target_position(p: dict[str, Any]) -> bool:
         only = str(os.environ.get("DAYTRADE_FORCE_CLOSE_ONLY_MARGIN_TYPE", "3") or "").strip()
         if only and only != "0" and mt != _safe_int(only, 3):
             return False
+        # 2026-10-19: 持ち越す前提で登録した制度信用の建玉は返済しない (trading/strategies/overnight_holds.py)。
+        #   日計り (3) は証券会社側も当日返済が必要なので、登録があっても飛ばさない。
+        if mt != 3:
+            try:
+                from trading.strategies.overnight_holds import is_overnight
+                if is_overnight(_norm_symbol(p.get("Symbol"))):
+                    logger.warning("[DAYTRADE FORCE CLOSE] skip overnight hold symbol=%s margin_trade_type=%s", p.get("Symbol"), mt)
+                    return False
+            except Exception:
+                logger.exception("[DAYTRADE FORCE CLOSE] overnight hold check failed symbol=%s", p.get("Symbol"))
         qty = _safe_int(p.get("LeavesQty") or p.get("Qty"), 0)
         if qty <= 0:
             return False
