@@ -793,12 +793,27 @@ def _judge_entry_trail_retrace_exit(*, symbol: str, pos: Dict[str, Any], side: s
         return False, "", {}
 
     st = _et3_state(symbol)
+    # 2026-10-19: 高値/安値は銘柄単位で持っていたため、同じ銘柄に入り直すと前のポジションの
+    #   高値が残り、建値より上の line で約定直後に決済していた (593A: 建値 2084 / 前回高値 2098)。
+    #   side・建値・hold_id が変わったら新しいポジションとして捨てる。ctx も銘柄単位で
+    #   使い回されるので、切り替わった回は ctx/pos の高値も使わない。
+    hold = str(_et3_pos_get(pos, "hold_id", "HoldID", "execution_id", "ExecutionID") or "")
+    key = (side_u, round(entry, 4))
+    old_hold = str(st.get("hold") or "")
+    fresh = st.get("key") != key or (hold and old_hold and hold != old_hold)
+    if fresh:
+        if st.get("key") is not None:
+            logger.info("[ENTRY_TRAIL_RETRACE_EXIT] reset state symbol=%s old_key=%s old_hold=%s new_key=%s new_hold=%s old_high=%s old_low=%s", symbol, st.get("key"), old_hold, key, hold, st.get("highest"), st.get("lowest"))
+        st.clear()
+        st["key"] = key
+    if hold:
+        st["hold"] = hold
     old_high = _et3_f(st.get("highest"))
     old_low = _et3_f(st.get("lowest"))
-    pos_high = _et3_f(_et3_pos_get(pos, "highest_since_entry", "highest", "high_since_entry"))
-    pos_low = _et3_f(_et3_pos_get(pos, "lowest_since_entry", "lowest", "low_since_entry"))
-    ctx_high = _et3_f(getattr(ctx, "highest", 0.0)) if ctx is not None else 0.0
-    ctx_low = _et3_f(getattr(ctx, "lowest", 0.0)) if ctx is not None else 0.0
+    pos_high = 0.0 if fresh else _et3_f(_et3_pos_get(pos, "highest_since_entry", "highest", "high_since_entry"))
+    pos_low = 0.0 if fresh else _et3_f(_et3_pos_get(pos, "lowest_since_entry", "lowest", "low_since_entry"))
+    ctx_high = _et3_f(getattr(ctx, "highest", 0.0)) if ctx is not None and not fresh else 0.0
+    ctx_low = _et3_f(getattr(ctx, "lowest", 0.0)) if ctx is not None and not fresh else 0.0
 
     high = max(x for x in [entry, cur, old_high, pos_high, ctx_high] if x > 0)
     low = min(x for x in [entry, cur, old_low, pos_low, ctx_low] if x > 0)
