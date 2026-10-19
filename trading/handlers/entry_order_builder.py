@@ -70,7 +70,8 @@ ALLOW_MARKET_IF_BAD_BOARD = str(os.getenv("ALLOW_MARKET_IF_BAD_BOARD", "1")).low
 }
 
 MAX_SPREAD_PCT_FOR_LIMIT = float(
-    os.getenv("MAX_SPREAD_PCT_FOR_LIMIT", os.getenv("ENTRY_ORDER_MAX_SPREAD_PCT", "0.15"))
+    # 2026-10-19: 0.15 -> 0.20 (最終ガード ENTRY_MAX_SPREAD_PCT と同じ)。634A 急騰中は 0.18%。
+    os.getenv("MAX_SPREAD_PCT_FOR_LIMIT", os.getenv("ENTRY_ORDER_MAX_SPREAD_PCT", "0.20"))
 )
 
 MIN_ENTRY_QTY = 100
@@ -684,7 +685,8 @@ def _price_drift_max_pct() -> float:
     try:
         import os
 
-        return float(os.getenv("ENTRY_PRICE_DRIFT_MAX_PCT", "0.5") or 0.5)
+        # 2026-10-19: 0.5 -> 1.0。急騰中は判定から 2 秒で 0.6% 動き、634A を 2 回逃した。
+        return float(os.getenv("ENTRY_PRICE_DRIFT_MAX_PCT", "1.0") or 1.0)
     except Exception:
         return 0.5
 

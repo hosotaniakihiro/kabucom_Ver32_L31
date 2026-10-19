@@ -999,8 +999,13 @@ def _cdp_reject_reason(entry: dict[str, Any], metrics: dict[str, Any], pm: Any =
     if side == "SELL" and day_pos <= low_zone:
         if strict_zone_only or from_open <= -open_extreme or vwap_gap <= -vwap_extreme or price_chg <= -short_chg_extreme:
             return "day_low_zone_selling_climax_guard"
+    # 2026-10-19: 買い側だけ寄り値比 5%→15%、VWAP 乖離 4%→8% に緩める (ユーザー判断「後場の分を取りにいく」)。
+    #   634A は寄り値比 +5.5〜11%、VWAP +2〜7% で上昇中に 6 回弾かれ、+14% を逃した。
+    #   直近の急変 (short_chg) は売り側と同じ基準で残す。
+    buy_open_extreme = abs(_cdp_env_float("COMMON_ENTRY_DAY_POSITION_BUY_FROM_OPEN_EXTREME_PCT", 15.0))
+    buy_vwap_extreme = abs(_cdp_env_float("COMMON_ENTRY_DAY_POSITION_BUY_VWAP_EXTREME_PCT", 8.0))
     if side == "BUY" and day_pos >= high_zone:
-        if strict_zone_only or from_open >= open_extreme or vwap_gap >= vwap_extreme or price_chg >= short_chg_extreme:
+        if strict_zone_only or from_open >= buy_open_extreme or vwap_gap >= buy_vwap_extreme or price_chg >= short_chg_extreme:
             return "day_high_zone_buying_climax_guard"
     return None
 
