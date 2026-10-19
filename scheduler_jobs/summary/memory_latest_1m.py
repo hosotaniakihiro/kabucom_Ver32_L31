@@ -1724,7 +1724,10 @@ def _load_push_memory_df() -> pd.DataFrame:
     if not _push_db_refresh_enabled():
         return base
 
-    max_stale = max(10.0, _env_float("SUMMARY_MAIN_PUSH_DB_REFRESH_MAX_STALE_SEC", 75.0))
+    # 2026-10-19: 75 -> 10。毎分 :00 の 1 分足作成時、前回の書き戻しから 60 秒しか経っていないと
+    #   memory (最新ティック = 前の分の :59) をそのまま使い、直前の分の足が無いまま stale 判定 (120 秒) で
+    #   捨てていた。書き戻しが 2 分に 1 回になり、奇数分のエントリー判定が丸ごと止まっていた (10/19 は 134 回中 111 回)。
+    max_stale = max(10.0, _env_float("SUMMARY_MAIN_PUSH_DB_REFRESH_MAX_STALE_SEC", 10.0))
     stale = _stale_sec(base)
     if isinstance(base, pd.DataFrame) and not base.empty and stale is not None and stale <= max_stale:
         return base
