@@ -73,6 +73,35 @@ def scan(b: pd.DataFrame, *, base: int, base_range: float, dry: float, ign: floa
     ev["r60"] = ev["c12"] / ev["entry"] - 1 - COST
     ev["r60_stop"] = np.where(first.notna(), ev["base_lo"] / ev["entry"] - 1 - COST, ev["r60"])
     ev["stop_pct"] = (ev["base_lo"] / ev["entry"] - 1) * 100
+    # 2026-10-20 (ユーザー): 時間ではなく 5MA で一旦利確。足の確定を待たず「株価が」5MA を割ったら売る。
+    #   5MA は直前に確定した足までの値 (ma5 を 1 本ずらす)。足 k の安値がその線以下なら線の値段で、
+    #   始値がすでに線より下なら始値で売る。同じ足で土台の安値も割ったら損切りを優先 (控えめ)。
+    #   どちらも無ければその日の最後の終値。
+    ma5 = g["close"].transform(lambda s: s.rolling(5).mean())
+    H = 48
+    sh_k = lambda ser, k: ser.groupby(sd).shift(-k)
+    opens = pd.concat([g["open"].shift(-k) for k in range(1, H + 1)], axis=1).loc[ev.index].values
+    lows48 = pd.concat([g["low"].shift(-k) for k in range(1, H + 1)], axis=1).loc[ev.index].values
+    line = pd.concat([sh_k(ma5, k - 1) for k in range(1, H + 1)], axis=1).loc[ev.index].values
+    nanc = np.isnan(lows48)
+    hit_ma = (lows48 <= line) & ~nanc & ~np.isnan(line)
+    hit_stop = (lows48 <= ev["base_lo"].values[:, None]) & ~nanc
+    def first_idx(m):
+        return np.where(m.any(axis=1), m.argmax(axis=1), 10**6)
+    ib, istop = first_idx(hit_ma), first_idx(hit_stop)
+    lastv = last_c.values
+    out, bars = [], []
+    for j in range(len(ev)):
+        e = ev["entry"].values[j]
+        if istop[j] < 10**6 and istop[j] <= ib[j]:
+            px = min(opens[j, istop[j]], ev["base_lo"].values[j]); bars.append(istop[j] + 1)
+        elif ib[j] < 10**6:
+            px = min(opens[j, ib[j]], line[j, ib[j]]); bars.append(ib[j] + 1)
+        else:
+            px = lastv[j]; bars.append(np.nan)
+        out.append(px / e - 1 - COST)
+    ev["r_ma5"] = out
+    ev["bars_ma5"] = bars
     ev["half"] = np.where(ev["d"] < b["d"].quantile(0.5), "前半", "後半")
     return ev
 
@@ -84,7 +113,10 @@ def summary(ev: pd.DataFrame) -> dict:
             "勝率60損切り": (ev["r60_stop"] > 0).mean() * 100,
             "前半60%": ev.loc[ev.half == "前半", "r60_stop"].mean() * 100,
             "後半60%": ev.loc[ev.half == "後半", "r60_stop"].mean() * 100,
-            "損切り幅%": ev["stop_pct"].median()}
+            "損切り幅%": ev["stop_pct"].median(),
+            "5MA利確%": ev["r_ma5"].mean() * 100, "勝率5MA": (ev["r_ma5"] > 0).mean() * 100,
+            "5MA前半%": ev.loc[ev.half == "前半", "r_ma5"].mean() * 100, "5MA後半%": ev.loc[ev.half == "後半", "r_ma5"].mean() * 100,
+            "保有本数": ev["bars_ma5"].median()}
 
 
 def main() -> None:
@@ -100,11 +132,13 @@ def main() -> None:
                     for drop in (1.5, 3.0):
                         ev = scan(b, base=base, base_range=base_range, dry=dry, ign=ign, drop=drop)
                         rows.append({"土台本数": base, "土台値幅%": base_range, "出来高細り": dry, "号砲倍率": ign, "下げ%": drop, **summary(ev)})
-                        print(rows[-1]["土台本数"], base_range, dry, ign, drop, rows[-1]["件数"], round(rows[-1]["60分損切り%"], 3), flush=True)
+                        print(rows[-1]["土台本数"], base_range, dry, ign, drop, rows[-1]["件数"], round(rows[-1]["5MA利確%"], 3), flush=True)
     t = pd.DataFrame(rows).round(3)
     t.to_csv(os.path.join(LOCAL, "research", "base_ignition_grid.csv"), index=False, encoding="utf-8-sig")
-    print("\n===== 条件ごとの成績 (60 分損切り% の高い順) =====")
-    print(t.sort_values("60分損切り%", ascending=False).to_string(index=False))
+    print("\n===== 条件ごとの成績 (5MA 利確% の高い順) =====")
+    cols = ["土台本数", "土台値幅%", "出来高細り", "号砲倍率", "下げ%", "件数", "5MA利確%", "勝率5MA", "5MA前半%", "5MA後半%",
+            "保有本数", "60分損切り%", "損切り幅%"]
+    print(t.sort_values("5MA利確%", ascending=False)[cols].to_string(index=False))
 
 
 if __name__ == "__main__":
