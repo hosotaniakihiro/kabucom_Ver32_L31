@@ -467,6 +467,63 @@ def _entry_paused_by_file(payload: dict) -> bool:
         return False
 
 
+_PREMIUM_CACHE: dict = {}  # symbol -> (取得時刻, DayTrade dict)
+
+
+def _daytrade_premium(symbol: str):
+    """/margin/marginpremium の DayTrade 部分 (円/株)。5 分キャッシュ。取れなければ None。"""
+    now = dt.datetime.now().timestamp()
+    hit = _PREMIUM_CACHE.get(symbol)
+    if hit and now - hit[0] < 300:
+        return hit[1]
+    token = get_valid_token()
+    if not token:
+        return None
+    try:
+        r = requests.get(f"{API_URL}/margin/marginpremium/{symbol}", headers={"X-API-KEY": token}, timeout=3)
+        if r.status_code != 200:
+            logger.warning("[DAYTRADE SHORT PREMIUM] marginpremium status=%s symbol=%s body=%s", r.status_code, symbol, r.text[:200])
+            return None
+        d = (r.json() or {}).get("DayTrade") or {}
+    except Exception:
+        logger.warning("[DAYTRADE SHORT PREMIUM] marginpremium failed symbol=%s", symbol, exc_info=True)
+        return None
+    _PREMIUM_CACHE[symbol] = (now, d)
+    return d
+
+
+def _daytrade_short_premium_block_reason(payload: dict) -> str:
+    """一般信用デイトレ (MarginTradeType=3) の新規売りで、プレミアム料が高すぎれば理由を返す。それ以外は ""。
+
+    プレミアム料が取れないときも送らない (4493 のような 0.5% を見落とすより、1 回見送るほうが安い)。
+    """
+    try:
+        if not _is_sell_credit_new_payload(payload) or int(payload.get("MarginTradeType") or 0) != 3:
+            return ""
+        max_pct = float(os.getenv("DAYTRADE_SHORT_MAX_PREMIUM_PCT", "0.1"))
+        if max_pct < 0:
+            return ""
+        sym = _safe_symbol(payload)
+        d = _daytrade_premium(sym)
+        if d is None:
+            return "reason=premium_unavailable"
+        if d.get("MarginPremiumType") is None:
+            return ""  # デイトレ空売りの対象外。証券会社が断り、制度信用への切替 (_retry_with_fallback_margin) に任せる
+        prem = float(d.get("MarginPremium") or 0.0)
+        if prem <= 0:
+            return ""
+        price = float(payload.get("Price") or 0.0)
+        if price <= 0:
+            return f"reason=premium_no_price premium_yen={prem}"
+        pct = prem / price * 100.0
+        if pct > max_pct:
+            return f"reason=premium_too_high premium_yen={prem} premium_pct={pct:.3f} max_pct={max_pct}"
+        return ""
+    except Exception:
+        logger.exception("[DAYTRADE SHORT PREMIUM] check failed")
+        return "reason=premium_check_error"
+
+
 def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
     if not isinstance(payload, dict):
         logger.error("❌ send_order_common: payload is not dict type=%s payload=%s", type(payload).__name__, payload)
@@ -515,6 +572,15 @@ def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
                     logger.exception("[ENTRY SEIDO AFTER CUTOFF] overnight register failed")
     except Exception:
         logger.exception("[ENTRY SEIDO AFTER CUTOFF] margin type rewrite failed")
+
+    # 2026-10-20: 一般信用デイトレの新規売りは、プレミアム料が売値の DAYTRADE_SHORT_MAX_PREMIUM_PCT (0.1%) を超えたら送らない。
+    #   10/20 の 4493 は 100 株 1,680 円 (売値の 0.5%) を 2 回払った。研究で見えた有利さは多くて 0.1%。
+    _premium_reason = _daytrade_short_premium_block_reason(payload)
+    if _premium_reason:
+        logger.warning("[DAYTRADE SHORT PREMIUM] 新規売りを送らない symbol=%s price=%s %s",
+                       _safe_symbol(payload), payload.get("Price"), _premium_reason)
+        _set_last_send_order_error(payload, {"Code": "DAYTRADE_SHORT_PREMIUM", "Message": _premium_reason}, status_code="LOCAL")
+        return None
 
     if _credit_new_suppressed_now(payload):
         _set_last_send_order_error(payload, {"Code": "LOCAL_SUPPRESS", "Message": "credit new local suppress"}, status_code="LOCAL")
