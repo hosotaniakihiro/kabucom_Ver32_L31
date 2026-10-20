@@ -504,6 +504,13 @@ def place_entry_sell(symbol: str, symbolname: str, price: Optional[float], reaso
         if not p["symbol"]:
             raise ValueError("SELL requires symbol")
 
+        # 2026-10-20: Summary AI の新規売りは止める (entry_controller と同じ env)。別の経路から来ても送らない。
+        if (str(p["reason"] or "").upper().startswith("SUMMARY_AI")
+                and str(os.getenv("ENTRY_SUMMARY_AI_SELL_ENABLED", "0")).strip().lower() not in ("1", "true", "yes", "on")):
+            logger.warning("[SUMMARY AI SELL DISABLED] 新規売りを送らない symbol=%s price=%s qty=%s (ENTRY_SUMMARY_AI_SELL_ENABLED=1 で戻す)",
+                           p["symbol"], p["price"], p["qty"])
+            return None
+
         liq_ok, liq_reason, liq_detail = _final_recent_liquidity_ok(p["symbol"], "SELL")
         if not liq_ok:
             logger.warning("[ENTRY FINAL LIQ GUARD] SELL blocked symbol=%s reason=%s detail=%s", p["symbol"], liq_reason, liq_detail)

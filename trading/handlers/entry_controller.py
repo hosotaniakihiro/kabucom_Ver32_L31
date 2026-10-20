@@ -3148,6 +3148,18 @@ def _execute_cleanup_inflight() -> None:
                 _EXECUTE_INFLIGHT.pop(key, None)
 
 
+def _is_summary_ai_item(item: dict, entry_row: Any, entry_type: Any) -> bool:
+    try:
+        vals = [entry_type, item.get("entry_type"), item.get("source")]
+        if isinstance(entry_row, dict):
+            vals += [entry_row.get("entry_type"), entry_row.get("source")]
+        elif entry_row is not None and hasattr(entry_row, "get"):
+            vals += [entry_row.get("entry_type"), entry_row.get("source")]
+        return any(str(v or "").upper().startswith("SUMMARY") for v in vals)
+    except Exception:
+        return False
+
+
 def _execute_best_candidate_core(item: dict, boost_active: bool) -> bool:
     symbol = item["symbol"]
     entry_row = item["entry_row"]
@@ -3161,6 +3173,14 @@ def _execute_best_candidate_core(item: dict, boost_active: bool) -> bool:
     blocked, reason, detail = _daily_risk_block_reason(symbol, side)
     if blocked:
         _log_skip(symbol, reason, side=side)
+        return False
+
+    # 2026-10-20: Summary AI の新規売りを止める (ユーザー判断)。ENTRY_SUMMARY_AI_SELL_ENABLED=1 で戻す。
+    #   9/07〜 の実売買で 19 回 ほぼ ±0 (プレミアム料前)。5MA 下抜けの何本目で売っても 6 か月でコスト負け
+    #   (ops/research/ma5_break_bar_scan.py)。売りは SURGE SHORT / OVEREXT_SHORT (別経路) だけ残す。
+    if (str(side or "").upper() == "SELL" and _is_summary_ai_item(item, entry_row, entry_type)
+            and not _env_bool("ENTRY_SUMMARY_AI_SELL_ENABLED", False)):
+        _log_skip(symbol, "SUMMARY_AI_SELL_DISABLED", side=side)
         return False
 
     # 2026-10-13: 検証どおりの殿様イナゴは、検証に無い流動性/反転/ハードガードを通さない

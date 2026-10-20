@@ -357,7 +357,10 @@ def _try_entry(sym: str, v: Dict[str, Any], st: Dict[str, Any], now: dt.datetime
             return "skipped", "loss_cap_too_small", {"bid": bid, "max_loss_yen": c["max_loss_yen"],
                                                       "loss_per_100": round(bid * c["stop_pct"], 1)}
     from trading.handlers.entry_handler import place_entry_sell
-    oid = place_entry_sell(sym, sym, bid, "SURGE_SHORT", order_type="LIMIT", qty=qty)
+    from kabu_api.send_order import premium_cap_override
+    # 2026-10-20: send_order_common の共通上限 (0.1%) ではなく、この戦略の max_premium_pct (0.4%) で出す
+    with premium_cap_override(c["max_premium_pct"]):
+        oid = place_entry_sell(sym, sym, bid, "SURGE_SHORT", order_type="LIMIT", qty=qty)
     detail = {"bid": bid, "ask": ask, "spread_pct": round(spread_pct, 3), "qty": qty,
               "premium_pct": round(prem_pct, 3), "chg": float(v.get("change_percentage") or 0), "trading_value": tv}
     if not oid:

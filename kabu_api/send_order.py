@@ -34,6 +34,7 @@ from token_manager import get_valid_token
 logger = logging.getLogger(__name__)
 
 import contextlib as _contextlib
+import sys as _sys
 import contextvars as _contextvars
 
 # 2026-10-19: 新規注文の信用区分を呼び出し側で決める (1=制度、3=一般デイトレ)。
@@ -469,6 +470,19 @@ def _entry_paused_by_file(payload: dict) -> bool:
 
 _PREMIUM_CACHE: dict = {}  # symbol -> (取得時刻, DayTrade dict)
 
+# 2026-10-20: 戦略ごとのプレミアム料上限 (%)。SURGE SHORT は 1 回 +2% 前後を取るので 0.4% まで払う (ユーザー判断)。
+_PREMIUM_CAP_PCT = _contextvars.ContextVar("daytrade_short_premium_cap_pct", default=None)
+
+
+@_contextlib.contextmanager
+def premium_cap_override(max_pct: float):
+    """with の中で出す新規売りだけ、DAYTRADE_SHORT_MAX_PREMIUM_PCT の代わりに max_pct を上限にする。"""
+    tok = _PREMIUM_CAP_PCT.set(float(max_pct))
+    try:
+        yield
+    finally:
+        _PREMIUM_CAP_PCT.reset(tok)
+
 
 def _daytrade_premium(symbol: str):
     """/margin/marginpremium の DayTrade 部分 (円/株)。5 分キャッシュ。取れなければ None。"""
@@ -486,7 +500,7 @@ def _daytrade_premium(symbol: str):
             return None
         d = (r.json() or {}).get("DayTrade") or {}
     except Exception:
-        logger.warning("[DAYTRADE SHORT PREMIUM] marginpremium failed symbol=%s", symbol, exc_info=True)
+        logger.warning("[DAYTRADE SHORT PREMIUM] marginpremium failed symbol=%s err=%s", symbol, _sys.exc_info()[1])
         return None
     _PREMIUM_CACHE[symbol] = (now, d)
     return d
@@ -500,12 +514,15 @@ def _daytrade_short_premium_block_reason(payload: dict) -> str:
     try:
         if not _is_sell_credit_new_payload(payload) or int(payload.get("MarginTradeType") or 0) != 3:
             return ""
-        max_pct = float(os.getenv("DAYTRADE_SHORT_MAX_PREMIUM_PCT", "0.1"))
+        _cap = _PREMIUM_CAP_PCT.get()
+        max_pct = float(_cap) if _cap is not None else float(os.getenv("DAYTRADE_SHORT_MAX_PREMIUM_PCT", "0.1"))
         if max_pct < 0:
             return ""
         sym = _safe_symbol(payload)
         d = _daytrade_premium(sym)
         if d is None:
+            if _cap is not None:
+                return ""  # 上限を渡した戦略 (SURGE SHORT) は発注直前に自分で照会済み。kabu Station が遅いだけで止めない
             return "reason=premium_unavailable"
         if d.get("MarginPremiumType") is None:
             return ""  # デイトレ空売りの対象外。証券会社が断り、制度信用への切替 (_retry_with_fallback_margin) に任せる
