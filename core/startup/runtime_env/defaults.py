@@ -373,6 +373,9 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     #   1) 日計り信用が使えない時刻には新規を入れない
     #   2) 強制決済は信用区分を問わず全建玉に効かせる (すり抜けの保険)
     "ENTRY_NO_NEW_AFTER": "15:00",
+    # 2026-10-20: 新規買いを再開 (ユーザー判断)。10-19 の 769bf45 で止めていた (コード側の既定は 0)。
+    #   止めた根拠は 9/07〜 の実売買で 買い 215 回 -62,140 円。止めるときは "0"。
+    "ENTRY_BUY_ENABLED": "1",
     "DAYTRADE_FORCE_CLOSE_ONLY_MARGIN_TYPE": "0",
     "BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED": "1.20",
     #   しきい値は 9/18 の 16 件で 3.0〜8.0 を振って決めた。5.5% が一致率
