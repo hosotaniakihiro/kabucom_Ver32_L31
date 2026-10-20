@@ -426,6 +426,14 @@ def _monitor_once():
 
         ref_px = info.get("ref_bid") if info.get("mode") == "buy_chase" and info.get("ref_bid") else info.get("price")
         adverse, adverse_reason, adverse_detail = _is_board_adverse(symbol, str(info.get("side") or ""), ref_px)
+        if adverse and info.get("mode") == "buy_chase":
+            # 2026-10-20: 0.5 円刻みの銘柄は 1 円上がっただけで「2 刻み離れた」になる (3436: 2586.5 -> 2588 で 4 秒後に取消)。
+            #   発注時の買気配から ENTRY_BUY_CHASE_AWAY_PCT (0.2%、下で待つ幅と同じ) 以上上がったときだけ「離れた」とする。
+            away_pct = _env_float("ENTRY_BUY_CHASE_AWAY_PCT", 0.2)
+            ref = float(info.get("ref_bid") or 0.0)
+            bid_now = float((adverse_detail or {}).get("bid") or 0.0)
+            if ref > 0 and bid_now < ref * (1 + away_pct / 100.0):
+                adverse = False
         if adverse:
             _cancel_pending_order(oid, info, f"entry_board_adverse:{adverse_reason}", adverse_detail)
             continue
