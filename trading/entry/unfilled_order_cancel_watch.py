@@ -241,6 +241,16 @@ def schedule_cancel_unfilled_entry_order(
                 _release_entry_inflight(sym)
                 return
 
+            # 2026-10-20: 買いの「少し下で待つ」注文は pending_order_monitor が待ち時間 (60 秒) ごと受け持つ。
+            #   ここで 10 秒で取り消すと待てない。
+            try:
+                from trading.handlers.pending_order_monitor import is_watched_order
+                if is_watched_order(oid):
+                    logger.info("[ENTRY CANCEL WATCH] left to pending_order_monitor symbol=%s side=%s order_id=%s", sym, side_u, oid)
+                    return
+            except Exception:
+                logger.debug("[ENTRY CANCEL WATCH] is_watched_order failed", exc_info=True)
+
             if not _is_entry_inflight(sym):
                 logger.info(
                     "[ENTRY CANCEL WATCH] inflight already released -> no cancel symbol=%s side=%s order_id=%s wait=%.1fs",

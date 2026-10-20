@@ -193,6 +193,9 @@ def on_unfilled_order_cancelled(symbol: str, order_id: str) -> bool:
             return False
 
         max_rounds = _env_int("ENTRY_SUMMARY_RETRY_MAX_ROUNDS", _retry_max_rounds_default())
+        if str(entry.get("side") or "").upper() == "BUY":
+            # 2026-10-20: 買いは値が離れたら今の買気配で 2 回まで出し直す (ユーザー判断)
+            max_rounds = _env_int("ENTRY_BUY_CHASE_MAX_ROUNDS", 2)
         new_round = int(entry.get("summary_retry_round") or 0) + 1
         if new_round > max_rounds:
             logger.warning(

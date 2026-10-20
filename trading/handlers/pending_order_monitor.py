@@ -81,6 +81,41 @@ ENTRY_CANCEL_BOARD_EXCHANGE = _env_int("ENTRY_CANCEL_BOARD_EXCHANGE", _env_int("
 _started = False
 _started_lock = threading.Lock()
 
+# 2026-10-20: 買いの「少し下で待ち、離れたら今の買気配で出し直す」(ユーザー判断)。
+#   entry_order_builder が発注直前に note_entry_order_intent() で発注時の買気配と待ち時間を置き、
+#   register_pending_entry_order() が拾う。発注経路 (entry_handler) を通さずに渡すための受け渡し口。
+#   - 「離れた」は発注時の買気配から ENTRY_CANCEL_BOARD_ADVERSE_TICKS 刻み上がったか (指値からではない)。
+#     指値は買気配の 0.2% 下なので、指値から測ると発注した瞬間に「離れた」になる。
+#   - 離れて取り消したときだけ出し直す (回数の上限は entry_retry_rotation の BUY 用上限)。
+#     待ち時間切れは出し直さない (値が動かず下にも来なかった = 見送り)。
+_ORDER_INTENT: Dict[str, dict] = {}
+_ORDER_INTENT_TTL_SEC = 30.0
+
+
+def note_entry_order_intent(symbol: str, side: str, *, mode: str, chase_round: int, ref_bid: float, cancel_after_sec: float) -> None:
+    sym = str(symbol or "").strip()
+    if not sym:
+        return
+    _ORDER_INTENT[sym] = {
+        "side": str(side or "").upper(), "mode": str(mode), "chase_round": int(chase_round),
+        "ref_bid": float(ref_bid or 0.0), "cancel_after_sec": float(cancel_after_sec), "ts": time.time(),
+    }
+
+
+def _take_order_intent(symbol: str, side: str) -> dict | None:
+    it = _ORDER_INTENT.pop(str(symbol or "").strip(), None)
+    if not it or time.time() - float(it.get("ts") or 0) > _ORDER_INTENT_TTL_SEC:
+        return None
+    if it.get("side") != str(side or "").upper():
+        return None
+    return it
+
+
+def is_watched_order(order_id: str) -> bool:
+    """この監視が待ち時間ごと受け持っている注文か (unfilled_order_cancel_watch の 10 秒取消を止めるため)。"""
+    info = _ensure_pending_orders().get(str(order_id or "").strip())
+    return isinstance(info, dict) and bool(info.get("mode")) and not info.get("cancel_requested")
+
 
 def _now() -> float:
     return time.time()
@@ -271,8 +306,14 @@ def register_pending_entry_order(*, order_id: str, symbol: str, side: str, qty: 
         return False
 
     ca = ENTRY_UNFILLED_CANCEL_SECONDS if cancel_after_sec is None else float(cancel_after_sec)
+    intent = _take_order_intent(sym, side)
+    if intent and cancel_after_sec is None:
+        ca = float(intent["cancel_after_sec"])
     po = _ensure_pending_orders()
     po[oid] = {
+        "mode": (intent or {}).get("mode"),
+        "chase_round": (intent or {}).get("chase_round"),
+        "ref_bid": (intent or {}).get("ref_bid"),
         "order_id": oid,
         "symbol": sym,
         "side": str(side or "").upper(),
@@ -336,7 +377,13 @@ def _cancel_pending_order(oid: str, info: dict, reason: str, detail: dict[str, A
     po.pop(oid, None)
     _release_entry_inflight(symbol, reason=reason)
 
-    allow_retry = _mark_cancel_and_decide_retry(symbol, reason)
+    if info.get("mode") == "buy_chase":
+        # 離れたときだけ出し直す。回数の上限は entry_retry_rotation 側 (銘柄ごとの累積回数は使わない)。
+        allow_retry = str(reason).startswith("entry_board_adverse")
+        logger.warning("[BUY CHASE] cancel order_id=%s symbol=%s round=%s reason=%s retry=%s",
+                       oid, symbol, info.get("chase_round"), reason, allow_retry)
+    else:
+        allow_retry = _mark_cancel_and_decide_retry(symbol, reason)
     if not allow_retry:
         _mark_symbol_cancel_cooldown(symbol, reason=reason)
     else:
@@ -377,7 +424,8 @@ def _monitor_once():
                 _release_entry_inflight(symbol, reason="entry_cancel_cleanup")
             continue
 
-        adverse, adverse_reason, adverse_detail = _is_board_adverse(symbol, str(info.get("side") or ""), info.get("price"))
+        ref_px = info.get("ref_bid") if info.get("mode") == "buy_chase" and info.get("ref_bid") else info.get("price")
+        adverse, adverse_reason, adverse_detail = _is_board_adverse(symbol, str(info.get("side") or ""), ref_px)
         if adverse:
             _cancel_pending_order(oid, info, f"entry_board_adverse:{adverse_reason}", adverse_detail)
             continue

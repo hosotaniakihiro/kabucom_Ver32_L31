@@ -544,6 +544,12 @@ def _passes_strict_candidate_quality_core(item: Dict[str, Any]) -> tuple[bool, D
         return True, {}
     symbol = _pick_symbol(item)
     side = _pick_side(item)
+    # 2026-10-20: 買いは 1 分足 1 本の値幅 (0.5%) では落とさない (ユーザー判断「買う回数を増やす」)。
+    #   ランキング由来の行は 1 分足が high=low=close の平らな足になりやすく、10/20 11 時台は
+    #   買い候補 48〜53 件が毎回すべてここで落ちていた。値動きの小ささは発注前の VOL FILTER
+    #   (5 分値幅 0.35%・当日値幅 1%) が見る。SUMMARY_AI_EXECUTOR_BUY_LOW_MOVE_CHECK=1 で戻す。
+    if str(side or "").upper() == "BUY" and not _env_bool("SUMMARY_AI_EXECUTOR_BUY_LOW_MOVE_CHECK", False):
+        return True, {}
     range_pct = _pick_range_pct(item)
     min_range_pct = _as_percent_threshold(
         _env_float("SUMMARY_AI_EXECUTOR_MIN_RANGE_PCT", _env_float("SUMMARY_AI_LOW_MOVE_MIN_RANGE_PCT", 0.5)),

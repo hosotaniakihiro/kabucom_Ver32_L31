@@ -827,6 +827,48 @@ def _passive_limit_price(bid: float, ask: float, side: str) -> float:
     return math.floor(near / tick) * tick if side_u == "BUY" else math.ceil(near / tick) * tick
 
 
+def _std_tick(price: float) -> float:
+    """通常銘柄の呼値 (TOPIX100 より粗い)。この刻みの値段は TOPIX100 銘柄でも有効。"""
+    p = float(price or 0.0)
+    for lim, t in ((3000, 1.0), (5000, 5.0), (30000, 10.0), (50000, 50.0), (300000, 100.0), (500000, 500.0), (3000000, 1000.0)):
+        if p <= lim:
+            return t
+    return 5000.0
+
+
+def _buy_chase_plan(symbol: str, side: str, bid: float, ask: float, retry_round: int, entry_row: Any, source: Any):
+    """2026-10-20 (ユーザー判断): 買いは 1 回目を買気配の ENTRY_BUY_BELOW_PCT (0.2%) 下で待ち、
+    値が上に離れて取り消したら今の買気配で出し直す (ENTRY_BUY_CHASE_MAX_ROUNDS=2 回まで)。
+    待ち時間は 1 回目 ENTRY_BUY_BELOW_WAIT_SEC (60 秒)、出し直し ENTRY_BUY_CHASE_WAIT_SEC (20 秒)。
+    対象外なら None (従来どおり)。殿様イナゴ (ENTRY_TAKE_SOURCES) は従来どおり相手側気配を取る。"""
+    try:
+        if str(side or "").upper() != "BUY" or not ENTRY_PASSIVE_LIMIT_ENABLED:
+            return None
+        below_pct = float(os.getenv("ENTRY_BUY_BELOW_PCT", "0.2") or 0.0)
+        if below_pct <= 0 or bid <= 0 or _is_take_entry(entry_row, source):
+            return None
+        max_rounds = int(float(os.getenv("ENTRY_BUY_CHASE_MAX_ROUNDS", "2") or 2))
+        if retry_round > max_rounds:
+            return None
+        if retry_round <= 0:
+            tick = _std_tick(bid)
+            price = math.floor(bid * (1 - below_pct / 100.0) / tick) * tick
+            if price >= bid:
+                price = bid - tick
+            src, wait = "board_buy_below_limit", float(os.getenv("ENTRY_BUY_BELOW_WAIT_SEC", "60") or 60)
+        else:
+            price = bid
+            src, wait = "board_buy_chase_bid_limit", float(os.getenv("ENTRY_BUY_CHASE_WAIT_SEC", "20") or 20)
+        from trading.handlers.pending_order_monitor import note_entry_order_intent
+        note_entry_order_intent(symbol, "BUY", mode="buy_chase", chase_round=retry_round, ref_bid=bid, cancel_after_sec=wait)
+        logger.warning("[BUY CHASE] symbol=%s round=%s bid=%s ask=%s -> price=%s (%s) wait=%.0fs",
+                       symbol, retry_round, bid, ask, price, src, wait)
+        return float(price), src
+    except Exception:
+        logger.exception("[BUY CHASE] plan failed symbol=%s -> 従来の指値", symbol)
+        return None
+
+
 def _take_sources() -> set:
     """2026-10-03 (ユーザー判断): 急騰の初動を取りに行く source は 1 回目から相手側気配を取る。
     買気配に並べて待つと、伸びる銘柄は値が逃げて約定せず、押し戻された銘柄だけ約定する
@@ -1170,7 +1212,10 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
                 if ALLOW_MARKET_IF_BAD_BOARD and spread_pct > MAX_SPREAD_PCT_FOR_LIMIT:
                     return _ng("SPREAD_TOO_WIDE", symbol=symbol, side=side, spread_pct=spread_pct, max_spread_pct=MAX_SPREAD_PCT_FOR_LIMIT, bid=bid, ask=ask)
                 retry_round = _passive_round_of(entry_row)
-                if ENTRY_PASSIVE_LIMIT_ENABLED and retry_round <= 0:
+                _chase = _buy_chase_plan(symbol, side, float(bid), float(ask), retry_round, entry_row, source)
+                if _chase is not None:
+                    price, price_source = _chase
+                elif ENTRY_PASSIVE_LIMIT_ENABLED and retry_round <= 0:
                     # 初回は自分側の気配で待つ。未約定なら cancel watch -> retry rotation で
                     # round が進み、次回はこの分岐を通らず相手側気配へ寄せる。
                     base_price = ask if side == "SELL" else bid
@@ -2298,6 +2343,11 @@ def _epi_patch_order_result(result: dict, *, symbol: str, side: str, source: str
 
     order_type = str(detail.get("order_type") or "").upper()
     if order_type != "LIMIT":
+        return result
+    # 2026-10-20: 買気配の 0.2% 下で待つ注文を bid+1 刻みや売気配へ引き上げない
+    if str(detail.get("price_source") or "").startswith("board_buy_"):
+        logger.info("[ENTRY PRICE IMPROVE] KEEP symbol=%s side=%s source=%s price=%s reason=buy_chase",
+                    symbol, side, source, detail.get("price"))
         return result
 
     row = _epi_row_to_dict(entry_row)
@@ -3437,6 +3487,18 @@ def _rfb_patch_result(ret: dict, *, symbol: str, side: str, source: str, entry_r
         detail["rest_full_board_double_check_warning"] = double_ng
 
     old = _rfb_safe_float(detail.get("price"))
+    # 2026-10-20: 買いの「少し下で待つ / 離れたら買気配で出し直す」は、この新しい板の買気配で値段を決め直す
+    if str(detail.get("price_source") or "").startswith("board_buy_") and bid > 0:
+        _chase = _buy_chase_plan(sym, side, bid, ask, _passive_round_of(entry_row), entry_row, source)
+        if _chase is not None:
+            detail["price_before_rest_full_board"] = old
+            detail["price"] = detail["base_price"] = _chase[0]
+            detail["price_source"] = _chase[1]
+            detail["rest_full_board"] = True
+            detail["rest_full_board_meta"] = {"bid": bid, "ask": ask, "spread_pct": spread_pct}
+            logger.warning("[REST FULL BOARD] symbol=%s side=%s source=%s mode=BUY_CHASE old=%s new=%s bid=%s ask=%s",
+                           sym, side, source, old, _chase[0], bid, ask)
+            return ret
     # C9: 初回は相手側気配に触れない (bid+tick を ask-tick で頭打ち)。再queue 後は従来どおり。
     touch = None
     if _passive_no_touch(entry_row):
