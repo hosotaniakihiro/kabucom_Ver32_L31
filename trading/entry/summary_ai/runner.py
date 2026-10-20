@@ -347,6 +347,22 @@ def _wsf_relax_check(symbol: str, side: str, frames: dict) -> Tuple[bool, str]:
         if candle or above:
             return True, f"{tf}m_{'candle' if candle else 'vwap'}_ok"
         return False, f"{tf}m_candle_vwap_against(o={o},c={c},vwap={vw})"
+    # 2026-10-20: 1 分足は ローカル push DB のティックから作った足を先に使う (trading.summary.mtf_local_bars)。
+    #   frames[1] (summary の 1 分足) は銘柄ごとの本数が足りず、10/19〜20 は 1m_short 851 回 / no_1m 114 回で
+    #   この代わりの判定が一度も働いていなかった。
+    try:
+        from trading.summary.mtf_local_bars import get_bars as _local_bars
+        lb = _local_bars(sym, 1, frames.get("now"))
+        if isinstance(lb, pd.DataFrame) and not lb.empty and "close" in lb.columns:
+            tcol = "datetime" if "datetime" in lb.columns else None
+            if tcol:
+                lb = lb[pd.to_datetime(lb[tcol], errors="coerce") + pd.Timedelta(minutes=1) <= pd.Timestamp(frames["now"])]
+            closes = [float(x) for x in lb["close"].tail(4).tolist() if pd.notna(x)]
+            if len(closes) >= 4:
+                ok = closes[-1] >= closes[0] if buy else closes[-1] <= closes[0]
+                return (True, "local1m_3bar_ok") if ok else (False, f"local1m_3bar_against({closes[0]}->{closes[-1]})")
+    except Exception:
+        logger.debug("[SUMMARY AI WEAK FILTER RELAX] local 1m bars failed symbol=%s", sym, exc_info=True)
     df1 = frames.get(1)
     if df1 is None or df1.empty or "symbol" not in df1.columns:
         return False, "no_1m"
