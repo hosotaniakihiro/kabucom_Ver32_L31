@@ -107,6 +107,21 @@ def _open_trades(st: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 # ------------------------------------------------------------
 # 外部データ
 # ------------------------------------------------------------
+def _seido_sell_stopped(symbol: str) -> str:
+    """/regulations で制度信用 (Product=2) の新規売り (Side 0=両方 / 1=売) に Level 2 以上の規制があれば理由を返す。"""
+    try:
+        import requests
+        from kabu_api.utils import API_URL, get_valid_token
+        r = requests.get(f"{API_URL}/regulations/{symbol}@1", headers={"X-API-KEY": get_valid_token()}, timeout=3)
+        r.encoding = "utf-8"
+        for x in (r.json() or {}).get("RegulationsInfo") or []:
+            if int(x.get("Product") or 0) == 2 and str(x.get("Side")) in ("0", "1") and int(x.get("Level") or 0) >= 2:
+                return str(x.get("Reason") or "level2")
+    except Exception:
+        logger.warning("[OVEREXT SHORT] regulations check failed symbol=%s", symbol, exc_info=True)
+    return ""
+
+
 def _candidates(now: dt.datetime, c: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """日足 DB で前日終値の 25 日平均乖離が min_dev25 以上の銘柄。30 分ごとに読み直す。"""
     day = now.date().isoformat()
@@ -263,6 +278,12 @@ def _try_entry(sym: str, info: Dict[str, Any], bd: Dict[str, Any], st: Dict[str,
     qty = int(c["max_yen"] // (bid * 100)) * 100
     if qty <= 0:
         return "skipped", "too_expensive", {"bid": bid, "max_yen": c["max_yen"]}
+    # 2026-10-20: 日証金の貸借申込停止などで制度信用の新規売りが止まっている銘柄は送らない。
+    #   10/20 の 3042 は「新規建停止 (貸借申込停止銘柄 (日証金規制))」で 09:37 の発注が code=100033 で断られた。
+    #   上がりすぎた銘柄ほどこの規制がかかりやすい。
+    _reg = _seido_sell_stopped(sym)
+    if _reg:
+        return "skipped", "seido_sell_regulated", {"regulation": _reg}
     from kabu_api.send_order import margin_trade_type_override
     from trading.handlers.entry_handler import place_entry_sell
     # 強制決済で返済されないよう、発注の前に持ち越し登録する (約定しなくても害はない)
@@ -273,6 +294,9 @@ def _try_entry(sym: str, info: Dict[str, Any], bd: Dict[str, Any], st: Dict[str,
     detail = {"bid": bid, "ask": ask, "spread_pct": round(spread_pct, 3), "qty": qty,
               "prev_close": bd.get("prev_close") or info.get("prev_close"), "margin_trade_type": c["margin_trade_type"]}
     if not oid:
+        # 2026-10-20: 送れなかったら持ち越し登録を戻す (3042 が 10/25 まで登録されたまま残った)
+        from trading.strategies.overnight_holds import unregister as _unregister_overnight
+        _unregister_overnight(sym)
         return "skipped", "send_failed", detail
     st["trades"][sym] = {"order_ts": _ts(now), "entry_day": now.date().isoformat(), "order_id": str(oid),
                          "price": bid, "qty": qty, **detail}
