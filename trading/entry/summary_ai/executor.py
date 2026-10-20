@@ -1425,7 +1425,7 @@ _DD_RETRYABLE_NO_ORDER_MARKERS = (
 
 
 def _dd_summary_ai_price_floor() -> float:
-    return max(0.0, _env_float("SUMMARY_AI_APPROVAL_MIN_PRICE_OVERRIDE", 2500.0))
+    return max(0.0, _env_float("SUMMARY_AI_APPROVAL_MIN_PRICE_OVERRIDE", 150.0))  # 2026-10-20: 2500 -> 150 (_dft_apply_entry_price_floor と揃える)
 
 
 def _dd_force_direct_sync_env() -> None:
@@ -2628,9 +2628,9 @@ def _dft_apply_entry_price_floor() -> None:
         return
     try:
         raw = os.getenv("SUMMARY_AI_APPROVAL_MIN_PRICE_OVERRIDE")
-        min_override = float(raw) if raw not in (None, "") else 200.0
+        min_override = float(raw) if raw not in (None, "") else 150.0  # 2026-10-20: 200 -> 150
     except Exception:
-        min_override = 200.0
+        min_override = 150.0
     min_override = max(0.0, min_override)
     os.environ["SUMMARY_AI_ENTRY_MIN_PRICE"] = str(min_override)
     os.environ["ENTRY_MIN_PRICE"] = str(min_override)

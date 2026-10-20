@@ -281,7 +281,7 @@ def _no_highlow_apply_env_defaults() -> None:
         return
     _NO_HIGHLOW_ENV_APPLIED = True
     try:
-        os.environ.setdefault("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE", "300")
+        os.environ.setdefault("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE", "150")  # 2026-10-20: 300 -> 150
         os.environ.setdefault("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK", "1")
         os.environ.setdefault("LOW_MOVE_TONOSAMA_NO_HIGHLOW_FALLBACK_RANGE_PCT", "0.012")
         os.environ.setdefault("LOW_MOVE_TONOSAMA_NO_HIGHLOW_USE_RAW_VOLUME_SIGNAL", "1")
