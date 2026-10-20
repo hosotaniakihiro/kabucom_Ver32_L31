@@ -377,7 +377,10 @@ def _cancel_pending_order(oid: str, info: dict, reason: str, detail: dict[str, A
     po.pop(oid, None)
     _release_entry_inflight(symbol, reason=reason)
 
-    if info.get("mode") == "buy_chase":
+    if info.get("mode") == "sell_wait":
+        allow_retry = False
+        logger.warning("[SELL WAIT] cancel order_id=%s symbol=%s reason=%s (追いかけない)", oid, symbol, reason)
+    elif info.get("mode") == "buy_chase":
         # 離れたときだけ出し直す。回数の上限は entry_retry_rotation 側 (銘柄ごとの累積回数は使わない)。
         allow_retry = str(reason).startswith("entry_board_adverse")
         logger.warning("[BUY CHASE] cancel order_id=%s symbol=%s round=%s reason=%s retry=%s",
@@ -424,6 +427,11 @@ def _monitor_once():
                 _release_entry_inflight(symbol, reason="entry_cancel_cleanup")
             continue
 
+        if info.get("mode") == "sell_wait":
+            # 2026-10-20: 空売りの 0.2% 上待ちは追いかけない。値が離れても待ち時間いっぱい置いておく
+            if elapsed >= cancel_after:
+                _cancel_pending_order(oid, info, "entry_unfilled_cancel_timeout", {"elapsed": elapsed, "cancel_after": cancel_after})
+            continue
         ref_px = info.get("ref_bid") if info.get("mode") == "buy_chase" and info.get("ref_bid") else info.get("price")
         adverse, adverse_reason, adverse_detail = _is_board_adverse(symbol, str(info.get("side") or ""), ref_px)
         if adverse and info.get("mode") == "buy_chase":

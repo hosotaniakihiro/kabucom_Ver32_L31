@@ -358,14 +358,21 @@ def _try_entry(sym: str, v: Dict[str, Any], st: Dict[str, Any], now: dt.datetime
                                                       "loss_per_100": round(bid * c["stop_pct"], 1)}
     from trading.handlers.entry_handler import place_entry_sell
     from kabu_api.send_order import premium_cap_override
+    # 2026-10-20 午後 (ユーザー判断): 買気配で売らず、売気配の 0.2% 上で 60 秒待つ。約定しなければ見送り
+    #   (この銘柄はその日もう売らない = 従来どおり trades に残る)。SURGE_SHORT_SELL_ABOVE=0 で従来の買気配。
+    sell_px = bid
+    if _env_on("SURGE_SHORT_SELL_ABOVE", True):
+        from trading.handlers.entry_order_builder import note_sell_wait, sell_above_price
+        sell_px = sell_above_price(ask, bid)
+        note_sell_wait(sym, ask)
     # 2026-10-20: send_order_common の共通上限 (0.1%) ではなく、この戦略の max_premium_pct (0.4%) で出す
     with premium_cap_override(c["max_premium_pct"]):
-        oid = place_entry_sell(sym, sym, bid, "SURGE_SHORT", order_type="LIMIT", qty=qty)
-    detail = {"bid": bid, "ask": ask, "spread_pct": round(spread_pct, 3), "qty": qty,
+        oid = place_entry_sell(sym, sym, sell_px, "SURGE_SHORT", order_type="LIMIT", qty=qty)
+    detail = {"bid": bid, "ask": ask, "sell_px": sell_px, "spread_pct": round(spread_pct, 3), "qty": qty,
               "premium_pct": round(prem_pct, 3), "chg": float(v.get("change_percentage") or 0), "trading_value": tv}
     if not oid:
         return "skipped", "send_failed", detail
-    st.setdefault("trades", {})[sym] = {"order_ts": _ts(now), "order_id": str(oid), "price": bid, "qty": qty,
+    st.setdefault("trades", {})[sym] = {"order_ts": _ts(now), "order_id": str(oid), "price": sell_px, "qty": qty,
                                         "limit_up": limit_up_price(prev_close) if prev_close > 0 else 0.0, **detail}
     return "ordered", "ok", {**detail, "order_id": str(oid)}
 

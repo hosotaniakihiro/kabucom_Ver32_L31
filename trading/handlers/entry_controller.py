@@ -3178,8 +3178,11 @@ def _execute_best_candidate_core(item: dict, boost_active: bool) -> bool:
     # 2026-10-20: Summary AI の新規売りを止める (ユーザー判断)。ENTRY_SUMMARY_AI_SELL_ENABLED=1 で戻す。
     #   9/07〜 の実売買で 19 回 ほぼ ±0 (プレミアム料前)。5MA 下抜けの何本目で売っても 6 か月でコスト負け
     #   (ops/research/ma5_break_bar_scan.py)。売りは SURGE SHORT / OVEREXT_SHORT (別経路) だけ残す。
+    #   2026-10-20 午後: 売気配の 0.2% 上で待つ形 (ENTRY_SUMMARY_AI_SELL_WAIT_ENABLED) に限って再開 (ユーザー判断)。
+    #   形の確認は entry_handler.place_entry_sell が発注直前に行う。
     if (str(side or "").upper() == "SELL" and _is_summary_ai_item(item, entry_row, entry_type)
-            and not _env_bool("ENTRY_SUMMARY_AI_SELL_ENABLED", False)):
+            and not _env_bool("ENTRY_SUMMARY_AI_SELL_ENABLED", False)
+            and not _env_bool("ENTRY_SUMMARY_AI_SELL_WAIT_ENABLED", True)):
         _log_skip(symbol, "SUMMARY_AI_SELL_DISABLED", side=side)
         return False
 

@@ -869,6 +869,43 @@ def _buy_chase_plan(symbol: str, side: str, bid: float, ask: float, retry_round:
         return None
 
 
+def sell_above_price(ask: float, bid: float = 0.0) -> float:
+    """2026-10-20 (ユーザー判断): 空売りは売気配の ENTRY_SELL_ABOVE_PCT (0.2%) 上で待つ。通常呼値で切り上げ。"""
+    above_pct = float(os.getenv("ENTRY_SELL_ABOVE_PCT", "0.2") or 0.0)
+    tick = _std_tick(ask)
+    price = math.ceil(ask * (1 + above_pct / 100.0) / tick - 1e-9) * tick
+    if price <= ask:
+        price = ask + tick
+    return float(price)
+
+
+def note_sell_wait(symbol: str, ask: float) -> None:
+    """待ち時間 ENTRY_SELL_ABOVE_WAIT_SEC (60 秒) で取消、追いかけない (pending_order_monitor の mode=sell_wait)。"""
+    from trading.handlers.pending_order_monitor import note_entry_order_intent
+    note_entry_order_intent(symbol, "SELL", mode="sell_wait", chase_round=0, ref_bid=float(ask),
+                            cancel_after_sec=float(os.getenv("ENTRY_SELL_ABOVE_WAIT_SEC", "60") or 60))
+
+
+def _sell_wait_plan(symbol: str, side: str, bid: float, ask: float):
+    """空売りを売気配の 0.2% 上で待つ (約定したら儲けもの、しなければ見送り)。対象外なら None。"""
+    try:
+        if str(side or "").upper() != "SELL" or ask <= 0:
+            return None
+        if float(os.getenv("ENTRY_SELL_ABOVE_PCT", "0.2") or 0.0) <= 0:
+            return None
+        price = sell_above_price(ask, bid)
+        note_sell_wait(symbol, ask)
+        logger.warning("[SELL WAIT] symbol=%s bid=%s ask=%s -> price=%s (board_sell_above_limit)", symbol, bid, ask, price)
+        return price, "board_sell_above_limit"
+    except Exception:
+        logger.exception("[SELL WAIT] plan failed symbol=%s -> 従来の指値", symbol)
+        return None
+
+
+def _is_wait_price_source(ps: Any) -> bool:
+    return str(ps or "").startswith(("board_buy_", "board_sell_above"))
+
+
 def _take_sources() -> set:
     """2026-10-03 (ユーザー判断): 急騰の初動を取りに行く source は 1 回目から相手側気配を取る。
     買気配に並べて待つと、伸びる銘柄は値が逃げて約定せず、押し戻された銘柄だけ約定する
@@ -1213,6 +1250,8 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
                     return _ng("SPREAD_TOO_WIDE", symbol=symbol, side=side, spread_pct=spread_pct, max_spread_pct=MAX_SPREAD_PCT_FOR_LIMIT, bid=bid, ask=ask)
                 retry_round = _passive_round_of(entry_row)
                 _chase = _buy_chase_plan(symbol, side, float(bid), float(ask), retry_round, entry_row, source)
+                if _chase is None:
+                    _chase = _sell_wait_plan(symbol, side, float(bid), float(ask))
                 if _chase is not None:
                     price, price_source = _chase
                 elif ENTRY_PASSIVE_LIMIT_ENABLED and retry_round <= 0:
@@ -2344,8 +2383,8 @@ def _epi_patch_order_result(result: dict, *, symbol: str, side: str, source: str
     order_type = str(detail.get("order_type") or "").upper()
     if order_type != "LIMIT":
         return result
-    # 2026-10-20: 買気配の 0.2% 下で待つ注文を bid+1 刻みや売気配へ引き上げない
-    if str(detail.get("price_source") or "").startswith("board_buy_"):
+    # 2026-10-20: 買気配の 0.2% 下 / 売気配の 0.2% 上で待つ注文を、相手側の気配へ寄せない
+    if _is_wait_price_source(detail.get("price_source")):
         logger.info("[ENTRY PRICE IMPROVE] KEEP symbol=%s side=%s source=%s price=%s reason=buy_chase",
                     symbol, side, source, detail.get("price"))
         return result
@@ -2662,8 +2701,8 @@ def _build_entry_order_elp(*args, **kwargs):
                 detail["aggressive_limit_ticks"] = 0
                 detail["entry_limit_mode"] = "BOARD_TOUCH_OR_FALLBACK"
                 detail["price_rule"] = "BUY=ask / SELL=bid / board_missing=fallback_limit"
-                if str(detail.get("price_source") or "").startswith("board_buy_"):
-                    pass  # 2026-10-20: 買いの 0.2% 下待ち。REST FULL BOARD がこの印で値段を決め直す
+                if _is_wait_price_source(detail.get("price_source")):
+                    pass  # 2026-10-20: 買いの 0.2% 下待ち / 売りの 0.2% 上待ち。REST FULL BOARD がこの印で値段を決め直す
                 elif detail.get("board"):
                     detail["price_source"] = "board_bid_ask_touch"
                 else:
@@ -3490,8 +3529,10 @@ def _rfb_patch_result(ret: dict, *, symbol: str, side: str, source: str, entry_r
 
     old = _rfb_safe_float(detail.get("price"))
     # 2026-10-20: 買いの「少し下で待つ / 離れたら買気配で出し直す」は、この新しい板の買気配で値段を決め直す
-    if str(detail.get("price_source") or "").startswith("board_buy_") and bid > 0:
+    if _is_wait_price_source(detail.get("price_source")) and bid > 0:
         _chase = _buy_chase_plan(sym, side, bid, ask, _passive_round_of(entry_row), entry_row, source)
+        if _chase is None:
+            _chase = _sell_wait_plan(sym, side, bid, ask)
         if _chase is not None:
             detail["price_before_rest_full_board"] = old
             detail["price"] = detail["base_price"] = _chase[0]

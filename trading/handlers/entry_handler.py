@@ -492,6 +492,16 @@ def place_entry_buy(symbol: str, symbolname: str, price: Optional[float], reason
 # SELL
 # ============================================================
 
+def _has_sell_wait_intent(symbol: str) -> bool:
+    try:
+        from trading.handlers.pending_order_monitor import _ORDER_INTENT, _ORDER_INTENT_TTL_SEC
+        import time as _t
+        it = _ORDER_INTENT.get(str(symbol or "").strip()) or {}
+        return it.get("mode") == "sell_wait" and _t.time() - float(it.get("ts") or 0) <= _ORDER_INTENT_TTL_SEC
+    except Exception:
+        return False
+
+
 def place_entry_sell(symbol: str, symbolname: str, price: Optional[float], reason: str, *args, order_type: str = "LIMIT", qty: Optional[int] = None):
     if args:
         if len(args) >= 1:
@@ -505,8 +515,10 @@ def place_entry_sell(symbol: str, symbolname: str, price: Optional[float], reaso
             raise ValueError("SELL requires symbol")
 
         # 2026-10-20: Summary AI の新規売りは止める (entry_controller と同じ env)。別の経路から来ても送らない。
+        #   2026-10-20 午後: 売気配の 0.2% 上で待つ注文 (entry_order_builder が mode=sell_wait を置いたもの) だけは通す。
         if (str(p["reason"] or "").upper().startswith("SUMMARY_AI")
-                and str(os.getenv("ENTRY_SUMMARY_AI_SELL_ENABLED", "0")).strip().lower() not in ("1", "true", "yes", "on")):
+                and str(os.getenv("ENTRY_SUMMARY_AI_SELL_ENABLED", "0")).strip().lower() not in ("1", "true", "yes", "on")
+                and not (_env_bool("ENTRY_SUMMARY_AI_SELL_WAIT_ENABLED", True) and _has_sell_wait_intent(p["symbol"]))):
             logger.warning("[SUMMARY AI SELL DISABLED] 新規売りを送らない symbol=%s price=%s qty=%s (ENTRY_SUMMARY_AI_SELL_ENABLED=1 で戻す)",
                            p["symbol"], p["price"], p["qty"])
             return None
