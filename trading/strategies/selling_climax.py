@@ -262,6 +262,49 @@ def _open_count(st: Dict[str, Any], now: dt.datetime, hold_min: float) -> int:
     return n
 
 
+def detect_wide(series: List[Tuple[dt.datetime, float, float]], c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """2026-10-20 (ユーザー判断): 広げた条件。記録だけ (signals_wide)、発注しない。
+    10/20 14:00〜14:06 の 593A は 1 分ごとの下げが -0.5/-0.65/-0.85% と段階的で、出来高 10〜16 倍でも
+    「1 分で -1%」に当たらなかった。直近 WIDE_BARS (5) 本の合計の下げと、その中の最大出来高で見る。"""
+    n = int(_env_f("SELLING_CLIMAX_WIDE_BARS", 5))
+    if len(series) < 20 + n + 1:
+        return None
+    t, close, _ = series[-1]
+    base_close = series[-n - 1][1]
+    closes30 = [x[1] for x in series[-31:-1]]
+    vols_prior = [x[2] for x in series[-(20 + n):-n]]
+    if base_close <= 0 or len(closes30) < 10 or not vols_prior:
+        return None
+    avg20 = sum(vols_prior) / len(vols_prior)
+    win_vol = max(x[2] for x in series[-n:])
+    cum_ret = (close / base_close - 1) * 100
+    drop30 = (1 - close / max(closes30)) * 100
+    vol_x = win_vol / avg20 if avg20 > 0 else 0.0
+    if not (cum_ret <= -_env_f("SELLING_CLIMAX_WIDE_CUM_DROP_PCT", 1.5) and drop30 >= c["drop30_pct"]
+            and vol_x >= _env_f("SELLING_CLIMAX_WIDE_VOL_MULT", 5.0)):
+        return None
+    return {"bar": _ts(t), "close": close, "cum_ret": round(cum_ret, 2), "bars": n, "drop30": round(drop30, 2),
+            "vol_x": round(vol_x, 1), "high30": max(closes30)}
+
+
+def _record_wide(st: Dict[str, Any], sym: str, ser, c: Dict[str, Any], now: dt.datetime) -> bool:
+    try:
+        wide = st.setdefault("signals_wide", {})
+        if sym in wide:
+            return False   # 1 銘柄 1 日 1 回
+        sig = detect_wide(ser, c)
+        if not sig:
+            return False
+        bd = _board(sym) if _env_on("SELLING_CLIMAX_WIDE_RECORD_BOARD", True) else None
+        wide[sym] = {"ts": _ts(now), **sig, "status": "observed", "reason": "wide_record_only",
+                     "bid": (bd or {}).get("bid"), "ask": (bd or {}).get("ask")}
+        logger.warning("[SELLING CLIMAX WIDE] signal (記録のみ) symbol=%s %s", sym, wide[sym])
+        return True
+    except Exception:
+        logger.warning("[SELLING CLIMAX WIDE] record failed symbol=%s", sym, exc_info=True)
+        return False
+
+
 def run_cycle(now: Optional[dt.datetime] = None) -> None:
     c = cfg()
     now = now or dt.datetime.now()
@@ -283,6 +326,8 @@ def run_cycle(now: Optional[dt.datetime] = None) -> None:
             ser = _BARS.series(sym, cur_min)
             if not ser or ser[-1][0] != cur_min - dt.timedelta(minutes=1):
                 continue
+            if _env_on("SELLING_CLIMAX_WIDE_ENABLED", True) and _record_wide(st, sym, ser, c, now):
+                changed = True
             sig = detect(ser, c)
             if not sig:
                 continue
