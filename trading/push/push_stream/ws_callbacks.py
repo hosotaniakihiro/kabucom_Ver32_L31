@@ -228,6 +228,20 @@ def _update_5sec_bar_safe(row: dict) -> None:
         logger.exception("[5SEC BAR] update from push_stream row failed row=%s", _safe_row_head(row))
 
 
+def _update_gapup_breakout_safe(row: dict) -> None:
+    """ギャップアップ＋初動5分足高値ブレイク戦略へ tick を渡す。
+    既定はドライラン（検知→ログ/Discord通知のみ）。PUSH 本流は絶対に止めない。"""
+    try:
+        if not isinstance(row, dict):
+            return
+        from trading.entry import gapup_breakout
+        if not gapup_breakout.enabled():
+            return
+        gapup_breakout.on_tick(row)
+    except Exception:
+        logger.exception("[GAPUP] update from push_stream row failed row=%s", _safe_row_head(row))
+
+
 def on_message(ws: websocket.WebSocketApp, message: Any) -> None:
     raw_len = 0
     try:
@@ -260,6 +274,7 @@ def on_message(ws: websocket.WebSocketApp, message: Any) -> None:
             return
         _update_latest_price_cache_safe(row)
         _update_5sec_bar_safe(row)
+        _update_gapup_breakout_safe(row)
 
         try:
             if state._ring_buffer is not None:
