@@ -2662,7 +2662,9 @@ def _build_entry_order_elp(*args, **kwargs):
                 detail["aggressive_limit_ticks"] = 0
                 detail["entry_limit_mode"] = "BOARD_TOUCH_OR_FALLBACK"
                 detail["price_rule"] = "BUY=ask / SELL=bid / board_missing=fallback_limit"
-                if detail.get("board"):
+                if str(detail.get("price_source") or "").startswith("board_buy_"):
+                    pass  # 2026-10-20: 買いの 0.2% 下待ち。REST FULL BOARD がこの印で値段を決め直す
+                elif detail.get("board"):
                     detail["price_source"] = "board_bid_ask_touch"
                 else:
                     detail["price_source"] = "summary_fallback_touch"
