@@ -257,7 +257,7 @@ def _install_entry_runtime_init_patches() -> None:
 
         _price_cfg = _rank_cfg.setdefault("PRICE", {})
         _old_price_min = float(_price_cfg.get("MIN", 300))
-        _price_cfg["MIN"] = _rank_env_float("RANKING_ENTRY_PRICE_MIN", 200.0)
+        _price_cfg["MIN"] = _rank_env_float("RANKING_ENTRY_PRICE_MIN", 150.0)  # 2026-10-20: 200 -> 150 (ユーザー判断)
 
         _vol_cfg = _rank_cfg.setdefault("VOLUME", {})
         _vol_cfg["MIN_VOLUME"] = _rank_env_float(

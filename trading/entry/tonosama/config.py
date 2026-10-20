@@ -126,7 +126,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 TONOSAMA_EXPIRE_SEC = _env_int("TONOSAMA_EXPIRE_SEC", 180)
 
-MIN_PRICE = _env_float_floor("TONOSAMA_MIN_PRICE", 300.0, 300.0)
+MIN_PRICE = _env_float_floor("TONOSAMA_MIN_PRICE", 300.0, 150.0)  # 2026-10-20: 下限 300 -> 150 (ユーザー判断)
 MIN_FINAL_SCORE = _env_float_floor("TONOSAMA_MIN_FINAL_SCORE", 2.3, 2.3)
 MIN_RAW_SCORE = _env_float("TONOSAMA_MIN_RAW_SCORE", 0.01)
 

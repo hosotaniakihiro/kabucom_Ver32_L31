@@ -39,7 +39,7 @@ RANKING_ENTRY_CONFIG = {
     },
 
     "PRICE": {
-        "MIN": 300,
+        "MIN": int(__import__("os").getenv("RANKING_ENTRY_PRICE_MIN", "150")),  # 2026-10-20: 300 -> 150 (ユーザー判断)
         "MAX": 7_000,
     },
 

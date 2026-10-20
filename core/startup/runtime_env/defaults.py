@@ -318,7 +318,7 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     "ACTIVE_PROTECT_HOT_SYMBOLS": "1",
     "ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME": "30000",
     "ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER": "10000000",
-    "ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE": "200",
+    "ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE": "150",  # 2026-10-20: 200 -> 150 (ユーザー判断)
     "ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE": "0.90",
     # 2026-09-15: 1 分足の方向確認ガード (close vs ma5/ma25 の構造・乖離) は
     #   3 分/5 分足の MA/RSI/MACD ゲート (trading/filters/mtf_ma_gate) と役割が重複し、
@@ -376,6 +376,20 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     # 2026-10-20: 新規買いを再開 (ユーザー判断)。10-19 の 769bf45 で止めていた (コード側の既定は 0)。
     #   止めた根拠は 9/07〜 の実売買で 買い 215 回 -62,140 円。止めるときは "0"。
     "ENTRY_BUY_ENABLED": "1",
+    # 2026-10-20: 最低株価を 150 円へ (ユーザー判断、2440 = 148 円がきっかけ。100 -> 150 に修正)。
+    #   150〜333 円は 1 呼値が株価の 0.3% 超 (148 円で 0.68%) になり、スプレッドだけで負けやすい点は伝えた。
+    #   最低株価はモジュールごとに散っているので、ここでまとめて 150 にする。戻すときは各キーを消す。
+    "SUMMARY_AI_APPROVAL_MIN_PRICE_OVERRIDE": "150",
+    "SUMMARY_AI_ENTRY_MIN_PRICE": "150",
+    "LIQUIDITY_MIN_PRICE": "150",
+    "PUSH_RANKING_SELECTOR_MIN_PRICE": "150",
+    "PUSH_RELAY_REGULARS_MIN_PRICE": "150",
+    "RANKING_ENTRY_PREFILTER_MIN_PRICE": "150",
+    "RANKING_ENTRY_PRICE_MIN": "150",  # core/startup/__init__.py が RANKING_ENTRY_CONFIG["PRICE"]["MIN"] を上書きする (既定 200)
+    "RANKING_ENTRY_RESCUE_MIN_PRICE": "150",
+    "SURGE_SHORT_MIN_PRICE": "150",
+    "OVEREXT_SHORT_MIN_PRICE": "150",
+    "TONOSAMA_MIN_PRICE": "150",
     "DAYTRADE_FORCE_CLOSE_ONLY_MARGIN_TYPE": "0",
     "BLOWOFF_FULL_TAKE_PCT_UNCONFIRMED": "1.20",
     #   しきい値は 9/18 の 16 件で 3.0〜8.0 を振って決めた。5.5% が一致率
@@ -497,9 +511,9 @@ SUMMARY_YAHOO_DEFAULTS: Dict[str, str] = {
     "SUMMARY_DB_DATE_GUARD_ENABLED": "1",
     "SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED": "0",
     "SUMMARY_SUPPRESS_LUNCH_FALLBACK_AFTER_PM": "1",
-    "TRADE_UNIVERSE_MIN_PRICE": "200",
+    "TRADE_UNIVERSE_MIN_PRICE": "150",  # 2026-10-20: 200 -> 150 (ユーザー判断)
     "TRADE_UNIVERSE_MAX_PRICE": "7000",
-    "SUMMARY_PIPELINE_MIN_PRICE": "200",
+    "SUMMARY_PIPELINE_MIN_PRICE": "150",  # 2026-10-20: 200 -> 150 (ユーザー判断)
     "SUMMARY_PIPELINE_MAX_PRICE": "7000",
     "SUMMARY_DISPLAY_MAX_PRICE": "7000",
     "ENTRY_MAX_PRICE": "7000",
