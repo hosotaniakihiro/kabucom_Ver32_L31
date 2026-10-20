@@ -836,23 +836,32 @@ def _std_tick(price: float) -> float:
     return 5000.0
 
 
+def _wait_tick(price: float, other: float, *, spread_given: bool = False) -> float:
+    """待ち注文の値段の刻み。通常呼値 (TOPIX100 より粗い) と、今の気配の差の小さい方。
+    気配の差は実際の呼値の倍数なので、その倍数に丸めた値段は有効。TOPIX100 の 3,000〜5,000 円 (1 円刻み) を
+    5 円で丸めて 0.1% のつもりが 0.22% 離れるのを防ぐ (10/20、4004 -> 3995)。"""
+    std = _std_tick(price)
+    spread = float(other if spread_given else (other - price)) if other else 0.0
+    return min(std, spread) if spread > 0 else std
+
+
 def _buy_chase_plan(symbol: str, side: str, bid: float, ask: float, retry_round: int, entry_row: Any, source: Any):
-    """2026-10-20 (ユーザー判断): 買いは 1 回目を買気配の ENTRY_BUY_BELOW_PCT (0.2%) 下で待ち、
+    """2026-10-20 (ユーザー判断): 買いは 1 回目を買気配の ENTRY_BUY_BELOW_PCT (0.1%、10/20 14 時に 0.2 -> 0.1) 下で待ち、
     値が上に離れて取り消したら今の買気配で出し直す (ENTRY_BUY_CHASE_MAX_ROUNDS=2 回まで)。
     待ち時間は 1 回目 ENTRY_BUY_BELOW_WAIT_SEC (60 秒)、出し直し ENTRY_BUY_CHASE_WAIT_SEC (20 秒)。
     対象外なら None (従来どおり)。殿様イナゴ (ENTRY_TAKE_SOURCES) は従来どおり相手側気配を取る。"""
     try:
         if str(side or "").upper() != "BUY" or not ENTRY_PASSIVE_LIMIT_ENABLED:
             return None
-        below_pct = float(os.getenv("ENTRY_BUY_BELOW_PCT", "0.2") or 0.0)
+        below_pct = float(os.getenv("ENTRY_BUY_BELOW_PCT", "0.1") or 0.0)
         if below_pct <= 0 or bid <= 0 or _is_take_entry(entry_row, source):
             return None
         max_rounds = int(float(os.getenv("ENTRY_BUY_CHASE_MAX_ROUNDS", "2") or 2))
         if retry_round > max_rounds:
             return None
         if retry_round <= 0:
-            tick = _std_tick(bid)
-            price = math.floor(bid * (1 - below_pct / 100.0) / tick) * tick
+            tick = _wait_tick(bid, ask)
+            price = bid - max(1, round(bid * below_pct / 100.0 / tick)) * tick  # 0.1% に一番近い刻み数 (最低 1 刻み)
             if price >= bid:
                 price = bid - tick
             src, wait = "board_buy_below_limit", float(os.getenv("ENTRY_BUY_BELOW_WAIT_SEC", "60") or 60)
@@ -870,10 +879,10 @@ def _buy_chase_plan(symbol: str, side: str, bid: float, ask: float, retry_round:
 
 
 def sell_above_price(ask: float, bid: float = 0.0) -> float:
-    """2026-10-20 (ユーザー判断): 空売りは売気配の ENTRY_SELL_ABOVE_PCT (0.2%) 上で待つ。通常呼値で切り上げ。"""
-    above_pct = float(os.getenv("ENTRY_SELL_ABOVE_PCT", "0.2") or 0.0)
-    tick = _std_tick(ask)
-    price = math.ceil(ask * (1 + above_pct / 100.0) / tick - 1e-9) * tick
+    """2026-10-20 (ユーザー判断): 空売りは売気配の ENTRY_SELL_ABOVE_PCT (0.1%、10/20 14 時に 0.2 -> 0.1) 上で待つ。通常呼値で切り上げ。"""
+    above_pct = float(os.getenv("ENTRY_SELL_ABOVE_PCT", "0.1") or 0.0)
+    tick = _wait_tick(ask, ask - bid if bid else 0.0, spread_given=True)
+    price = ask + max(1, round(ask * above_pct / 100.0 / tick)) * tick  # 0.1% に一番近い刻み数 (最低 1 刻み)
     if price <= ask:
         price = ask + tick
     return float(price)
@@ -891,7 +900,7 @@ def _sell_wait_plan(symbol: str, side: str, bid: float, ask: float):
     try:
         if str(side or "").upper() != "SELL" or ask <= 0:
             return None
-        if float(os.getenv("ENTRY_SELL_ABOVE_PCT", "0.2") or 0.0) <= 0:
+        if float(os.getenv("ENTRY_SELL_ABOVE_PCT", "0.1") or 0.0) <= 0:
             return None
         price = sell_above_price(ask, bid)
         note_sell_wait(symbol, ask)
