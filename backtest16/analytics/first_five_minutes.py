@@ -111,20 +111,28 @@ def aggregate(records: List[dict]) -> dict:
     if df.empty:
         return {"n": 0}
     df["dir"] = df["first5_bullish"].map({True: "陽線", False: "陰線"})
-    out = {"n": int(len(df)), "groups": {}}
+    # 分割/異常ティック由来の外れ値(例 +248%)が平均を歪めるため、
+    # 平均は ±20% にwinsorizeし、外れ値件数は別途カウントして明示する(§3 データ品質)。
+    CLIP = 20.0
+    out = {"n": int(len(df)), "groups": {},
+           "outliers_abs_gt_20pct": int(((df["max_up_pct"].abs() > CLIP) | (df["max_down_pct"].abs() > CLIP)).sum()),
+           "note": "avg_max_*_pct は±20%でwinsorize(外れ値=分割/異常ティックの可能性)。先後率は未加工。"}
     for (gb, d), g in df.groupby(["gap_bucket", "dir"]):
         n = len(g)
         def frac(col):
             s = g[col].dropna()
             return round(float(s.mean()), 4) if len(s) else None
+        up_w = g["max_up_pct"].clip(-CLIP, CLIP)
+        dn_w = g["max_down_pct"].clip(-CLIP, CLIP)
         out["groups"][f"{gb} / {d}"] = {
             "n": n,
             "high_first_rate": frac("high_first"),
             "low_first_rate": frac("low_first"),
             "up_0.3_first_rate": frac("reached_up_first"),
             "down_0.3_first_rate": frac("reached_down_first"),
-            "avg_max_up_pct": round(float(g["max_up_pct"].mean()), 3),
-            "avg_max_down_pct": round(float(g["max_down_pct"].mean()), 3),
+            "avg_max_up_pct": round(float(up_w.mean()), 3),
+            "avg_max_down_pct": round(float(dn_w.mean()), 3),
+            "outliers": int(((g["max_up_pct"].abs() > CLIP) | (g["max_down_pct"].abs() > CLIP)).sum()),
             "tick_source_rate": round(float((g["source"] == "TICK").mean()), 3),
         }
     return out
