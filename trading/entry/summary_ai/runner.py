@@ -311,6 +311,21 @@ def _wsf_relax_check(symbol: str, side: str, frames: dict) -> Tuple[bool, str]:
     buy = str(side or "BUY").upper() != "SELL"
     recs = {tf: (frames.get(tf) or {}).get(sym) for tf in (3, 5)}
     have = {tf: r for tf, r in recs.items() if r is not None}
+    # 2026-10-20: 古い足の向きで落とさない。3042 は 12:42〜12:56 に -10% 崩れている最中に、7 分前に確定した
+    #   5 分足 (12:45 の足 = 一度戻した足、買い点数 5.74) を「逆向き」として売りを 10 回落とした。
+    #   確定から SUMMARY_AI_MTF_RELAX_MAX_LAG_SEC (既定 120 秒) を過ぎた足は無いものとして扱い、1 分足の向きで代える。
+    max_lag = _env_float("SUMMARY_AI_MTF_RELAX_MAX_LAG_SEC", 120.0)
+    now = pd.Timestamp(frames.get("now") or pd.Timestamp.now())
+    for tf in list(have):
+        r = have[tf]
+        bt = None
+        for k in ("datetime", "date_time", "bar_time", "time"):  # mtf_attach._latest_completed_rows と同じ列
+            v = r.get(k) if hasattr(r, "get") else None
+            if v is not None and str(v) not in ("", "NaT", "None"):
+                bt = pd.to_datetime(v, errors="coerce")
+                break
+        if bt is not None and pd.notna(bt) and (now - (bt + pd.Timedelta(minutes=tf))).total_seconds() > max_lag:
+            have.pop(tf)
     # 3m/5m の点数は買い・売りのどちらか片方だけがプラスになる作りで中立 (両方 0) はほぼ無い
     # (10/8 の 3 分足 2,788 本中 40 本)。「逆向き > 0」で落とすと元のゲートと同じになるので、
     # 強い逆向き (既定 3.0 = 最低エントリー点数。3 分足で 3 以上は全体の 1.7%) だけ落とす。
