@@ -69,7 +69,8 @@ def _env_float(name: str, default: float) -> float:
 TRADE_GUARD_ENABLED = _env_bool("TRADE_GUARD_ENABLED", True)
 ENTRY_TIME_GUARD_ENABLED = _env_bool("ENTRY_TIME_GUARD_ENABLED", True)
 LOSS_COOLDOWN_MINUTES = int(float(os.getenv("LOSS_COOLDOWN_MINUTES", "15")))
-PROFIT_COOLDOWN_MINUTES = int(float(os.getenv("PROFIT_COOLDOWN_MINUTES", "5")))
+# 2026-10-21: 5 -> 0。4382 が利確 3 分後に +7% 暴騰したのをクールダウンで逃した。負けた後の止めは残す。
+PROFIT_COOLDOWN_MINUTES = int(float(os.getenv("PROFIT_COOLDOWN_MINUTES", "0")))
 PARTIAL_PROFIT_COOLDOWN_MINUTES = int(float(os.getenv("PARTIAL_PROFIT_COOLDOWN_MINUTES", "3")))
 MAX_DAILY_LOSSES_PER_SYMBOL = int(float(os.getenv("MAX_DAILY_LOSSES_PER_SYMBOL", "2")))
 ENTRY_STOP_AFTER = os.getenv("ENTRY_STOP_AFTER", "15:23")

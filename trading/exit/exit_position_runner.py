@@ -437,6 +437,18 @@ def run_exit_for_position(*, symbol: str, pos: Dict[str, Any], now: dt.datetime,
 
         logger.warning("[ABSOLUTE_ENTRY_STOP_LOSS] check symbol=%s side=%s entry=%.4f price=%.4f pnl=%.4f current_profit=%.4f%% threshold=%.4f%% pos_source=%s", symbol, side, entry_price, price, pnl, _calc_current_profit_pct(side=side, entry_price=entry_price, current_price=price), ABSOLUTE_ENTRY_STOP_LOSS_PCT, _pos_get(pos, "_position_source", default=""))
 
+        # 2026-10-21: ストップ高で売る。1 ティック手前で勢いが無ければそこで売る (ユーザー判断)。
+        try:
+            from trading.exit.limit_up_exit import judge_limit_up_exit
+            _lu_exit, _lu_reason, _lu_detail = judge_limit_up_exit(symbol=symbol, side=side, current_price=price, now=now)
+        except Exception:
+            logger.exception("[LIMIT UP EXIT] judge failed symbol=%s", symbol)
+            _lu_exit, _lu_reason, _lu_detail = False, "", {}
+        if _lu_exit:
+            logger.warning("[LIMIT UP EXIT] EXIT symbol=%s detail=%s reason=%s", symbol, _lu_detail, _lu_reason)
+            finalize_exit(symbol=symbol, price=price, reason=_lu_reason, cluster_id=0, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=None)
+            return True
+
         ctx = _resolve_exit_ctx(symbol, pos, side=side, entry_price=entry_price, now=now)
         if not ctx:
             logger.warning("[EXIT] skip ctx unavailable symbol=%s side=%s entry=%.4f", symbol, side, entry_price)

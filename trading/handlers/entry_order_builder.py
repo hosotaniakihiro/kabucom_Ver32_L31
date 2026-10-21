@@ -594,10 +594,12 @@ def _day_change_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any):
     """
     import os
 
+    # 2026-10-21: ユーザー判断で BUY 側を無効化 (10.0 -> 0)。4498 のストップ高 (+12% から +24%) を取れなかった。
+    #   SELL 側 (-10% 以下の売り禁止) は残す。
     try:
-        buy_max = float(os.getenv("ENTRY_DAY_CHANGE_BUY_MAX_PCT", "10.0") or 10.0)
+        buy_max = float(os.getenv("ENTRY_DAY_CHANGE_BUY_MAX_PCT", "0") or 0.0)
     except Exception:
-        buy_max = 10.0
+        buy_max = 0.0
     try:
         sell_min = float(os.getenv("ENTRY_DAY_CHANGE_SELL_MIN_PCT", "-10.0") or -10.0)
     except Exception:
@@ -686,7 +688,8 @@ def _price_drift_max_pct() -> float:
         import os
 
         # 2026-10-19: 0.5 -> 1.0。急騰中は判定から 2 秒で 0.6% 動き、634A を 2 回逃した。
-        return float(os.getenv("ENTRY_PRICE_DRIFT_MAX_PCT", "1.0") or 1.0)
+        # 2026-10-21: 1.0 -> 1.5。4382 の再エントリーを 1.01% で逃した。
+        return float(os.getenv("ENTRY_PRICE_DRIFT_MAX_PCT", "1.5") or 1.5)
     except Exception:
         return 0.5
 
