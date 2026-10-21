@@ -67,6 +67,10 @@ except Exception:
 
 Base = declarative_base()
 
+# ニュース系は専用 Base（専用ローカル DB に隔離）。
+# ホットな NAS summary DB / init_engines には一切相乗りしない。
+Base_news = declarative_base()
+
 logger = logging.getLogger(__name__)
 
 
@@ -904,8 +908,64 @@ class RankingEntryEvent(Base_position):
     created_at = Column(DateTime, default=dt.datetime.utcnow, index=True)
 
 
+# ============================================================
+# News / Disclosure（ニュース→売買反応の素材テーブル）
+# ------------------------------------------------------------
+# summary DB に同居（news_monitors 等は Session_summary を使う）。
+# 銘柄コード code を確実に持てるのは JPX 適時開示。
+# 一般ニュースは title / summary からコード抽出できた場合のみ code が入る。
+# news_score() はこのテーブルを銘柄・期間で引いて材料スコアを算出する。
+# ============================================================
+
+class NewsDisclosure(Base_news):
+    __tablename__ = "news_disclosure"
+    __table_args__ = (
+        UniqueConstraint("source", "url", name="uq_news_source_url"),
+        Index("idx_news_code_time", "code", "time"),
+        {"extend_existing": True},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source = Column(String, index=True, nullable=False)   # "JPX" / "Yahoo" / "Nikkei" ...
+    code = Column(String, index=True)                     # 4桁銘柄コード（取れない場合 None）
+    time = Column(DateTime, index=True)                   # 開示 / 記事時刻
+    title = Column(String, nullable=False)
+    summary = Column(String)                              # Gemini 要約（約100字）
+    intro = Column(String)                                # 本文抜粋
+    keywords = Column(String)                             # 検出ワードを「、」連結
+    url = Column(String)
+    sentiment = Column(Float)                             # 任意: -1.0〜+1.0（将来 LLM 判定用）
+    created_at = Column(DateTime, default=dt.datetime.utcnow, index=True)
+
+
+class NewsShadowLog(Base_news):
+    """
+    検証先行(シャドー)用。発注判断には使わず、ポジション建て時点の
+    news_score を記録するだけ。後で約定結果(PnL)と突き合わせ、
+    「news_score を反映していたら勝てたか」を評価する素材になる。
+    hold_id 単位で entry 時のスコアを1本だけ残す（重複スナップショット防止）。
+    """
+    __tablename__ = "news_shadow_log"
+    __table_args__ = (
+        UniqueConstraint("hold_id", name="uq_news_shadow_hold"),
+        Index("idx_news_shadow_symbol_time", "symbol", "entry_time"),
+        {"extend_existing": True},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    hold_id = Column(String, index=True)                  # Position.hold_id（無ければ symbol|entry_time）
+    symbol = Column(String, index=True, nullable=False)
+    side = Column(String)
+    entry_time = Column(DateTime)                          # ポジションの建て時刻
+    news_score = Column(Float, nullable=False)             # entry_time as-of の材料スコア
+    lookback_hours = Column(Float)
+    note = Column(String)
+    created_at = Column(DateTime, default=dt.datetime.utcnow, index=True)
+
+
 __all__ = [
     "Base",
+    "Base_news",
     "Summary",
     "StockSummary1Min",
     "StockSummary3Min",
@@ -924,6 +984,8 @@ __all__ = [
     "ConfidenceBias",
     "SymbolStateLog",
     "RankingEntryEvent",
+    "NewsDisclosure",
+    "NewsShadowLog",
     "SUMMARY_WIDE_SCHEMA_COLUMNS",
     "ensure_summary_wide_schema",
 ]
