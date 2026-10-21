@@ -189,13 +189,30 @@ def apply_incremental_indicators(
 
     df_existing = _ensure_datetime(df_existing)
 
-    results = []
     lookback = RECALC_LOOKBACK.get(interval, 120)
+
+    # df_existing[df_existing["symbol"] == symbol] を銘柄数ぶん繰り返すと
+    # O(銘柄数 x 全行) のスキャンになる。groupby は 1 回で済む。
+    try:
+        old_by_symbol = {s: g for s, g in df_existing.groupby("symbol", sort=False)}
+    except Exception:
+        logger.exception("[INC_IND] groupby(existing) failed -> per-symbol filter")
+        old_by_symbol = None
+
+    empty_old = df_existing.iloc[0:0]
+
+    order: list = []
+    heads: dict = {}
+    calc_parts: list = []
 
     for symbol, g_new in df_new.groupby("symbol", sort=False):
 
         try:
-            g_old = df_existing[df_existing["symbol"] == symbol]
+            if old_by_symbol is None:
+                g_old = df_existing[df_existing["symbol"] == symbol]
+            else:
+                g_old = old_by_symbol.get(symbol, empty_old)
+
             g_all = pd.concat([g_old, g_new], ignore_index=True)
 
             g_all = (
@@ -208,19 +225,60 @@ def apply_incremental_indicators(
             if len(g_all) <= lookback:
                 g_calc = g_all.copy()
             else:
+                heads[symbol] = g_all.iloc[:-lookback]
                 g_calc = g_all.iloc[-lookback:].copy()
 
-            g_calc = add_all_indicators(
-                g_calc,
-                interval=f"{interval}min"
-            )
+            calc_parts.append(g_calc)
+            order.append(symbol)
 
-            # ★ 異常値防御
-            g_calc = _clip_slope_columns(g_calc)
+        except Exception as e:
+            logger.exception(f"[INC_IND] symbol={symbol} prepare failed: {e}")
+            continue
 
-            if len(g_all) > lookback:
+    if not calc_parts:
+        return df_existing
+
+    # add_all_indicators は内部で groupby("symbol") して
+    # _build_symbol_indicators(g, symbol) を呼ぶ = 銘柄単位に閉じた計算なので、
+    # 銘柄ごとに呼んでも全銘柄まとめて 1 回呼んでも結果は同じ。
+    # 一方で 1 回の呼び出しごとに前日サマリDB(NAS)へ sqlite3.connect が発生し、
+    # lru_cache のキーは symbols タプルなので銘柄単位だとほぼ全て miss する。
+    # そのため銘柄数に比例して NAS アクセスが増え、tick が数分に膚れていた。
+    try:
+        batch = pd.concat(calc_parts, ignore_index=True)
+        batch = add_all_indicators(batch, interval=f"{interval}min")
+
+        # ★ 異常値防御 (行単位演算のみなので一括でも同等)
+        batch = _clip_slope_columns(batch)
+
+        calc_by_symbol = {s: g for s, g in batch.groupby("symbol", sort=False)}
+    except Exception:
+        # 一括計算が失敗したときだけ従来どおり銘柄ごとに計算し直す。
+        # (理由を必ず残したうえで、全銘柄を落とさない)
+        logger.exception("[INC_IND] batch indicators failed -> per-symbol fallback")
+        calc_by_symbol = {}
+        for symbol, g_calc in zip(order, calc_parts):
+            try:
+                g = add_all_indicators(g_calc, interval=f"{interval}min")
+                calc_by_symbol[symbol] = _clip_slope_columns(g)
+            except Exception as e:
+                logger.exception(f"[INC_IND] symbol={symbol} failed: {e}")
+                continue
+
+    results = []
+
+    for symbol in order:
+
+        try:
+            g_calc = calc_by_symbol.get(symbol)
+            if g_calc is None or g_calc.empty:
+                continue
+            g_calc = g_calc.reset_index(drop=True)
+
+            head = heads.get(symbol)
+            if head is not None and not head.empty:
                 g_final = pd.concat(
-                    [g_all.iloc[:-lookback], g_calc],
+                    [head, g_calc],
                     ignore_index=True
                 )
             else:

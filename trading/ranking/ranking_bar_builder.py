@@ -66,7 +66,7 @@ def build_ranking_bar_1min(*, force: bool = False) -> None:
             errors="coerce",
             format="mixed",
         )
-        df["minute"] = df["datetime"].dt.floor("T")
+        df["minute"] = df["datetime"].dt.floor("min")
 
 
         bars = []

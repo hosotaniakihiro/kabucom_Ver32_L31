@@ -1,0 +1,664 @@
+# ============================================================
+# File   : trading/summary/mtf_startup_catchup.py
+#          (旧 core/startup/summary_multiframe_startup_catchup_patch.py)
+# Version: V1.4-TIME-RANGE-NOT-NULL-FIX
+# ------------------------------------------------------------
+# 起動時にDB内の1分足サマリーから、3分足・5分足サマリーを差分再集計する。
+# その後、3分足/5分足の rsi/macd/signal/ma75/score 等を補完する。
+#
+# V1.4:
+#   - stock_summary_3min/5min の time_range NOT NULL 対策
+#   - 3分足/5分足生成時に time_range を必ず作成
+#   - UPSERT保存対象に time_range を追加
+#   - 将来 NOT NULL カラムが増えても止まりにくいよう、INSERT必須列へ安全デフォルトを補完
+#   - sqlite3.IntegrityError も interval単位でログ化して処理継続しやすくする
+#
+# V1.3:
+#   - NAS/SQLiteの database is locked 対策
+#   - busy_timeout 30秒既定
+#   - UPSERTをチャンク分割
+#   - locked/busy時 rollback + retry
+#   - startup中にDBが忙しい場合は全体停止ではなく interval単位でskip可能
+# ============================================================
+
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import os
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Any, Iterable
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
+
+logger = logging.getLogger(__name__)
+
+_INSTALLED = False
+_RUNNING = False
+_LOCK = threading.Lock()
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok"}
+    except Exception:
+        return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _is_sqlite_busy_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database is busy" in msg or "locked" in msg
+
+
+def _safe_rollback(conn: sqlite3.Connection) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        logger.debug("[SUMMARY MTF CATCHUP] rollback failed", exc_info=True)
+
+
+def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    busy_ms = int(_env_float("SUMMARY_MTF_CATCHUP_BUSY_TIMEOUT_MS", 30000))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        logger.debug("[SUMMARY MTF CATCHUP] PRAGMA journal_mode=WAL failed", exc_info=True)
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute(f"PRAGMA busy_timeout={busy_ms}")
+    except Exception:
+        logger.debug("[SUMMARY MTF CATCHUP] PRAGMA setup failed", exc_info=True)
+
+
+def _summary_db_path() -> str:
+    explicit = os.getenv("SUMMARY_DB_PATH") or os.getenv("AUTOSTOCK_SUMMARY_DB_PATH")
+    if explicit:
+        return explicit
+    base = os.getenv(
+        "SUMMARY_DB_DIR",
+        nas_path(r"raw_data\kabu_station\summary"),
+    )
+    today = dt.datetime.now().strftime("%Y%m%d")
+    return str(Path(base) / f"summary{today}.db")
+
+
+def _parse_intervals() -> list[int]:
+    raw = os.getenv("SUMMARY_MTF_CATCHUP_INTERVALS", "3,5")
+    out: list[int] = []
+    for x in str(raw).replace(";", ",").split(","):
+        try:
+            n = int(float(x.strip()))
+            if n in (3, 5) and n not in out:
+                out.append(n)
+        except Exception:
+            pass
+    return out or [3, 5]
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
+    except Exception:
+        return False
+
+
+def _table_info(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return [
+            {
+                "cid": r[0],
+                "name": str(r[1]),
+                "type": str(r[2] or ""),
+                "notnull": int(r[3] or 0),
+                "dflt_value": r[4],
+                "pk": int(r[5] or 0),
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [x["name"] for x in _table_info(conn, table)]
+
+
+def _pick(cols: Iterable[str], candidates: Iterable[str]) -> str:
+    s = set(cols or [])
+    for c in candidates:
+        if c in s:
+            return c
+    return ""
+
+
+def _f(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(v)
+        return float(default) if x != x else x
+    except Exception:
+        return float(default)
+
+
+def _norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip().upper()
+        if s.endswith(".T"):
+            s = s[:-2]
+        if s.endswith(".0") and s[:-2].isdigit():
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _parse_dt(v: Any) -> dt.datetime | None:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, dt.datetime):
+            return v.replace(tzinfo=None)
+        txt = str(v).strip().replace("T", " ")
+        if not txt:
+            return None
+        return dt.datetime.fromisoformat(txt)
+    except Exception:
+        try:
+            import pandas as pd
+            t = pd.to_datetime(v, errors="coerce")
+            if pd.isna(t):
+                return None
+            if hasattr(t, "to_pydatetime"):
+                t = t.to_pydatetime()
+            if isinstance(t, dt.datetime):
+                return t.replace(tzinfo=None)
+        except Exception:
+            pass
+    return None
+
+
+def _floor_interval(t: dt.datetime, interval: int) -> dt.datetime:
+    return t.replace(minute=(t.minute // interval) * interval, second=0, microsecond=0)
+
+
+def _make_time_range(start_dt: dt.datetime, interval: int) -> str:
+    """DBの time_range NOT NULL 対策。例: 09:00:00-09:02:59。"""
+    try:
+        end_dt = start_dt + dt.timedelta(minutes=int(interval), seconds=-1)
+        return f"{start_dt.strftime('%H:%M:%S')}-{end_dt.strftime('%H:%M:%S')}"
+    except Exception:
+        return "00:00:00-00:00:00"
+
+
+def _latest_dst_dt(conn: sqlite3.Connection, table: str, cols: list[str]) -> dt.datetime | None:
+    dt_col = _pick(cols, ["datetime", "dt", "timestamp"])
+    date_col = _pick(cols, ["date", "trade_date"])
+    time_col = _pick(cols, ["time", "minute", "bar_time"])
+    try:
+        if dt_col:
+            r = conn.execute(f"SELECT MAX({dt_col}) FROM {table}").fetchone()
+            return _parse_dt(r[0] if r else None)
+        if date_col and time_col:
+            r = conn.execute(f"SELECT MAX({date_col} || ' ' || {time_col}) FROM {table}").fetchone()
+            return _parse_dt(r[0] if r else None)
+    except Exception:
+        logger.debug("[SUMMARY MTF CATCHUP] latest dt failed table=%s", table, exc_info=True)
+    return None
+
+
+def _build_1min_select(cols: list[str], table: str) -> str:
+    sym = _pick(cols, ["symbol", "code", "stock_code"])
+    dtc = _pick(cols, ["datetime", "dt", "timestamp"])
+    datec = _pick(cols, ["date", "trade_date"])
+    timec = _pick(cols, ["time", "minute", "bar_time"])
+    name = _pick(cols, ["symbolname", "symbol_name", "name"])
+    op = _pick(cols, ["open_price", "open"])
+    hi = _pick(cols, ["high_price", "high"])
+    lo = _pick(cols, ["low_price", "low"])
+    cl = _pick(cols, ["close_price", "close", "price", "current_price"])
+    vol = _pick(cols, ["volume", "vol"])
+    turn = _pick(cols, ["turnover", "turnover_yen", "trading_value"])
+    vwap = _pick(cols, ["vwap"])
+
+    if not sym:
+        raise RuntimeError("stock_summary_1min symbol column missing")
+    if not dtc and not (datec and timec):
+        raise RuntimeError("stock_summary_1min datetime columns missing")
+    if not cl:
+        raise RuntimeError("stock_summary_1min close/price column missing")
+
+    dtexpr = dtc if dtc else f"({datec} || ' ' || {timec})"
+    return f"""
+        SELECT
+            CAST({sym} AS TEXT) AS symbol,
+            {name if name else "''"} AS symbolname,
+            {dtexpr} AS dtv,
+            {op if op else cl} AS open_price,
+            {hi if hi else cl} AS high_price,
+            {lo if lo else cl} AS low_price,
+            {cl} AS close_price,
+            {vol if vol else "0"} AS volume,
+            {turn if turn else "0"} AS turnover,
+            {vwap if vwap else "0"} AS vwap
+        FROM {table}
+        WHERE {dtexpr} >= ?
+        ORDER BY symbol, dtv
+        LIMIT ?
+    """
+
+
+def _aggregate(rows: list[tuple[Any, ...]], interval: int, include_current_partial: bool) -> list[dict[str, Any]]:
+    now_floor = _floor_interval(dt.datetime.now(), interval)
+    buckets: dict[tuple[str, dt.datetime], list[dict[str, Any]]] = {}
+
+    for r in rows:
+        sym = _norm_symbol(r[0])
+        dtx = _parse_dt(r[2])
+        if not sym or dtx is None:
+            continue
+        bdt = _floor_interval(dtx, interval)
+        if not include_current_partial and bdt >= now_floor:
+            continue
+        buckets.setdefault((sym, bdt), []).append({
+            "symbol": sym,
+            "symbolname": str(r[1] or ""),
+            "datetime": dtx,
+            "open_price": _f(r[3], 0.0),
+            "high_price": _f(r[4], 0.0),
+            "low_price": _f(r[5], 0.0),
+            "close_price": _f(r[6], 0.0),
+            "volume": _f(r[7], 0.0),
+            "turnover": _f(r[8], 0.0),
+            "vwap": _f(r[9], 0.0),
+        })
+
+    out: list[dict[str, Any]] = []
+    now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for (sym, bdt), xs in sorted(buckets.items(), key=lambda x: (x[0][1], x[0][0])):
+        xs = sorted(xs, key=lambda x: x["datetime"])
+        closes = [_f(x.get("close_price"), 0.0) for x in xs if _f(x.get("close_price"), 0.0) > 0]
+        if not closes:
+            continue
+        open_price = next((_f(x.get("open_price"), 0.0) for x in xs if _f(x.get("open_price"), 0.0) > 0), closes[0])
+        close_price = closes[-1]
+        highs = [_f(x.get("high_price"), 0.0) for x in xs if _f(x.get("high_price"), 0.0) > 0]
+        lows = [_f(x.get("low_price"), 0.0) for x in xs if _f(x.get("low_price"), 0.0) > 0]
+        volume = sum(_f(x.get("volume"), 0.0) for x in xs)
+        turnover = sum(_f(x.get("turnover"), 0.0) for x in xs)
+        if turnover <= 0 and close_price > 0 and volume > 0:
+            turnover = close_price * volume
+        vwap = turnover / volume if turnover > 0 and volume > 0 else 0.0
+        time_range = _make_time_range(bdt, interval)
+        out.append({
+            "symbol": sym,
+            "symbolname": xs[-1].get("symbolname") or xs[0].get("symbolname") or "",
+            "symbol_name": xs[-1].get("symbolname") or xs[0].get("symbolname") or "",
+            "datetime": bdt.strftime("%Y-%m-%d %H:%M:%S"),
+            "date": bdt.strftime("%Y-%m-%d"),
+            "time": bdt.strftime("%H:%M:%S"),
+            "time_range": time_range,
+            "open_price": open_price,
+            "high_price": max(highs) if highs else close_price,
+            "low_price": min(lows) if lows else close_price,
+            "close_price": close_price,
+            "open": open_price,
+            "high": max(highs) if highs else close_price,
+            "low": min(lows) if lows else close_price,
+            "close": close_price,
+            "price": close_price,
+            "current_price": close_price,
+            "volume": volume,
+            "turnover": turnover,
+            "trading_value": turnover,
+            "vwap": vwap,
+            "source": f"startup_1min_to_{interval}min_catchup",
+            "updated_at": now_str,
+        })
+    return out
+
+
+def _chunked(vals: list[tuple[Any, ...]], chunk_size: int) -> Iterable[list[tuple[Any, ...]]]:
+    n = max(1, int(chunk_size or 1))
+    for i in range(0, len(vals), n):
+        yield vals[i:i + n]
+
+
+def _default_for_required_column(col: str, col_type: str, row: dict[str, Any]) -> Any:
+    c = str(col or "")
+    t = str(col_type or "").upper()
+    if c == "time_range":
+        dtx = _parse_dt(row.get("datetime") or f"{row.get('date', '')} {row.get('time', '')}")
+        return _make_time_range(dtx or dt.datetime.now(), 1)
+    if c == "source":
+        return "startup_mtf_catchup"
+    if c == "updated_at":
+        return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if c in {"date", "trade_date"}:
+        dtx = _parse_dt(row.get("datetime")) or dt.datetime.now()
+        return dtx.strftime("%Y-%m-%d")
+    if c in {"time", "minute", "bar_time"}:
+        dtx = _parse_dt(row.get("datetime")) or dt.datetime.now()
+        return dtx.strftime("%H:%M:%S")
+    if "INT" in t or "REAL" in t or "NUM" in t or "FLOA" in t or "DOUB" in t:
+        return 0
+    return ""
+
+
+def _upsert(conn: sqlite3.Connection, table: str, cols: list[str], rows: list[dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    table_info = _table_info(conn, table)
+    info_by_col = {x["name"]: x for x in table_info}
+    preferred = [
+        "symbol", "symbolname", "symbol_name", "datetime", "date", "time", "time_range",
+        "open_price", "high_price", "low_price", "close_price",
+        "open", "high", "low", "close", "price", "current_price",
+        "volume", "turnover", "trading_value", "vwap", "source", "updated_at",
+    ]
+    writable = [c for c in preferred if c in cols]
+
+    # NOT NULL かつ defaultなしの列はINSERT時に必ず含める。
+    # symbol/datetime/date/time 以外の未知列も安全デフォルトで埋める。
+    for info in table_info:
+        c = info["name"]
+        if info.get("pk"):
+            continue
+        if c in writable:
+            continue
+        if int(info.get("notnull") or 0) and info.get("dflt_value") is None and c in cols:
+            writable.append(c)
+
+    if "symbol" not in writable:
+        raise RuntimeError(f"{table} symbol column missing")
+    if "datetime" in writable:
+        conflict = "symbol, datetime"
+    elif "date" in writable and "time" in writable:
+        conflict = "symbol, date, time"
+    else:
+        raise RuntimeError(f"{table} datetime/date+time columns missing")
+
+    non_keys = [c for c in writable if c not in {"symbol", "datetime", "date", "time"}]
+    update_sql = ",".join([f"{c}=excluded.{c}" for c in non_keys])
+    if not update_sql:
+        update_sql = "symbol=excluded.symbol"
+    sql = f"""
+        INSERT INTO {table} ({','.join(writable)})
+        VALUES ({','.join(['?'] * len(writable))})
+        ON CONFLICT({conflict}) DO UPDATE SET {update_sql}
+    """
+
+    vals: list[tuple[Any, ...]] = []
+    for r in rows:
+        one = []
+        for c in writable:
+            v = r.get(c)
+            if v is None or (isinstance(v, str) and v == ""):
+                info = info_by_col.get(c, {})
+                if int(info.get("notnull") or 0):
+                    v = _default_for_required_column(c, str(info.get("type") or ""), r)
+            one.append(v)
+        vals.append(tuple(one))
+
+    retry_count = max(1, _env_int("SUMMARY_MTF_CATCHUP_UPSERT_RETRY_COUNT", 3))
+    sleep_base = max(0.05, _env_float("SUMMARY_MTF_CATCHUP_UPSERT_RETRY_SLEEP_SEC", 0.5))
+    chunk_size = max(1, _env_int("SUMMARY_MTF_CATCHUP_UPSERT_CHUNK_SIZE", 500))
+    skip_if_busy = _env_bool("SUMMARY_MTF_CATCHUP_SKIP_IF_BUSY", True)
+    total = 0
+
+    for chunk_no, chunk in enumerate(_chunked(vals, chunk_size), start=1):
+        last_err: sqlite3.OperationalError | None = None
+        for attempt in range(1, retry_count + 1):
+            try:
+                conn.executemany(sql, chunk)
+                total += len(chunk)
+                break
+            except sqlite3.OperationalError as e:
+                last_err = e
+                _safe_rollback(conn)
+                if not _is_sqlite_busy_error(e):
+                    raise
+                if attempt >= retry_count:
+                    if skip_if_busy:
+                        logger.warning(
+                            "[SUMMARY MTF CATCHUP] upsert skip busy table=%s chunk=%s rows=%s attempts=%s err=%s",
+                            table, chunk_no, len(chunk), retry_count, e,
+                        )
+                        return total
+                    raise
+                sleep_sec = sleep_base * attempt
+                logger.warning(
+                    "[SUMMARY MTF CATCHUP] upsert busy retry table=%s chunk=%s rows=%s attempt=%s/%s sleep=%.2fs err=%s",
+                    table, chunk_no, len(chunk), attempt, retry_count, sleep_sec, e,
+                )
+                time.sleep(sleep_sec)
+        else:
+            if last_err is not None:
+                raise last_err
+    return total
+
+
+def _read_recent_from_db(conn: sqlite3.Connection, table: str, cols: list[str], interval: int, bars: int) -> list[dict[str, Any]]:
+    sym = _pick(cols, ["symbol", "code", "stock_code"])
+    dtc = _pick(cols, ["datetime", "dt", "timestamp"])
+    datec = _pick(cols, ["date", "trade_date"])
+    timec = _pick(cols, ["time", "minute", "bar_time"])
+    cl = _pick(cols, ["close_price", "close", "price", "current_price"])
+    vol = _pick(cols, ["volume", "vol"])
+    if not sym or not cl or not (dtc or (datec and timec)):
+        return []
+    dtexpr = dtc if dtc else f"({datec} || ' ' || {timec})"
+    lookback_min = max(interval * bars + 30, interval * bars)
+    since = (dt.datetime.now() - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        rows = conn.execute(
+            f"SELECT CAST({sym} AS TEXT), {dtexpr}, {cl}, {vol if vol else '0'} FROM {table} WHERE {dtexpr} >= ? ORDER BY {dtexpr} DESC LIMIT ?",
+            (since, max(1000, bars * 200)),
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        if _is_sqlite_busy_error(e) and _env_bool("SUMMARY_MTF_CATCHUP_SKIP_IF_BUSY", True):
+            logger.warning("[SUMMARY MTF CATCHUP] read recent skipped busy table=%s err=%s", table, e)
+            _safe_rollback(conn)
+            return []
+        raise
+    return [{"symbol": _norm_symbol(r[0]), "datetime": str(r[1]), "close": _f(r[2], 0.0), "volume": _f(r[3], 0.0)} for r in rows]
+
+
+def _run_indicator_fill_after_catchup() -> None:
+    if not _env_bool("SUMMARY_MTF_INDICATOR_FILL_AFTER_CATCHUP", True):
+        return
+    try:
+        from trading.summary.mtf_indicator_fill import run_fill
+        run_fill(reason="after_mtf_catchup")
+    except Exception as e:
+        logger.warning("[SUMMARY MTF CATCHUP] indicator fill failed err=%s", e, exc_info=True)
+
+
+def run_catchup(*, reason: str = "manual") -> dict[str, Any]:
+    t0 = time.monotonic()
+    path = _summary_db_path()
+    src = os.getenv("SUMMARY_MTF_CATCHUP_SRC_TABLE", "stock_summary_1min")
+    intervals = _parse_intervals()
+    ma_bars = _env_int("SUMMARY_MTF_CATCHUP_MA_BARS", 75)
+    extra_min = _env_int("SUMMARY_MTF_CATCHUP_EXTRA_MINUTES", 30)
+    max_rows = _env_int("SUMMARY_MTF_CATCHUP_MAX_ROWS", 80000)
+    include_partial = _env_bool("SUMMARY_MTF_CATCHUP_INCLUDE_CURRENT_PARTIAL", True)
+    timeout_sec = max(5.0, _env_float("SUMMARY_MTF_CATCHUP_SQLITE_TIMEOUT", 30.0))
+    busy_ms = int(_env_float("SUMMARY_MTF_CATCHUP_BUSY_TIMEOUT_MS", 30000))
+    result: dict[str, Any] = {"ok": False, "path": path, "intervals": intervals, "reason": reason, "details": {}}
+
+    if not Path(path).exists():
+        result["error"] = "summary_db_not_found"
+        logger.warning("[SUMMARY MTF CATCHUP] skip db not found path=%s", path)
+        return result
+
+    try:
+        with committing_connect(path, timeout=timeout_sec) as conn:
+            _apply_sqlite_pragmas(conn)
+            logger.warning(
+                "[SUMMARY MTF CATCHUP] db open path=%s timeout=%.1fs busy_timeout_ms=%s skip_if_busy=%s chunk_size=%s",
+                path,
+                timeout_sec,
+                busy_ms,
+                _env_bool("SUMMARY_MTF_CATCHUP_SKIP_IF_BUSY", True),
+                _env_int("SUMMARY_MTF_CATCHUP_UPSERT_CHUNK_SIZE", 500),
+            )
+            if not _table_exists(conn, src):
+                result["error"] = "src_table_missing"
+                logger.warning("[SUMMARY MTF CATCHUP] skip src missing table=%s path=%s", src, path)
+                return result
+            cols1 = _columns(conn, src)
+            sql1 = _build_1min_select(cols1, src)
+            total_upserted = 0
+            for interval in intervals:
+                dst = f"stock_summary_{interval}min"
+                detail: dict[str, Any] = {"dst": dst, "interval": interval}
+                result["details"][interval] = detail
+                if not _table_exists(conn, dst):
+                    detail["error"] = "dst_table_missing"
+                    logger.warning("[SUMMARY MTF CATCHUP] skip interval=%s dst table missing path=%s", interval, path)
+                    continue
+                cols_dst = _columns(conn, dst)
+                latest = _latest_dst_dt(conn, dst, cols_dst)
+                lookback_min = max(interval * ma_bars + extra_min, interval * ma_bars)
+                floor_since = dt.datetime.now() - dt.timedelta(minutes=lookback_min)
+                if latest is None:
+                    since = floor_since
+                    latest_s = None
+                else:
+                    since = min(latest - dt.timedelta(minutes=1), floor_since)
+                    latest_s = latest.strftime("%Y-%m-%d %H:%M:%S")
+
+                try:
+                    rows1 = conn.execute(sql1, (since.strftime("%Y-%m-%d %H:%M:%S"), max_rows)).fetchall()
+                    barsx = _aggregate(rows1, interval, include_partial)
+                    upserted = _upsert(conn, dst, cols_dst, barsx)
+                    recent = _read_recent_from_db(conn, dst, cols_dst, interval, ma_bars)
+                    total_upserted += upserted
+                    detail.update({
+                        "latest_before": latest_s,
+                        "since": since.strftime("%Y-%m-%d %H:%M:%S"),
+                        "rows_1min": len(rows1),
+                        "bars": len(barsx),
+                        "upserted": upserted,
+                        "recent_rows_for_ma": len(recent),
+                        "ma_bars": ma_bars,
+                    })
+                    logger.warning(
+                        "[SUMMARY MTF CATCHUP] interval=%s latest_before=%s since=%s rows_1min=%s bars=%s upserted=%s recent_for_ma=%s",
+                        interval, latest_s, detail["since"], len(rows1), len(barsx), upserted, len(recent),
+                    )
+                except sqlite3.OperationalError as e:
+                    _safe_rollback(conn)
+                    if _is_sqlite_busy_error(e) and _env_bool("SUMMARY_MTF_CATCHUP_SKIP_IF_BUSY", True):
+                        detail.update({"error": "database_busy_skipped", "message": str(e)})
+                        logger.warning(
+                            "[SUMMARY MTF CATCHUP] interval skipped busy interval=%s dst=%s err=%s path=%s",
+                            interval, dst, e, path,
+                        )
+                        continue
+                    raise
+                except sqlite3.IntegrityError as e:
+                    _safe_rollback(conn)
+                    detail.update({"error": "integrity_error_skipped", "message": str(e)})
+                    logger.warning(
+                        "[SUMMARY MTF CATCHUP] interval skipped integrity interval=%s dst=%s err=%s path=%s",
+                        interval, dst, e, path, exc_info=True,
+                    )
+                    continue
+            conn.commit()
+        result.update({"ok": True, "upserted": total_upserted, "elapsed": round(time.monotonic() - t0, 3)})
+        logger.warning("[SUMMARY MTF CATCHUP] done reason=%s upserted=%s elapsed=%.3fs db=%s", reason, total_upserted, time.monotonic() - t0, path)
+        if total_upserted > 0 or _env_bool("SUMMARY_MTF_INDICATOR_FILL_AFTER_EMPTY_CATCHUP", False):
+            _run_indicator_fill_after_catchup()
+        else:
+            logger.warning("[SUMMARY MTF CATCHUP] indicator fill skipped because upserted=0")
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        logger.warning("[SUMMARY MTF CATCHUP] failed reason=%s err=%s path=%s", reason, e, path, exc_info=True)
+        return result
+
+
+def _run_background(reason: str) -> None:
+    global _RUNNING
+    with _LOCK:
+        if _RUNNING:
+            logger.info("[SUMMARY MTF CATCHUP] already running skip reason=%s", reason)
+            return
+        _RUNNING = True
+    try:
+        run_catchup(reason=reason)
+    finally:
+        with _LOCK:
+            _RUNNING = False
+
+
+def install() -> bool:
+    global _INSTALLED
+    if _INSTALLED:
+        return True
+    if not _env_bool("SUMMARY_MTF_STARTUP_CATCHUP_ENABLED", True):
+        logger.warning("[SUMMARY MTF CATCHUP] disabled by env")
+        return False
+    _INSTALLED = True
+    delay_sec = max(0.0, _env_float("SUMMARY_MTF_CATCHUP_START_DELAY_SEC", 8.0))
+    logger.warning(
+        "[SUMMARY MTF CATCHUP] installed intervals=%s ma_bars=%s async=%s delay=%.1fs busy_timeout_ms=%s skip_if_busy=%s",
+        _parse_intervals(),
+        _env_int("SUMMARY_MTF_CATCHUP_MA_BARS", 75),
+        _env_bool("SUMMARY_MTF_CATCHUP_RUN_ASYNC", True),
+        delay_sec,
+        int(_env_float("SUMMARY_MTF_CATCHUP_BUSY_TIMEOUT_MS", 30000)),
+        _env_bool("SUMMARY_MTF_CATCHUP_SKIP_IF_BUSY", True),
+    )
+
+    def _delayed_background() -> None:
+        if delay_sec > 0:
+            time.sleep(delay_sec)
+        _run_background("startup")
+
+    if _env_bool("SUMMARY_MTF_CATCHUP_RUN_ASYNC", True):
+        th = threading.Thread(target=_delayed_background, name="summary-mtf-startup-catchup", daemon=True)
+        th.start()
+    else:
+        _delayed_background()
+    return True
+
+
+# import 時の自動 install は撤去した。
+# 旧構成では import しただけで DISABLE_SUMMARY_MTF_CATCHUP の判定を経ずに
+# catchup スレッドが立つ可能性があった (実際には sitecustomize の
+# _install_summary_mtf_catchup_safely() が gate を通してから import するので
+# 顕在化していなかったが、本体ツリーへ移動して誤 import されやすくなるため)。
+# install() は _INSTALLED ガード付きの冪等な関数なので、呼び出し側で明示的に呼ぶ。
+
+__all__ = ["install", "run_catchup"]

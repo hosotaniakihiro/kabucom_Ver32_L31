@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import pandas as pd
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +41,7 @@ logger = logging.getLogger(__name__)
 # constants
 # ============================================================
 
-DEFAULT_NAS_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_NAS_ROOT = nas_root()
 
 _SAVE_BACKEND_CANDIDATES: tuple[tuple[str, str], ...] = (
     ("trading.ranking.summary.persistence.saver", "save_ranking_summary"),
@@ -200,7 +202,7 @@ def _ensure_local_ranking_summary_table(
         return True
 
     try:
-        with sqlite3.connect(str(path), timeout=15) as conn:
+        with committing_connect(str(path), timeout=15) as conn:
             conn.execute("PRAGMA busy_timeout=15000")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
@@ -360,7 +362,7 @@ def _read_latest_rows_from_table(
         return pd.DataFrame()
 
     try:
-        with sqlite3.connect(str(db_path), timeout=10) as conn:
+        with committing_connect(str(db_path), timeout=10) as conn:
             conn.execute("PRAGMA busy_timeout=10000")
 
             if not _table_exists(conn, table):
@@ -409,7 +411,7 @@ def _read_recent_rows_from_table(
         return pd.DataFrame()
 
     try:
-        with sqlite3.connect(str(db_path), timeout=10) as conn:
+        with committing_connect(str(db_path), timeout=10) as conn:
             conn.execute("PRAGMA busy_timeout=10000")
 
             if not _table_exists(conn, table):

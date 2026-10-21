@@ -33,6 +33,23 @@ from token_manager import get_valid_token
 
 logger = logging.getLogger(__name__)
 
+import contextlib as _contextlib
+import sys as _sys
+import contextvars as _contextvars
+
+# 2026-10-19: 新規注文の信用区分を呼び出し側で決める (1=制度、3=一般デイトレ)。
+#   with margin_trade_type_override(1): place_entry_sell(...) のように使う。スレッド/コンテキストごと。
+_FORCED_MARGIN_TRADE_TYPE: "_contextvars.ContextVar[int | None]" = _contextvars.ContextVar("forced_margin_trade_type", default=None)
+
+
+@_contextlib.contextmanager
+def margin_trade_type_override(margin_trade_type: int):
+    token = _FORCED_MARGIN_TRADE_TYPE.set(int(margin_trade_type))
+    try:
+        yield
+    finally:
+        _FORCED_MARGIN_TRADE_TYPE.reset(token)
+
 API_URL = "http://localhost:18080/kabusapi"
 
 TRADE_RESTRICT_SEC = 1800
@@ -123,6 +140,96 @@ def _is_symbol_trade_restricted(data: Any) -> bool:
     if "取引" in message and "制限" in message:
         return True
     return False
+
+
+def _margin_type_reject_enabled() -> bool:
+    """MarginTradeType 不正を銘柄固有の制限として扱うか (2026-09-25)。"""
+    import os
+
+    v = str(os.getenv("ENTRY_MARK_MARGIN_TYPE_REJECT", "1")).strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _margin_type_restrict_sec() -> int:
+    """MarginTradeType 不正で止めておく秒数。既定 21600 (6 時間 = 当日いっぱい)。
+
+    100033 の一時的な取引制限 (TRADE_RESTRICT_SEC=1800) と違い、
+    日計り信用の対象外かどうかは当日中変わらないので長く止める。
+    """
+    import os
+
+    try:
+        return max(60, int(float(os.getenv("MARGIN_TYPE_RESTRICT_SEC", "21600") or 21600)))
+    except Exception:
+        return 21600
+
+
+def _is_margin_type_unsupported(data: Any) -> bool:
+    """日計り信用などの信用区分が使えない銘柄か (2026-09-25)。
+
+    9/25 の 4875 は margin_type=3 (日計り信用) で
+      Code=4002013 パラメータ不正：MarginTradeType
+    が返った。同じ margin_type=3 で 6904 は約定しているので設定側の誤りでは
+    なく、銘柄がデイトレ信用の対象外という固有の性質。
+    reason=ORDER_ID_EMPTY_RETRYABLE として再試行されるのを止める。
+    """
+    if not _margin_type_reject_enabled():
+        return False
+    code, message = _extract_code_message(data)
+    if code != "4002013":
+        return False
+    return "margintradetype" in str(message or "").lower()
+
+
+def _margin_type_fallback_enabled() -> bool:
+    """日計り信用が使えない銘柄を制度信用で建て直すか (2026-09-29)。既定 ON。
+
+    9/25 の 4875、9/29 の新規上場株群 (627A / 625A / 634A / 646A / 593A /
+    621A / 604A ...) は margin_type=3 で Code=4002013 MarginTradeType が返る。
+    これらは値上がり率上位に頻出するので、6 時間止めると当日いっぱい触れない。
+    制度信用 (MarginTradeType=1) なら建てられる。
+
+    持ち越しの安全性は確認済み: DAYTRADE_FORCE_CLOSE_ONLY_MARGIN_TYPE="0" なので
+    15:24:30 の強制決済は MarginTradeType=1 も対象にする (kabu_api/daytrade_credit.py
+    _is_target_position)。新規は ENTRY_NO_NEW_AFTER=15:00 で止まる。
+
+    注意: 日計り信用は証券会社側も当日中に強制返済するが、制度信用は 6 か月
+    なので**自前の強制決済だけが持ち越しを防ぐ**。停止時はここが効かない。
+
+    ENTRY_MARGIN_TYPE_FALLBACK_ENABLED=0 で従来動作 (6 時間ブロック) に戻る。
+    """
+    import os
+
+    v = str(os.getenv("ENTRY_MARGIN_TYPE_FALLBACK_ENABLED", "1")).strip().lower()
+    return v not in ("0", "false", "no", "off", "ng", "disabled")
+
+
+def _margin_type_fallback_value() -> int:
+    """フォールバック先の信用区分。既定 1 (制度信用)。"""
+    import os
+
+    try:
+        return int(float(os.getenv("ENTRY_MARGIN_TYPE_FALLBACK", "1") or 1))
+    except Exception:
+        return 1
+
+
+def _margin_type_fallback_applicable(payload: dict, data: Any) -> bool:
+    """この拒否を制度信用で再送してよいか。"""
+    if not _margin_type_fallback_enabled():
+        return False
+    if not _is_margin_type_unsupported(data):
+        return False
+    try:
+        if int(float(payload.get("CashMargin") or 0)) != 2:
+            return False  # 新規の信用建て以外は触らない
+        cur = int(float(payload.get("MarginTradeType") or 0))
+    except Exception:
+        return False
+    nxt = _margin_type_fallback_value()
+    if nxt <= 0 or nxt == cur:
+        return False
+    return True
 
 
 def _set_last_send_order_error(payload: dict, data: Any, *, status_code: Any = None) -> None:
@@ -263,19 +370,27 @@ def _mark_symbol_trade_restricted_if_needed(payload: dict, data: Any) -> None:
     try:
         if not _is_credit_new_order_payload(payload):
             return
-        if not _is_symbol_trade_restricted(data):
+        # 2026-09-25: 100033 (一時的な取引制限) と 4002013 (MarginTradeType 不正)
+        #   の両方を拾う。後者は日計り信用の対象外という銘柄固有の性質なので
+        #   当日いっぱい止める。
+        _margin_ng = _is_margin_type_unsupported(data)
+        if not _margin_ng and not _is_symbol_trade_restricted(data):
             return
         symbol = _safe_symbol(payload)
         if not symbol:
             return
         code, message = _extract_code_message(data)
         side = _payload_side_name(payload)
-        until = dt.datetime.now() + dt.timedelta(seconds=TRADE_RESTRICT_SEC)
+        _sec = _margin_type_restrict_sec() if _margin_ng else TRADE_RESTRICT_SEC
+        until = dt.datetime.now() + dt.timedelta(seconds=_sec)
         root = _get_trade_restricted_root()
         root[symbol] = until
         logger.warning(
-            "🚫 SYMBOL_TRADE_RESTRICTED_BY_KABU_API symbol=%s side=%s code=%s until=%s message=%s",
-            symbol, side, code or "UNKNOWN", until, message,
+            "🚫 SYMBOL_TRADE_RESTRICTED_BY_KABU_API symbol=%s side=%s code=%s until=%s sec=%d "
+            "kind=%s message=%s",
+            symbol, side, code or "UNKNOWN", until, _sec,
+            "margin_type_unsupported" if _margin_ng else "trade_restricted",
+            message,
         )
     except Exception:
         logger.exception("[SEND ORDER] failed to mark symbol trade_restricted payload=%s data=%s", payload, data)
@@ -308,7 +423,125 @@ def _log_send_attempt(payload: dict) -> None:
 # 🌐 統一注文 API（常に dict を返す）
 # ============================================================
 
-def send_order_common(payload: dict):
+def _retry_with_fallback_margin(payload: dict, data: Any, *, status_code: Any = None):
+    """日計り信用が使えない銘柄を制度信用で 1 回だけ建て直す。"""
+    nxt = _margin_type_fallback_value()
+    code, message = _extract_code_message(data)
+    new_payload = dict(payload)
+    new_payload["MarginTradeType"] = nxt
+    logger.warning(
+        "[SEND ORDER MARGIN FALLBACK] symbol=%s side=%s margin_type=%s -> %s "
+        "code=%s message=%s status=%s (日計り信用の対象外なので制度信用で再送。"
+        "15:24:30 の強制決済は MarginTradeType=%s も対象)",
+        _safe_symbol(payload), _payload_side_name(payload),
+        payload.get("MarginTradeType"), nxt, code, message, status_code, nxt,
+    )
+    return send_order_common(new_payload, _margin_fallback_done=True)
+
+
+# ============================================================
+# 2026-10-01: 新規エントリーの停止スイッチ (再起動不要)
+#   %LOCALAPPDATA%\autostock\runtime\ENTRY_PAUSE があれば新規注文
+#   (信用新規 CashMargin=2 / 現物買い) を送らない。返済は止めない。
+#   ファイルを消せば即再開。発注ごとに存在確認するだけ。
+# ============================================================
+def _entry_pause_file():
+    import os
+    from pathlib import Path
+
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "autostock" / "runtime" / "ENTRY_PAUSE"
+
+
+def _entry_paused_by_file(payload: dict) -> bool:
+    try:
+        cm = int(payload.get("CashMargin") or 0)
+        is_entry = cm == 2 or (cm == 1 and str(payload.get("Side")) == "2")
+        if not is_entry or not _entry_pause_file().exists():
+            return False
+        logger.warning(
+            "[ENTRY PAUSE] 新規注文を送らない (停止ファイルあり) symbol=%s side=%s qty=%s file=%s",
+            payload.get("Symbol"), payload.get("Side"), payload.get("Qty"), _entry_pause_file(),
+        )
+        return True
+    except Exception:
+        return False
+
+
+_PREMIUM_CACHE: dict = {}  # symbol -> (取得時刻, DayTrade dict)
+
+# 2026-10-20: 戦略ごとのプレミアム料上限 (%)。SURGE SHORT は 1 回 +2% 前後を取るので 0.4% まで払う (ユーザー判断)。
+_PREMIUM_CAP_PCT = _contextvars.ContextVar("daytrade_short_premium_cap_pct", default=None)
+
+
+@_contextlib.contextmanager
+def premium_cap_override(max_pct: float):
+    """with の中で出す新規売りだけ、DAYTRADE_SHORT_MAX_PREMIUM_PCT の代わりに max_pct を上限にする。"""
+    tok = _PREMIUM_CAP_PCT.set(float(max_pct))
+    try:
+        yield
+    finally:
+        _PREMIUM_CAP_PCT.reset(tok)
+
+
+def _daytrade_premium(symbol: str):
+    """/margin/marginpremium の DayTrade 部分 (円/株)。5 分キャッシュ。取れなければ None。"""
+    now = dt.datetime.now().timestamp()
+    hit = _PREMIUM_CACHE.get(symbol)
+    if hit and now - hit[0] < 300:
+        return hit[1]
+    token = get_valid_token()
+    if not token:
+        return None
+    try:
+        r = requests.get(f"{API_URL}/margin/marginpremium/{symbol}", headers={"X-API-KEY": token}, timeout=3)
+        if r.status_code != 200:
+            logger.warning("[DAYTRADE SHORT PREMIUM] marginpremium status=%s symbol=%s body=%s", r.status_code, symbol, r.text[:200])
+            return None
+        d = (r.json() or {}).get("DayTrade") or {}
+    except Exception:
+        logger.warning("[DAYTRADE SHORT PREMIUM] marginpremium failed symbol=%s err=%s", symbol, _sys.exc_info()[1])
+        return None
+    _PREMIUM_CACHE[symbol] = (now, d)
+    return d
+
+
+def _daytrade_short_premium_block_reason(payload: dict) -> str:
+    """一般信用デイトレ (MarginTradeType=3) の新規売りで、プレミアム料が高すぎれば理由を返す。それ以外は ""。
+
+    プレミアム料が取れないときも送らない (4493 のような 0.5% を見落とすより、1 回見送るほうが安い)。
+    """
+    try:
+        if not _is_sell_credit_new_payload(payload) or int(payload.get("MarginTradeType") or 0) != 3:
+            return ""
+        _cap = _PREMIUM_CAP_PCT.get()
+        max_pct = float(_cap) if _cap is not None else float(os.getenv("DAYTRADE_SHORT_MAX_PREMIUM_PCT", "0.1"))
+        if max_pct < 0:
+            return ""
+        sym = _safe_symbol(payload)
+        d = _daytrade_premium(sym)
+        if d is None:
+            if _cap is not None:
+                return ""  # 上限を渡した戦略 (SURGE SHORT) は発注直前に自分で照会済み。kabu Station が遅いだけで止めない
+            return "reason=premium_unavailable"
+        if d.get("MarginPremiumType") is None:
+            return ""  # デイトレ空売りの対象外。証券会社が断り、制度信用への切替 (_retry_with_fallback_margin) に任せる
+        prem = float(d.get("MarginPremium") or 0.0)
+        if prem <= 0:
+            return ""
+        price = float(payload.get("Price") or 0.0)
+        if price <= 0:
+            return f"reason=premium_no_price premium_yen={prem}"
+        pct = prem / price * 100.0
+        if pct > max_pct:
+            return f"reason=premium_too_high premium_yen={prem} premium_pct={pct:.3f} max_pct={max_pct}"
+        return ""
+    except Exception:
+        logger.exception("[DAYTRADE SHORT PREMIUM] check failed")
+        return "reason=premium_check_error"
+
+
+def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
     if not isinstance(payload, dict):
         logger.error("❌ send_order_common: payload is not dict type=%s payload=%s", type(payload).__name__, payload)
         return None
@@ -319,8 +552,59 @@ def send_order_common(payload: dict):
     if _block_if_market_closed(payload):
         return None
 
+    # 2026-10-19: 信用の新規買いを止める (ユーザー判断)。ENTRY_BUY_ENABLED=1 で戻す。
+    #   過去 18 日の実売買で 買い 215 回 -62,140 円 / 売り 32 回 +45,240 円。返済 (CashMargin=3) は止めない。
+    if (_is_credit_new_order_payload(payload) and str(payload.get("Side")) == "2"
+            and not _env_bool("ENTRY_BUY_ENABLED", False)):
+        logger.warning("[ENTRY BUY DISABLED] 新規買いを送らない symbol=%s qty=%s price=%s (ENTRY_BUY_ENABLED=1 で戻す)",
+                       _safe_symbol(payload), payload.get("Qty"), payload.get("Price"))
+        _set_last_send_order_error(payload, {"Code": "ENTRY_BUY_DISABLED", "Message": "credit new buy disabled"}, status_code="LOCAL")
+        return None
+
+    # 2026-10-19: 呼び出し側が信用区分を指定した新規 (OVEREXT_SHORT の制度信用など)。margin_trade_type_override 参照。
+    try:
+        _forced = _FORCED_MARGIN_TRADE_TYPE.get()
+        if _forced and _is_credit_new_order_payload(payload) and int(payload.get("MarginTradeType") or 0) != int(_forced):
+            logger.warning("[MARGIN TYPE OVERRIDE] symbol=%s side=%s MarginTradeType %s -> %s",
+                           _safe_symbol(payload), payload.get("Side"), payload.get("MarginTradeType"), _forced)
+            payload["MarginTradeType"] = int(_forced)
+    except Exception:
+        logger.exception("[MARGIN TYPE OVERRIDE] failed")
+
+    # 2026-10-19: ENTRY_NO_NEW_AFTER (15:00) 以降の信用新規は制度信用 (MarginTradeType=1) で出す (ユーザー判断)。
+    #   一般信用デイトレ (3) は日計りで当日中に返済が必要なため。制度の建玉は 15:24:30 の強制決済の対象外で持ち越しになる。
+    try:
+        if (_is_credit_new_order_payload(payload) and int(payload.get("MarginTradeType") or 0) != 1
+                and _env_bool("ENTRY_AFTER_CUTOFF_SEIDO_ENABLED", True)):
+            hh, mm = [int(x) for x in str(os.getenv("ENTRY_NO_NEW_AFTER", "15:00")).split(":")[:2]]
+            if dt.datetime.now().time() >= dt.time(hh, mm):
+                logger.warning("[ENTRY SEIDO AFTER CUTOFF] symbol=%s side=%s MarginTradeType %s -> 1 (制度信用、持ち越し)",
+                               _safe_symbol(payload), payload.get("Side"), payload.get("MarginTradeType"))
+                payload["MarginTradeType"] = 1
+                # 15:24:30 の強制決済で返済されないよう持ち越し登録する (制度は全区分が強制決済の対象)
+                try:
+                    from trading.strategies.overnight_holds import register as _register_overnight
+                    _register_overnight(_safe_symbol(payload), "ENTRY_AFTER_CUTOFF_SEIDO", days=3)
+                except Exception:
+                    logger.exception("[ENTRY SEIDO AFTER CUTOFF] overnight register failed")
+    except Exception:
+        logger.exception("[ENTRY SEIDO AFTER CUTOFF] margin type rewrite failed")
+
+    # 2026-10-20: 一般信用デイトレの新規売りは、プレミアム料が売値の DAYTRADE_SHORT_MAX_PREMIUM_PCT (0.1%) を超えたら送らない。
+    #   10/20 の 4493 は 100 株 1,680 円 (売値の 0.5%) を 2 回払った。研究で見えた有利さは多くて 0.1%。
+    _premium_reason = _daytrade_short_premium_block_reason(payload)
+    if _premium_reason:
+        logger.warning("[DAYTRADE SHORT PREMIUM] 新規売りを送らない symbol=%s price=%s %s",
+                       _safe_symbol(payload), payload.get("Price"), _premium_reason)
+        _set_last_send_order_error(payload, {"Code": "DAYTRADE_SHORT_PREMIUM", "Message": _premium_reason}, status_code="LOCAL")
+        return None
+
     if _credit_new_suppressed_now(payload):
         _set_last_send_order_error(payload, {"Code": "LOCAL_SUPPRESS", "Message": "credit new local suppress"}, status_code="LOCAL")
+        return None
+
+    if _entry_paused_by_file(payload):
+        _set_last_send_order_error(payload, {"Code": "ENTRY_PAUSE", "Message": "entry paused by file"}, status_code="LOCAL")
         return None
 
     token = get_valid_token()
@@ -341,6 +625,8 @@ def send_order_common(payload: dict):
                 data = res.json()
             except Exception:
                 data = res.text
+            if not _margin_fallback_done and _margin_type_fallback_applicable(payload, data):
+                return _retry_with_fallback_margin(payload, data, status_code=res.status_code)
             _handle_reject_response(payload, data, status_code=res.status_code)
             code, message = _extract_code_message(data)
             logger.error(
@@ -358,6 +644,9 @@ def send_order_common(payload: dict):
 
         order_id = data.get("OrderId") if isinstance(data, dict) else None
         if not order_id:
+            if not _margin_fallback_done and _margin_type_fallback_applicable(payload, data):
+                return _retry_with_fallback_margin(
+                    payload, data, status_code=getattr(res, "status_code", None))
             _handle_reject_response(payload, data, status_code=getattr(res, "status_code", None))
             code, message = _extract_code_message(data)
             logger.error(

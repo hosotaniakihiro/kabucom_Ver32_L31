@@ -26,6 +26,8 @@ import concurrent.futures
 import importlib
 import logging
 import os
+import time
+import sys
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
 from .normalize import _normalize_symbol
@@ -94,10 +96,10 @@ _DYNAMIC_SYMBOL_PROVIDERS: Tuple[Tuple[str, str], ...] = (
     ("trading.ranking.active_symbol_manager", "get_push_symbols"),
     ("trading.ranking.active_symbol_manager", "get_register_symbols"),
     ("trading.ranking.active_symbol_manager", "get_current_active_symbols"),
-    ("core.startup.symbol_bootstrap", "get_active_symbols"),
-    ("core.startup.symbol_bootstrap", "get_monitor_symbols"),
-    ("core.startup.push_bootstrap", "get_push_symbols"),
-    ("core.startup.push_stream_bootstrap", "get_push_symbols"),
+    ("core.startup.bootstrap.symbol", "get_active_symbols"),
+    ("core.startup.bootstrap.symbol", "get_monitor_symbols"),
+    ("core.startup.push.bootstrap", "get_push_symbols"),
+    ("core.startup.push.stream_bootstrap", "get_push_symbols"),
     ("optional.batch.daily_watchlist", "get_daily_watchlist_symbols"),
     ("optional.batch.daily_watchlist", "load_daily_watchlist_symbols"),
 )
@@ -423,7 +425,7 @@ def _resolve_from_dynamic_providers() -> List[str]:
     return []
 
 
-def resolve_monitor_symbols() -> List[str]:
+def _resolve_monitor_symbols_core() -> List[str]:
     resolvers: Tuple[Tuple[str, Callable[[], List[str]]], ...] = (
         ("runtime", _resolve_from_runtime),
         ("global_data", _resolve_from_global_data),
@@ -463,7 +465,7 @@ def _filter_liquidity_with_timeout(cleaned: List[str]) -> Any:
     )
 
 
-def apply_register_liquidity_guard(targets: Sequence[str]) -> List[str]:
+def _apply_register_liquidity_guard_core(targets: Sequence[str]) -> List[str]:
     cleaned, raw_count, filler_count, invalid_count = clean_symbol_list(targets)
 
     if not cleaned:
@@ -530,7 +532,7 @@ def apply_register_liquidity_guard(targets: Sequence[str]) -> List[str]:
             logger.debug("[push_stream] liquidity guard executor shutdown failed", exc_info=True)
 
 
-def resolve_register_targets() -> List[str]:
+def _resolve_register_targets_core() -> List[str]:
     targets = resolve_monitor_symbols()
     targets, raw_count, filler_count, invalid_count = clean_symbol_list(targets)
 
@@ -608,3 +610,350 @@ __all__ = [
     "apply_register_liquidity_guard",
     "resolve_register_targets",
 ]
+
+
+# ============================================================
+# PUSH ローテーション対象の 2 層ガード
+# (旧 core/startup の2パッチを本文化)
+#   1層目 _ilg_*: intraday_load_guard_patch     … 100件ハードクランプ
+#   2層目 _prr_*: push_registration_recovery_patch … topup / audit ログ
+# ------------------------------------------------------------
+# 実 install 順は core/startup/runtime_env/installer.py の install() 内で
+#   524行 intraday_load_guard -> 543行 push_registration_recovery
+# どちらも元関数を closure/_original で保持する合成型なので、
+#   native <- intraday clamp <- push_recovery
+# の 2 層になる。同じ順序で重ねている。
+#
+# 適用スコープが 2 つで異なる点に注意 (_safe_install の allowed 集合):
+#   intraday_load_guard        … DB|TRADING|HELPER (ほぼ全 context)
+#   push_registration_recovery … {main, main_database, push_receiver}
+# ranking_collector などでは 1 層目だけが効く。
+#
+# 意図的な差分: 旧構成では rotation_core.py:34 が
+#   from .rotation_symbols import resolve_register_targets
+# で native を束縛済みだったため、intraday は rotation_core 側の束縛も
+# 別途ラップしていた (clamp のみ / audit 無し)。本文化後は
+# rotation_core の from-import が合成済みの関数を掴むので、
+# rotation_core 経由でも audit ログが 1 行増える。
+# audit ラッパーは戻り値を変えない純粋なログなので値の挙動は同じ。
+# ============================================================
+
+_ILG_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+_ILG_CONTEXTS = {
+    "main_database", "db_prepare", "push_receiver", "summary_database",
+    "ranking_collector", "yahoo_complement", "main", "helper",
+}
+_PRR_CONTEXTS = {"main", "main_database", "push_receiver"}
+
+
+def _rot_argv_context() -> str:
+    """core/startup/runtime_env/installer.py の _argv_context() と同一。"""
+    try:
+        text = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if "main_database.py" in text:
+            return "main_database"
+        if text.endswith("main.py") or "/main.py" in text:
+            return "main"
+        if "db_prepare_runner.py" in text:
+            return "db_prepare"
+        if "push_receiver_runner.py" in text:
+            return "push_receiver"
+        if "summary_database_runner.py" in text:
+            return "summary_database"
+        if "ranking_collector_runner.py" in text:
+            return "ranking_collector"
+        if "yahoo_complement_runner.py" in text:
+            return "yahoo_complement"
+        if "data_collectors_runner.py" in text:
+            return "main_database"
+        if text:
+            return "helper"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _ilg_scope_enabled() -> bool:
+    if str(os.environ.get("DISABLE_INTRADAY_LOAD_GUARD_PATCH", "")).strip() == "1":
+        return False
+    if _ilg_env_bool("DISABLE_INTRADAY_LOAD_GUARD_PATCH", False):
+        return False
+    return _rot_argv_context() in _ILG_CONTEXTS
+
+
+def _prr_scope_enabled() -> bool:
+    if str(os.environ.get("DISABLE_PUSH_REGISTER_RECOVERY_PATCH", "")).strip() == "1":
+        return False
+    return _rot_argv_context() in _PRR_CONTEXTS
+
+
+def _ilg_env_bool(name: str, default: bool = False) -> bool:
+    try:
+        raw = str(os.getenv(name, "")).strip().lower()
+        if raw in _ILG_TRUE:
+            return True
+        if raw in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _ilg_env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        v = int(float(str(os.getenv(name, str(default))).replace(",", "")))
+    except Exception:
+        v = int(default)
+    if min_value is not None:
+        v = max(v, min_value)
+    if max_value is not None:
+        v = min(v, max_value)
+    return int(v)
+
+
+def _ilg_norm_symbol(symbol: Any) -> str:
+    s = str(symbol or "").strip().upper()
+    if s.endswith(".T"):
+        s = s[:-2]
+    return s
+
+
+def _ilg_dedupe_limit(items: Iterable[Any], limit: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in items or []:
+        s = _ilg_norm_symbol(x)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _prr_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _prr_env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).replace(",", "")))
+    except Exception:
+        return int(default)
+
+
+def _prr_dedupe(items: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in items or []:
+        s = str(x or "").strip().upper()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _prr_safe_clean_symbols(values: Any) -> list[str]:
+    try:
+        cleaned, *_ = clean_symbol_list(values)
+        return list(cleaned or [])
+    except Exception:
+        try:
+            return _prr_dedupe([str(x) for x in list(values or [])])
+        except Exception:
+            return []
+
+
+def _prr_split_ab_counts(symbols: Sequence[str]) -> tuple[int, int, list[str], list[str]]:
+    chunk = max(1, _prr_env_int("PUSH_REGISTER_CHUNK_SIZE", 50))
+    a = list(symbols or [])[:chunk]
+    b = list(symbols or [])[chunk:chunk * 2]
+    return len(a), len(b), a[:10], b[:10]
+
+
+def _prr_extend_symbols(base: Sequence[str], extra: Sequence[str], limit: int) -> list[str]:
+    cleaned = _prr_safe_clean_symbols(extra)
+    merged = _prr_dedupe([*(base or []), *cleaned])
+    return merged[:limit]
+
+
+def _ilg_clamp(values: Any) -> List[str]:
+    limit = _ilg_env_int("PUSH_ROTATION_TARGET_MAX_KEEP", 100, min_value=1, max_value=100)
+    out = _ilg_dedupe_limit(values or [], limit)
+    return out[:limit]
+
+
+def _resolve_monitor_symbols_clamped() -> List[str]:
+    """1層目: 100件ハードクランプ (旧 intraday_load_guard_patch)。"""
+    base = _resolve_monitor_symbols_core()
+    if not _ilg_scope_enabled():
+        return base
+    return _ilg_clamp(base)
+
+
+def _resolve_register_targets_clamped() -> List[str]:
+    """1層目: 100件ハードクランプ (旧 intraday_load_guard_patch)。"""
+    base = _resolve_register_targets_core()
+    if not _ilg_scope_enabled():
+        return base
+    return _ilg_clamp(base)
+
+
+# ============================================================
+# ROTATION STABILITY / LIQUIDITY KEEP100
+# (旧 rotation_stability_patch.py と rotation_liquidity_keep100_patch.py)
+# ------------------------------------------------------------
+# 旧 install は
+#   resolve_monitor_symbols / resolve_register_targets を stability 版へ置換
+#   apply_register_liquidity_guard を stability -> keep100 の順に 2 段ラップ
+# していた。実装本体は rotation_stability.py に残し、ここは束縛だけを持つ。
+# ネイティブ実装は *_core にリネームしてある (stability 版は元実装を呼ばない)。
+# ============================================================
+
+
+def resolve_monitor_symbols() -> List[str]:
+    from . import rotation_stability
+
+    return rotation_stability.resolve_monitor_symbols()
+
+
+def resolve_register_targets() -> List[str]:
+    from . import rotation_stability
+
+    return rotation_stability.resolve_register_targets()
+
+
+def apply_register_liquidity_guard(targets: Sequence[str]) -> List[str]:
+    """keep100 -> stability fail-open -> ネイティブガード の順。"""
+    from . import rotation_liquidity_keep100, rotation_stability
+
+    def _stability(t):
+        return rotation_stability.apply_register_liquidity_guard(t, apply_register_liquidity_guard_core)
+
+    return rotation_liquidity_keep100.apply_keep100_guard(targets, _stability)
+
+
+def resolve_monitor_symbols_core() -> List[str]:
+    """2層目: 100件までの topup (旧 push_registration_recovery_patch)。"""
+    if not _prr_scope_enabled():
+        return _resolve_monitor_symbols_clamped()
+
+    min_keep = max(1, _prr_env_int("PUSH_REGISTER_MIN_KEEP", 100))
+    max_keep = max(min_keep, _prr_env_int("PUSH_REGISTER_MAX_KEEP", DEFAULT_REGISTER_MAX_SYMBOLS))
+    if not _prr_env_bool("PUSH_REGISTER_TARGET_TOPUP_ENABLED", True):
+        return _resolve_monitor_symbols_clamped()
+
+    try:
+        base = _resolve_monitor_symbols_clamped()
+    except Exception:
+        logger.exception("[PUSH REGISTER RECOVERY] original resolve_monitor_symbols failed")
+        base = []
+    base = _prr_safe_clean_symbols(base)
+
+    if len(base) >= min_keep:
+        out = base[:max_keep]
+        a_count, b_count, a_head, b_head = _prr_split_ab_counts(out)
+        logger.warning(
+            "[PUSH REGISTER RECOVERY][TARGET AUDIT] monitor resolved enough total=%s min_keep=%s max_keep=%s A=%s B=%s head=%s A_head=%s B_head=%s",
+            len(out), min_keep, max_keep, a_count, b_count, out[:10], a_head, b_head,
+        )
+        return out
+
+    before = len(base)
+    sources: List[Any] = []
+    for name in ("_resolve_from_global_data", "_resolve_from_dynamic_providers"):
+        fn = globals().get(name)
+        if callable(fn):
+            sources.append((name, fn))
+
+    merged = list(base)
+    for source_name, fn in sources:
+        if len(merged) >= min_keep:
+            break
+        try:
+            extra = fn()
+            old = len(merged)
+            merged = _prr_extend_symbols(merged, extra, max_keep)
+            logger.warning(
+                "[PUSH REGISTER RECOVERY] target topup source=%s before=%d after=%d min_keep=%d head=%s",
+                source_name, old, len(merged), min_keep, merged[:10],
+            )
+        except Exception:
+            logger.exception("[PUSH REGISTER RECOVERY] target topup failed source=%s", source_name)
+
+    if len(merged) < min_keep:
+        logger.warning(
+            "[PUSH REGISTER RECOVERY] target topup insufficient before=%d after=%d min_keep=%d max_keep=%d head=%s",
+            before, len(merged), min_keep, max_keep, merged[:10],
+        )
+    else:
+        logger.warning(
+            "[PUSH REGISTER RECOVERY] target topup ok before=%d after=%d min_keep=%d max_keep=%d",
+            before, len(merged), min_keep, max_keep,
+        )
+    out = merged[:max_keep]
+    a_count, b_count, a_head, b_head = _prr_split_ab_counts(out)
+    logger.warning(
+        "[PUSH REGISTER RECOVERY][TARGET AUDIT] monitor final total=%s A=%s B=%s head=%s A_head=%s B_head=%s",
+        len(out), a_count, b_count, out[:10], a_head, b_head,
+    )
+    return out
+
+
+def resolve_register_targets_core() -> List[str]:
+    """2層目: audit ログのみ (戻り値は変えない / 旧 push_registration_recovery_patch)。"""
+    if not _prr_scope_enabled():
+        return _resolve_register_targets_clamped()
+    t0 = time.monotonic()
+    targets = _resolve_register_targets_clamped()
+    targets_clean = _prr_safe_clean_symbols(targets)
+    a_count, b_count, a_head, b_head = _prr_split_ab_counts(targets_clean)
+    logger.warning(
+        "[PUSH REGISTER RECOVERY][TARGET AUDIT] resolve_register_targets done total=%s A=%s B=%s elapsed=%.3fs head=%s A_head=%s B_head=%s",
+        len(targets_clean), a_count, b_count, time.monotonic() - t0, targets_clean[:10], a_head, b_head,
+    )
+    return targets
+
+
+# ============================================================
+# WATCHLIST RECENT LIQUIDITY GUARD (PUSH 登録側)
+# (旧 watchlist_recent_liquidity_guard_patch + usercustomize の
+#  apply fail-open ラッパーを本文化)
+# ------------------------------------------------------------
+# rotation.py:46 が from-import で束縛しているので、本文化すれば
+# _apply_register_liquidity_guard も自動で追従する。
+# ============================================================
+
+
+def apply_register_liquidity_guard_core(targets: Sequence[str]) -> List[str]:
+    from trading.ranking.active_symbols.recent_liquidity import (
+        apply_failopen_min_keep as _wrl_failopen,
+        filter_symbols as _wrl_filter,
+    )
+
+    base = _apply_register_liquidity_guard_core(targets)
+    out = _wrl_filter(base, context="push.rotation.apply_register_liquidity_guard")
+    return _wrl_failopen(list(targets or []), out)
+
+
+# 旧パッチが立てていた互換フラグ
+_STABILITY_PATCHED_TARGET_TOPUP = True
+_STABILITY_PATCHED_LIQ_FAILOPEN = True
+_LIQ_KEEP100_PATCHED = True

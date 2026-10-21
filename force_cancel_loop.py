@@ -1,6 +1,6 @@
 # ============================================================
 # force_cancel_loop.py（BUY_SELL 準拠・安全最終版）
-# Version: V2.3-ORDERS-429-BACKOFF
+# Version: V2.4-ORDERS-SHARED-READ-CACHE
 # ------------------------------------------------------------
 # ・30秒ごとに kabusapi/orders を直接確認
 # ・未約定の指値注文を全キャンセル
@@ -14,6 +14,13 @@
 # ・get_orders にプロセス内レート制限を追加。
 # ・429 Too Many Requests は認証エラーではないため refresh_token() へ流さない。
 # ・settings.ini [API_RATE_LIMIT] から間隔/backoffを調整可能。
+#
+# V2.4 (2026-09-01):
+# ・GET /orders を kabu_api.orders_read_cache 経由に統一。
+#   pending_monitor / exit の fill confirm / unfilled reprice と
+#   同じプロセス内キャッシュ・singleflight・失敗時バックオフを共有する。
+# ・「読めなかった」を「注文 0 件」と混同しない (ok フラグで区別)。
+# ・cancel_order (PUT) はキャッシュ/バックオフの対象外のまま。
 # ============================================================
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ import time
 import requests
 from requests.exceptions import ConnectionError, HTTPError, ReadTimeout
 
+from kabu_api import orders_read_cache
 from kabu_api.api_common import get_headers
 
 logger = logging.getLogger(__name__)
@@ -223,7 +231,7 @@ def _refresh_headers_after_401(context: str):
     return _direct_token_fallback(context)
 
 
-def _safe_get_headers(context):
+def _safe_get_headers_core(context):
     global _LAST_TOKEN_WARN_AT
     try:
         return get_headers()
@@ -304,10 +312,15 @@ def _parse_orders_response(data):
     return []
 
 
-def get_orders():
+def _fetch_orders_once():
+    """実際の GET。(orders, ok, error) を返す。
+
+    ok=False は「注文が無い」ではなく「読めていない」。
+    orders_read_cache がこれを見てバックオフする。
+    """
     headers = _safe_get_headers("get_orders")
     if headers is None:
-        return []
+        return [], False, "headers unavailable"
 
     for attempt in (1, 2):
         try:
@@ -319,15 +332,15 @@ def get_orders():
             )
             if r.status_code == 429:
                 _handle_429("get_orders", r)
-                return []
+                return [], False, "429 Too Many Requests"
             if r.status_code == 401 and attempt == 1:
                 logger.warning("[FORCE_CANCEL] get_orders got 401 -> refresh token and retry")
                 headers = _refresh_headers_after_401("get_orders")
                 if headers is None:
-                    return []
+                    return [], False, "401 (token refresh unavailable)"
                 continue
             r.raise_for_status()
-            return _parse_orders_response(r.json())
+            return _parse_orders_response(r.json()), True, ""
         except HTTPError as e:
             status = e.response.status_code if e.response is not None else None
             if status == 429:
@@ -336,23 +349,38 @@ def get_orders():
                 logger.warning("[FORCE_CANCEL] kabu API Unauthorized (401) in get_orders after retry")
             else:
                 logger.exception("❌ kabu API HTTP error in get_orders")
-            return []
+            return [], False, f"HTTPError status={status}"
         except ReadTimeout:
             logger.warning("⚠ kabu API read timeout (get_orders)")
-            return []
+            return [], False, "ReadTimeout"
         except ConnectionError:
             logger.warning("⚠ kabu API connection error (get_orders)")
-            return []
+            return [], False, "ConnectionError"
         except RuntimeError as e:
             if "API TOKEN is not set" in str(e):
                 logger.warning("[FORCE_CANCEL] API TOKEN not ready; skip get_orders")
-                return []
+                return [], False, "API TOKEN is not set"
             logger.exception("❌ runtime error in get_orders")
-            return []
-        except Exception:
+            return [], False, f"RuntimeError: {e}"
+        except Exception as e:  # noqa: BLE001
             logger.exception("❌ unexpected error in get_orders")
-            return []
-    return []
+            return [], False, f"{type(e).__name__}: {e}"
+    return [], False, "retries exhausted"
+
+
+def get_orders():
+    """互換 API。読めなかった場合は従来どおり [] を返す。
+
+    実 GET は kabu_api.orders_read_cache が 1 本化する
+    (pending_monitor と共有 / TTL / singleflight / 失敗時バックオフ)。
+    """
+    res = orders_read_cache.get_orders_cached(_fetch_orders_once, caller="force_cancel_loop")
+    return list(res.orders) if res.ok else []
+
+
+def get_orders_state():
+    """orders と「読めたかどうか」を両方返す。0 件と読めない を区別する。"""
+    return orders_read_cache.get_orders_cached(_fetch_orders_once, caller="force_cancel_loop")
 
 
 # ============================================================
@@ -370,7 +398,17 @@ def start_force_cancel_loop(interval_sec=30):
 
     while True:
         try:
-            orders = get_orders()
+            res = get_orders_state()
+            if not res.ok:
+                # 読めていない。0 件と混同しない (キャンセル判断もしない)。
+                logger.warning(
+                    "[FORCE_CANCEL] /orders を読めていないためこの周回は判定しない source=%s err=%s",
+                    res.source, str(res.error)[:120],
+                )
+                time.sleep(interval_sec)
+                continue
+
+            orders = res.orders
             if not orders:
                 time.sleep(interval_sec)
                 continue
@@ -384,6 +422,20 @@ def start_force_cancel_loop(interval_sec=30):
 
                 if not order_id:
                     continue
+                # 2026-10-03: 急騰銘柄の空売り (SURGE_SHORT) が証券会社に置いた損切りの逆指値は取消さない
+                try:
+                    from trading.strategies.surge_short import protected_order_ids
+                    if str(order_id) in protected_order_ids():
+                        continue
+                except Exception:
+                    pass
+                # 2026-10-19: OVEREXT_SHORT の逆指値も取消さない
+                try:
+                    from trading.strategies.overext_short import protected_order_ids as _overext_protected
+                    if str(order_id) in _overext_protected():
+                        continue
+                except Exception:
+                    pass
 
                 is_limit = price not in (0, None)
                 is_open = qty and cum < qty
@@ -391,9 +443,33 @@ def start_force_cancel_loop(interval_sec=30):
 
                 if is_limit and is_open and can_cancel:
                     logger.warning("[FORCE_CANCEL] CANCEL order_id=%s state=%s %s/%s", order_id, state, cum, qty)
+                    # 取消 (PUT) はキャッシュ/バックオフの対象外。
+                    # 送った直後の注文状態は必ず取り直す。
                     cancel_order(order_id)
+                    orders_read_cache.invalidate(reason="force_cancel_loop.cancel")
                     time.sleep(0.3)
         except Exception:
             logger.exception("[FORCE_CANCEL LOOP ERROR]")
 
         time.sleep(interval_sec)
+
+
+# ============================================================
+# KABU API TOKEN RUNTIME
+# (旧 core/startup/kabu_api_token_runtime_patch._patch_force_cancel_loop)
+# ------------------------------------------------------------
+# 旧パッチは install 時にこれを**完全置換**していた (元関数は呼ばない)。
+# 素の実装は *_core として残し、有効時だけ委譲する。
+# 併せて生やしていた _has_api_token は、このファイルに定義も参照も無い
+# 不活性な属性だったので引き継がない。
+# ============================================================
+
+
+def _safe_get_headers(context):
+    try:
+        from kabu_api import token_runtime as _tr
+    except Exception:
+        return _safe_get_headers_core(context)
+    if not _tr.token_runtime_enabled():
+        return _safe_get_headers_core(context)
+    return _tr.safe_get_headers(context)

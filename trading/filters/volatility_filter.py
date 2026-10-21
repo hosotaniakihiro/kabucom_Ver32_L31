@@ -40,12 +40,15 @@ import datetime as dt
 import glob
 import logging
 import os
+import sys
 import sqlite3
+import time
 from typing import Any
 
 import pandas as pd
 
 from utils_common import safe_float
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -55,16 +58,92 @@ logger = logging.getLogger(__name__)
 # ==========================================================
 
 # 1分ATR / 価格。
-# 旧 0.25% → 新 0.35%。ほとんど動かない銘柄を落とす。
-DEFAULT_ATR_1M_MIN_RATIO = 0.0035
+# 旧 0.25% → 0.35% (2026 前半)。
+# 2026-09-15: 0.35% → 0.12%。0.35% は PUSH 由来の足の high/low に当日高安が
+#   混ざって ATR が 10〜100 倍に膨らんでいた時期 (c629825 で修正) に調整された値。
+#   実値では 1 分 ATR は 0.05〜0.15% が普通で、9/15 は 517 件がここで落ちた
+#   (662 候補 → 発注 1 件)。実値ベースに合わせて下げる。
+# 2026-09-17: 0.12% → 0.20%。0.12% だと 3,000〜4,000 円台の銘柄は ATR が 1 ティック (5 円)
+#   でも通ってしまい、6590 (ATR 5 円 = 0.137%) のような「動いていない銘柄」に入った。
+#   併せてローカル 1 分足で ATR >= 3 ティックも要求する (VOL_FILTER_LOCAL_FIRST)。
+# 2026-09-17 13:30: 0.20% → 0.15% (後場の 4588/3907 が落ちた。6590 の 0.107% は落ちたまま)
+_BASE_ATR_1M_MIN_RATIO = 0.0015
+_BASE_ATR_1M_MIN_TICKS = 3.0
+# 当日レンジ (寄りからの高安 / 株価)。ローカル 1 分足の全本から計算する。
+_BASE_DAY_RANGE_MIN_PCT = 0.010
 
 # 直近5分高安幅 / 価格。
-# 旧 0.8% → 新 1.2%。短期エントリー向けに強める。
-DEFAULT_RANGE_5M_MIN_PCT = 0.012
+# 旧 0.8% → 1.2% (2026 前半)。
+# 2026-09-15: 1.2% → 0.3%。上と同じ理由 (膨らんだ足で調整した値)。9/15 は 856 件が
+#   ここで落ちて最大の却下要因だった。
+# 2026-09-17: 0.3% → 0.5%。entry_row の高安が「修復」で当日高安に置き換わり (6590: 0.14% → 4.5%)
+#   実質判定されていなかったので、ローカル 1 分足の直近 5 本で先に判定する。
+# 2026-09-17 13:30: 0.5% → 0.35% (同上。6590 の 0.14% は落ちたまま)
+_BASE_RANGE_5M_MIN_PCT = 0.0035
 
 # entry_row 単体の high-low / close。
 # summary行そのものが動いていない場合に落とす。
-DEFAULT_ENTRY_ROW_RANGE_MIN_PCT = 0.006
+_BASE_ENTRY_ROW_RANGE_MIN_PCT = 0.006
+
+
+# ----------------------------------------------------------
+# TONOSAMA HISTORY GUARD 由来のしきい値緩和
+# (旧 core/startup/tonosama_history_missing_guard_patch.py
+#  _patch_volatility_filter_thresholds を本文化)
+# ----------------------------------------------------------
+# 旧パッチは install 時に
+#   vf.DEFAULT_* = env値
+#   _entry_row_range_ok / _atr_1m_filter_from_entry_row /
+#   _range_5m_filter_from_entry_row の __defaults__ = env値
+# の**この 3 関数だけ**を書き換えていた。
+# _range_5m_filter_from_entry_row_core / _atr_1m_filter_core /
+# range_5m_filter の既定値は import 時に束縛済みで書き換え対象外
+# だったため、そちらは _BASE_* を使い続ける (実測どおり)。
+#
+# 適用スコープは sitecustomize のパッチ一覧と同じで、
+# DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH=1 のときだけ素の値に戻す。
+# ----------------------------------------------------------
+
+def _local_ranking_dir_first() -> str:
+    """ranking DB のローカル置き場。解決できなければ空文字。
+
+    2026-09-07: ranking DB をローカルへ移した。候補リストの先頭に
+    入れておかないと、この経路だけ NAS の複製 (最大で複製間隔ぶん古い)
+    を読むことになる。
+    """
+    try:
+        from trading.ranking import ranking_db_location
+
+        return str(ranking_db_location.ranking_db_dir())
+    except Exception:
+        return ""
+
+
+def _hg_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _hg_threshold_patch_enabled() -> bool:
+    try:
+        return str(os.environ.get("DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH", "")).strip() != "1"
+    except Exception:
+        return True
+
+
+if _hg_threshold_patch_enabled():
+    DEFAULT_ATR_1M_MIN_RATIO = _hg_env_float("ENTRY_ATR_1M_MIN_RATIO", 0.0010)
+    DEFAULT_RANGE_5M_MIN_PCT = _hg_env_float("ENTRY_RANGE_5M_MIN_PCT", 0.008)
+    DEFAULT_ENTRY_ROW_RANGE_MIN_PCT = _hg_env_float("ENTRY_ROW_RANGE_MIN_PCT", 0.003)
+else:
+    DEFAULT_ATR_1M_MIN_RATIO = _BASE_ATR_1M_MIN_RATIO
+    DEFAULT_RANGE_5M_MIN_PCT = _BASE_RANGE_5M_MIN_PCT
+    DEFAULT_ENTRY_ROW_RANGE_MIN_PCT = _BASE_ENTRY_ROW_RANGE_MIN_PCT
 
 # 起動直後ranking救済用。ランキング由来の実変動率がこの値以上なら
 # summary高安が未成熟でも「動いている銘柄」として扱う。
@@ -297,7 +376,7 @@ def _entry_row_source_text(entry_row: Any) -> str:
     return " ".join(vals).lower()
 
 
-def _looks_ranking_entry(entry_row: Any) -> bool:
+def _looks_ranking_entry_core(entry_row: Any) -> bool:
     text = _entry_row_source_text(entry_row)
     if "ranking" in text or "rank" in text or "ランキング" in text:
         return True
@@ -316,6 +395,88 @@ def _looks_ranking_entry(entry_row: Any) -> bool:
     return bool(set(row.keys()) & ranking_keys)
 
 
+# --- summary_ai_no_ranking_rescue_scan_patch (native化, 元 core/startup/summary_ai_no_ranking_rescue_scan_patch.py) ---
+# SUMMARY_AI 由来の候補行は reason に rankScore を含むため、素の _looks_ranking_entry_core /
+# _ranking_move_rescue_core だけでは誤って Ranking 由来と判定され、陳腐化した ranking DB を
+# スキャンする rescue 経路に入ってしまう。SUMMARY_AI 行は明示的に除外し、Ranking 固有の識別子
+# (ranking/rank_type 等のトークンや列) がある場合のみ Ranking 由来として扱う。
+_NO_RANK_RESCUE_SUMMARY_TOKENS = ("summary", "summary_ai", "push", "stock_summary", "src=summary")
+_NO_RANK_RESCUE_RANKING_TOKENS = ("ranking", "ランキング", "rank_type", "ranking_type")
+
+
+def _no_rank_rescue_row_to_dict(row: Any) -> dict:
+    try:
+        if row is None:
+            return {}
+        if isinstance(row, dict):
+            return dict(row)
+        if hasattr(row, "to_dict"):
+            v = row.to_dict()
+            if isinstance(v, dict):
+                return dict(v)
+    except Exception:
+        pass
+    return {}
+
+
+def _no_rank_rescue_is_summary_ai_row(entry_row: Any) -> bool:
+    row = _no_rank_rescue_row_to_dict(entry_row)
+    text_parts: list = []
+    for key in (
+        "source",
+        "entry_source",
+        "candidate_source",
+        "pipeline_source",
+        "entry_type",
+        "reason",
+        "ai_reason",
+        "skip_reason",
+        "model_used",
+    ):
+        try:
+            v = row.get(key)
+            if v is not None:
+                text_parts.append(str(v))
+        except Exception:
+            pass
+    text = " ".join(text_parts).lower()
+    if any(tok in text for tok in _NO_RANK_RESCUE_SUMMARY_TOKENS):
+        return True
+    try:
+        if bool(row.get("ai_gate_allow")) or bool(row.get("preapproved")) or bool(row.get("summary_ai_ok")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _no_rank_rescue_has_explicit_ranking_identity(entry_row: Any) -> bool:
+    row = _no_rank_rescue_row_to_dict(entry_row)
+    text_parts: list = []
+    for key in ("source", "entry_source", "candidate_source", "pipeline_source", "rank_type", "ranking_type"):
+        v = row.get(key)
+        if v is not None:
+            text_parts.append(str(v))
+    text = " ".join(text_parts).lower()
+    if any(tok in text for tok in _NO_RANK_RESCUE_RANKING_TOKENS):
+        return True
+    # reason='rankScore=...' はランキング由来と見なさない (SUMMARY_AI の reason には常に rankScore が入るため)。
+    ranking_keys = {"rank", "ranking_type", "ranking_kind", "rank_type", "source_rank", "change_percentage", "change_rate", "change_ratio"}
+    return bool(set(row.keys()) & ranking_keys)
+
+
+def _looks_ranking_entry(entry_row: Any) -> bool:
+    if _no_rank_rescue_is_summary_ai_row(entry_row):
+        # SUMMARY_AI 行は reason に rankScore を含むが、Ranking 由来ではない。
+        return False
+    if _no_rank_rescue_has_explicit_ranking_identity(entry_row):
+        return True
+    try:
+        return bool(_looks_ranking_entry_core(entry_row))
+    except Exception:
+        return False
+
+
 def _ranking_db_candidate_paths() -> list[str]:
     today = dt.datetime.now().strftime("%Y%m%d")
     env_candidates = [
@@ -326,8 +487,9 @@ def _ranking_db_candidate_paths() -> list[str]:
     base_dirs = [
         os.environ.get("RANKING_DB_DIR"),
         os.environ.get("KABU_RANKING_DB_DIR"),
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\Ranking",
+        _local_ranking_dir_first(),   # 2026-09-07: ローカルを先に見る
+        nas_path(r"raw_data\kabu_station\ranking"),
+        nas_path(r"raw_data\kabu_station\Ranking"),
         os.path.join(os.getcwd(), "raw_data", "kabu_station", "ranking"),
         os.path.join(os.getcwd(), "raw_data", "kabu_station", "Ranking"),
     ]
@@ -402,7 +564,7 @@ def _row_change_ratio(row: dict[str, Any]) -> float:
     return 0.0
 
 
-def _latest_ranking_snapshot_move(symbol: str) -> dict[str, Any] | None:
+def _latest_ranking_snapshot_move_core(symbol: str) -> dict[str, Any] | None:
     symbol = _normalize_symbol(symbol)
     if not symbol:
         return None
@@ -485,7 +647,183 @@ def _latest_ranking_snapshot_move(symbol: str) -> dict[str, Any] | None:
     return None
 
 
-def _ranking_move_rescue(entry_row: Any, *, min_pct: float, label: str) -> bool:
+# --- volatility_filter_ranking_rescue_timebox_patch (native化, 元 core/startup/volatility_filter_ranking_rescue_timebox_patch.py) ---
+# SUMMARY_AI direct snapshot が volatility_filter 内で ranking rescue が複数の陳腐化した
+# ranking DB (NAS上) をスキャンする際にハングしうる問題への対処。厳格な fail-closed 挙動は
+# 維持したまま (ATR/range/board/order の各ガードは緩めない)、新鮮な ranking move を素早く
+# 読めない場合は rescue を適用しない。旧関数 (_latest_ranking_snapshot_move_core) は
+# 複数の古いDBを glob するため 10-100秒スタールしうるのに対し、この版は固定6テーブルのみを
+# 対象にし、全体デッドライン (既定0.35秒) を超えたら即座に諦める。
+_VOL_FILTER_RESCUE_TIMEBOX_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+def _vol_filter_rescue_timebox_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in _VOL_FILTER_RESCUE_TIMEBOX_TRUE
+    except Exception:
+        return bool(default)
+
+
+def _vol_filter_rescue_timebox_parse_dt(v: Any):
+    try:
+        if v is None:
+            return None
+        if isinstance(v, dt.datetime):
+            return v.replace(tzinfo=None)
+        ts = pd.to_datetime(v, errors="coerce")
+        if ts is None or getattr(ts, "isna", lambda: False)():
+            return None
+        x = ts.to_pydatetime()
+        return x.replace(tzinfo=None) if isinstance(x, dt.datetime) else None
+    except Exception:
+        return None
+
+
+def _vol_filter_rescue_timebox_coerce_ratio(v: Any) -> float:
+    try:
+        if v is None:
+            return 0.0
+        if isinstance(v, str):
+            s = v.replace("％", "%").replace("+", "").replace("%", "").strip()
+            if not s:
+                return 0.0
+            x = float(s.replace(",", ""))
+        else:
+            x = float(v)
+        return x / 100.0 if abs(x) > 1.0 else x
+    except Exception:
+        return 0.0
+
+
+def _vol_filter_rescue_timebox_row_ratio(d: dict[str, Any]) -> float:
+    for k in ("change_ratio", "change_rate", "change_percentage", "change_percent", "騰落率", "変化率"):
+        if k in d:
+            r = _vol_filter_rescue_timebox_coerce_ratio(d.get(k))
+            if r:
+                return r
+    try:
+        price = float(d.get("current_price") or d.get("price") or d.get("close") or d.get("close_price") or 0)
+        prev = float(d.get("previous_close") or d.get("prev_close") or d.get("base_price") or d.get("reference_price") or 0)
+        if price > 0 and prev > 0:
+            return (price - prev) / prev
+    except Exception:
+        pass
+    return 0.0
+
+
+def _vol_filter_rescue_timebox_candidate_paths() -> list[str]:
+    today = dt.datetime.now().strftime("%Y%m%d")
+    out: list[str] = []
+    for p in (os.getenv("RANKING_DB_PATH"), os.getenv("KABU_RANKING_DB_PATH"), os.getenv("ATS_RANKING_DB_PATH")):
+        if p:
+            out.append(str(p))
+    # 古いDBを glob しない (glob すると 10-100秒スタールしうるため)。
+    for d_ in (
+        os.getenv("RANKING_DB_DIR"),
+        os.getenv("KABU_RANKING_DB_DIR"),
+        _local_ranking_dir_first(),   # 2026-09-07: ローカルを先に見る
+        nas_path(r"raw_data\kabu_station\ranking"),
+        nas_path(r"raw_data\kabu_station\Ranking"),
+    ):
+        if d_:
+            out.append(os.path.join(str(d_), f"ranking{today}.db"))
+    seen: set[str] = set()
+    return [p for p in out if p and not (p in seen or seen.add(p))]
+
+
+def _latest_ranking_snapshot_move_fast(symbol: str) -> dict[str, Any] | None:
+    symbol = _normalize_symbol(symbol)
+    if not symbol:
+        return None
+    max_age = _env_float("RANKING_RESCUE_MAX_AGE_SEC", 360.0)
+    deadline = time.perf_counter() + max(0.05, _env_float("VOL_FILTER_RANKING_RESCUE_TIMEBOX_SEC", 0.35))
+    now_dt = dt.datetime.now()
+    tables = ("ranking_snapshot_1min", "ranking", "値上がり率_ALL", "値下がり率_ALL", "売買高急増_ALL", "売買代金急増_ALL")
+    for path in _vol_filter_rescue_timebox_candidate_paths():
+        if time.perf_counter() > deadline:
+            logger.warning("[VOL FILTER RESCUE TIMEBOX] deadline reached before path symbol=%s path=%s", symbol, path)
+            return None
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            conn = sqlite3.connect(path, timeout=max(0.05, _env_float("VOL_FILTER_RANKING_RESCUE_SQLITE_TIMEOUT_SEC", 0.12)))
+            conn.row_factory = sqlite3.Row
+            try:
+                existing = {r[0] for r in conn.execute("select name from sqlite_master where type='table'").fetchall()}
+                for table in tables:
+                    if time.perf_counter() > deadline:
+                        logger.warning("[VOL FILTER RESCUE TIMEBOX] deadline reached symbol=%s path=%s table=%s", symbol, path, table)
+                        return None
+                    if table not in existing:
+                        continue
+                    try:
+                        cols = [r[1] for r in conn.execute(f'pragma table_info("{table}")').fetchall()]
+                        if "symbol" not in cols:
+                            continue
+                        order_col = next((c for c in ("datetime", "snapshot_time", "received_at", "created_at", "inserted_at", "id") if c in cols), None)
+                        sql = f'select * from "{table}" where cast(symbol as text)=?'
+                        if order_col:
+                            sql += f' order by "{order_col}" desc'
+                        sql += " limit 1"
+                        row = conn.execute(sql, (symbol,)).fetchone()
+                        if row is None:
+                            continue
+                        d = dict(row)
+                        dt_value = None
+                        for c in ("datetime", "snapshot_time", "received_at", "created_at", "inserted_at"):
+                            if c in d:
+                                dt_value = _vol_filter_rescue_timebox_parse_dt(d.get(c))
+                                if dt_value is not None:
+                                    break
+                        age_sec = abs((now_dt - dt_value).total_seconds()) if dt_value is not None else None
+                        if age_sec is not None and age_sec > max_age:
+                            logger.info("[VOL FILTER] ranking rescue stale-fast symbol=%s table=%s age=%.1fs max=%.1fs path=%s", symbol, table, age_sec, max_age, path)
+                            continue
+                        ratio = _vol_filter_rescue_timebox_row_ratio(d)
+                        return {"symbol": symbol, "ratio": ratio, "abs_ratio": abs(ratio), "price": float(d.get("current_price") or d.get("price") or d.get("close") or d.get("close_price") or 0), "table": table, "path": path, "datetime": dt_value.isoformat() if dt_value else None, "age_sec": age_sec}
+                    except Exception:
+                        logger.debug("[VOL FILTER RESCUE TIMEBOX] table scan failed symbol=%s path=%s table=%s", symbol, path, table, exc_info=True)
+                        continue
+            finally:
+                conn.close()
+        except Exception:
+            logger.debug("[VOL FILTER RESCUE TIMEBOX] db scan failed symbol=%s path=%s", symbol, path, exc_info=True)
+            continue
+    return None
+
+
+def _vol_filter_rescue_timebox_scope_enabled() -> bool:
+    """volatility_filter_ranking_rescue_timebox_patch (native化) の旧scope判定を再現する。
+
+    旧パッチは core/startup/runtime_env/installer.py の TRADING_CONTEXTS={"main"}
+    経由でのみ install() が呼ばれ (DISABLE_VOL_FILTER_RANKING_RESCUE_TIMEBOX_PATCH=1でも
+    install()自体が呼ばれない)、install() 内部でも重ねて
+    VOL_FILTER_RANKING_RESCUE_TIMEBOX_ENABLED (既定True) を確認していた。
+    """
+    try:
+        if str(os.environ.get("DISABLE_VOL_FILTER_RANKING_RESCUE_TIMEBOX_PATCH", "")).strip() == "1":
+            return False
+        if not _vol_filter_rescue_timebox_env_bool("VOL_FILTER_RANKING_RESCUE_TIMEBOX_ENABLED", True):
+            return False
+        raw = os.getenv("VOL_FILTER_RANKING_RESCUE_TIMEBOX_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _vol_filter_rescue_timebox_env_bool("VOL_FILTER_RANKING_RESCUE_TIMEBOX_SCOPE_ENABLED", False)
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        return any(a.endswith("/main.py") or a == "main.py" for a in argv_list)
+    except Exception:
+        return False
+
+
+def _latest_ranking_snapshot_move(symbol: str) -> dict[str, Any] | None:
+    if not _vol_filter_rescue_timebox_scope_enabled():
+        return _latest_ranking_snapshot_move_core(symbol)
+    return _latest_ranking_snapshot_move_fast(symbol)
+
+
+def _ranking_move_rescue_core(entry_row: Any, *, min_pct: float, label: str) -> bool:
     if not _env_bool("RANKING_STARTUP_VOL_RESCUE", True):
         return False
     if not _looks_ranking_entry(entry_row):
@@ -516,6 +854,22 @@ def _ranking_move_rescue(entry_row: Any, *, min_pct: float, label: str) -> bool:
         close,
     )
     return bool(ok)
+
+
+def _ranking_move_rescue(entry_row: Any, *, min_pct: float, label: str) -> bool:
+    # summary_ai_no_ranking_rescue_scan_patch (native化): SUMMARY_AI 由来の行は
+    # 陳腐化した ranking DB スキャンによる rescue の対象にしない。
+    if _no_rank_rescue_is_summary_ai_row(entry_row):
+        row = _no_rank_rescue_row_to_dict(entry_row)
+        logger.info(
+            "[SUMMARY AI NO RANKING RESCUE] skip stale ranking DB scan symbol=%s label=%s source=%s entry_type=%s",
+            row.get("symbol") or row.get("Symbol"),
+            label,
+            row.get("source"),
+            row.get("entry_type"),
+        )
+        return False
+    return bool(_ranking_move_rescue_core(entry_row, min_pct=min_pct, label=label))
 
 
 def _entry_row_range_ok(entry_row: Any, min_pct: float = DEFAULT_ENTRY_ROW_RANGE_MIN_PCT) -> bool:
@@ -553,6 +907,184 @@ def _entry_row_range_ok(entry_row: Any, min_pct: float = DEFAULT_ENTRY_ROW_RANGE
 # entry_row compatibility mode
 # ==========================================================
 
+# ----------------------------------------------------------
+# 2026-09-16: ローカル push DB のティックから作る 1 分足での代替計算
+#   main.py の in-memory 1m 履歴は銘柄あたり 1 本しか無く、entry_row に atr /
+#   high / low が無い候補は「1m本数不足」→ ランキング救済 → NG に落ちていた
+#   (9/16 09:46〜09:58: 候補 20 件中 ATR 10 / RANGE 8 がこれ)。
+#   trading/summary/mtf_local_bars.get_bars(symbol, 1) で当日の 1 分足を作り、
+#   ATR(14) と直近 5 本の高安幅を出す。足が足りなければ None (従来経路へ)。
+# ----------------------------------------------------------
+def _local_1m_bars(symbol: str):
+    try:
+        from trading.summary.mtf_local_bars import get_bars, is_stale
+        bars = get_bars(symbol, 1)
+        if bars is None or bars.empty or is_stale(bars, 1, max_age_bars=3.0):
+            return None
+        return bars
+    except Exception:
+        logger.debug("[VOL FILTER] local 1m bars failed symbol=%s", symbol, exc_info=True)
+        return None
+
+
+def _local_atr_ratio(symbol: str) -> tuple[float, float, int] | None:
+    """(atr, price, bars) を返す。14 本分の TR が取れなければ None。"""
+    bars = _local_1m_bars(symbol)
+    if bars is None or len(bars) < 15:
+        return None
+    try:
+        h = pd.to_numeric(bars["high"], errors="coerce").to_numpy()
+        l = pd.to_numeric(bars["low"], errors="coerce").to_numpy()
+        c = pd.to_numeric(bars["close"], errors="coerce").to_numpy()
+        tr = [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, len(c))]
+        atr = float(sum(tr[-14:]) / 14)
+        price = float(c[-1])
+        if atr <= 0 or price <= 0:
+            return None
+        return atr, price, len(bars)
+    except Exception:
+        return None
+
+
+def _local_range_5m_ratio(symbol: str) -> tuple[float, float, float] | None:
+    """直近 5 本 (1 分足) の (high, low, close)。5 本無ければ None。"""
+    bars = _local_1m_bars(symbol)
+    if bars is None or len(bars) < 5:
+        return None
+    try:
+        t = bars.tail(5)
+        high = float(pd.to_numeric(t["high"], errors="coerce").max())
+        low = float(pd.to_numeric(t["low"], errors="coerce").min())
+        close = float(pd.to_numeric(t["close"], errors="coerce").iloc[-1])
+        if high <= 0 or low <= 0 or close <= 0:
+            return None
+        return high, low, close
+    except Exception:
+        return None
+
+
+def _local_first_enabled() -> bool:
+    return _env_bool("VOL_FILTER_LOCAL_FIRST", True)
+
+
+def _tick_size_safe(price: float) -> float:
+    try:
+        t = float(get_tick_size(price))
+        return t if t > 0 else 1.0
+    except Exception:
+        return 1.0
+
+
+def _midday_scale() -> tuple[float, float, str]:
+    """昼の薄い時間帯は ATR しきい値を緩める (2026-09-18)。
+
+    戻り値: (ratio 係数, ticks 係数, ログ用ラベル)。帯の外なら (1.0, 1.0, "")。
+    9/18 の後場、13:10 以降 19 分間エントリーが 0 になった。却下の最多は
+    ATR_1M_FILTER_NG で、ratio=0.00138 / 0.00108 と 0.00150 に僅差で届かない
+    銘柄が並んでいた。昼は値動きが細るので、この帯だけしきい値を下げる。
+    """
+    if _env_float("VOL_FILTER_MIDDAY_ENABLED", 1.0) <= 0:
+        return 1.0, 1.0, ""
+    try:
+        now = dt.datetime.now().time()
+        # 2026-10-06: 10 時で分ける (ユーザー判断)。寄り後の 1 時間を過ぎると値動きが細り、
+        #   10:00〜10:15 の ATR_1M_FILTER_NG 26 件のうち 11 件が 0.8 倍なら通る水準だった。
+        s = str(os.environ.get("VOL_FILTER_MIDDAY_START", "") or "10:00").strip()
+        # 2026-09-30: 14:00 で打ち切ると後場の薄い時間帯に基準が戻り、
+        #   14 時台の 5 分値幅の通過率が 66% まで落ちた。大引けまで延長 (ユーザー判断)。
+        e = str(os.environ.get("VOL_FILTER_MIDDAY_END", "") or "15:30").strip()
+        sh, sm = [int(x) for x in s.split(":")[:2]]
+        eh, em = [int(x) for x in e.split(":")[:2]]
+        start = dt.time(sh, sm)
+        end = dt.time(eh, em)
+    except Exception:
+        return 1.0, 1.0, ""
+    if not (start <= now < end):
+        return 1.0, 1.0, ""
+    rs = _env_float("VOL_FILTER_MIDDAY_ATR_RATIO_SCALE", 0.8)
+    ts = _env_float("VOL_FILTER_MIDDAY_ATR_TICKS_SCALE", 0.75)
+    return rs, ts, " midday=%s-%s" % (s, e)
+
+def _midday_range_scale() -> tuple[float, str]:
+    """昼〜大引けの 5 分値幅しきい値の係数 (2026-09-30)。帯の外なら (1.0, "")。
+
+    ATR と同じ帯 (_midday_scale) で 5 分値幅の下限も下げる。後場は商いが細り
+    9/30 の 14 時台は候補の 5 分値幅 p25=0.27% で 0.35% に届かない銘柄が並んだ。
+    VOL_FILTER_MIDDAY_RANGE_5M_SCALE (既定 0.8 = 0.35% -> 0.28%)。
+    """
+    _r, _t, label = _midday_scale()
+    if not label:
+        return 1.0, ""
+    return _env_float("VOL_FILTER_MIDDAY_RANGE_5M_SCALE", 0.8), label
+
+
+def _local_atr_strict(symbol: str) -> tuple[bool, str] | None:
+    """ローカル 1 分足で ATR を見る (2026-09-17)。None = 本数不足 (判定できない)。
+    条件: ATR/価格 >= VOL_FILTER_ATR_1M_MIN_RATIO かつ ATR >= VOL_FILTER_ATR_1M_MIN_TICKS ティック。"""
+    bars = _local_1m_bars(symbol)
+    min_bars = int(_env_float("VOL_FILTER_LOCAL_MIN_BARS", 6))
+    if bars is None or len(bars) < min_bars:
+        return None
+    try:
+        h = pd.to_numeric(bars["high"], errors="coerce").to_numpy()
+        l = pd.to_numeric(bars["low"], errors="coerce").to_numpy()
+        c = pd.to_numeric(bars["close"], errors="coerce").to_numpy()
+        tr = [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, len(c))]
+        tr = tr[-14:]
+        atr = float(sum(tr) / len(tr))
+        price = float(c[-1])
+    except Exception:
+        return None
+    if price <= 0:
+        return None
+    min_ratio = _env_float("VOL_FILTER_ATR_1M_MIN_RATIO", _BASE_ATR_1M_MIN_RATIO)
+    min_ticks = _env_float("VOL_FILTER_ATR_1M_MIN_TICKS", _BASE_ATR_1M_MIN_TICKS)
+    # 2026-09-18: 昼の薄い帯だけ緩める。詳細は _midday_scale。
+    _r_scale, _t_scale, _midday_label = _midday_scale()
+    min_ratio = min_ratio * _r_scale
+    min_ticks = min_ticks * _t_scale
+    tick = _tick_size_safe(price)
+    ratio = atr / price
+    ok = ratio >= min_ratio and atr >= tick * min_ticks
+    detail = f"atr={atr:.3f} price={price:.1f} ratio={ratio:.5f} min_ratio={min_ratio:.5f} ticks={atr / tick:.1f} min_ticks={min_ticks:.2f} bars={len(bars)}{_midday_label}"
+    return ok, detail
+
+
+def _local_range_strict(symbol: str, row: dict | None = None) -> tuple[bool, str] | None:
+    """ローカル 1 分足で 直近 5 本レンジ と 当日レンジ を見る (2026-09-17)。None = 本数不足。
+    当日レンジはローカル足が PUSH 登録以降しか無いので、entry_row の day_high/day_low
+    (kabu の当日高安) があれば大きい方を採る。"""
+    bars = _local_1m_bars(symbol)
+    if bars is None or len(bars) < 3:
+        return None
+    try:
+        hh = pd.to_numeric(bars["high"], errors="coerce")
+        ll = pd.to_numeric(bars["low"], errors="coerce")
+        cc = pd.to_numeric(bars["close"], errors="coerce")
+        t = bars.tail(5)
+        h5 = float(pd.to_numeric(t["high"], errors="coerce").max())
+        l5 = float(pd.to_numeric(t["low"], errors="coerce").min())
+        close = float(cc.iloc[-1])
+        day_h, day_l = float(hh.max()), float(ll.min())
+    except Exception:
+        return None
+    if close <= 0 or h5 <= 0 or l5 <= 0:
+        return None
+    _rg_scale, _rg_label = _midday_range_scale()
+    min_5m = _env_float("VOL_FILTER_RANGE_5M_MIN_PCT", _BASE_RANGE_5M_MIN_PCT) * _rg_scale
+    min_day = _env_float("VOL_FILTER_DAY_RANGE_MIN_PCT", _BASE_DAY_RANGE_MIN_PCT)
+    r5 = (h5 - l5) / close
+    rday = (day_h - day_l) / close if day_h > 0 and day_l > 0 else 0.0
+    if isinstance(row, dict):
+        rh = safe_float(_first(row, ("day_high", "DayHigh", "today_high", "high_price_day"), 0.0), 0.0)
+        rl = safe_float(_first(row, ("day_low", "DayLow", "today_low", "low_price_day"), 0.0), 0.0)
+        if rh > 0 and rl > 0 and rh >= rl:
+            rday = max(rday, (rh - rl) / close)
+    ok = r5 >= min_5m and rday >= min_day
+    detail = f"range5m={r5:.5f} min_5m={min_5m:.5f} day_range={rday:.5f} min_day={min_day:.5f} h5={h5:.1f} l5={l5:.1f} day_h={day_h:.1f} day_l={day_l:.1f} close={close:.1f} bars={len(bars)}{_rg_label}"
+    return ok, detail
+
+
 def _atr_1m_filter_from_entry_row(entry_row: Any, min_ratio: float = DEFAULT_ATR_1M_MIN_RATIO) -> bool:
     """
     entry_controller.py 互換用。
@@ -568,6 +1100,17 @@ def _atr_1m_filter_from_entry_row(entry_row: Any, min_ratio: float = DEFAULT_ATR
       ただしランキング由来でranking_snapshotの新鮮な変動率が十分なら起動直後のみ救済する。
     """
     symbol, price, _, _, atr = _extract_basic_prices(entry_row)
+
+    # 2026-09-17: まずローカル push DB の 1 分足で判定する (entry_row の ATR は古い/膨らんでいることがある)。
+    #   本数が足りなければ (登録直後) 従来の経路へ。
+    if symbol and _local_first_enabled():
+        strict = _local_atr_strict(symbol)
+        if strict is not None:
+            ok_s, det = strict
+            logger.info("[VOL FILTER] ATR local_strict symbol=%s ok=%s %s", symbol, ok_s, det)
+            if ok_s:
+                return True
+            return _ranking_move_rescue(entry_row, min_pct=min_ratio, label="atr_local_strict_low")
 
     # entry_rowにATRがあればそれで判定
     if atr > 0 and price > 0:
@@ -585,6 +1128,21 @@ def _atr_1m_filter_from_entry_row(entry_row: Any, min_ratio: float = DEFAULT_ATR
         if ok:
             return True
         return _ranking_move_rescue(entry_row, min_pct=min_ratio, label="atr_entry_row_low")
+
+    # 2026-09-16: entry_row に ATR が無ければ、まずローカル push DB の 1 分足で ATR(14)
+    if symbol:
+        loc = _local_atr_ratio(symbol)
+        if loc is not None:
+            atr_l, price_l, nbars = loc
+            ratio_l = atr_l / price_l
+            ok_l = ratio_l >= float(min_ratio)
+            logger.info(
+                "[VOL FILTER] ATR local_1m symbol=%s ok=%s atr=%.6f price=%.3f ratio=%.6f min_ratio=%.6f bars=%s",
+                symbol, ok_l, atr_l, price_l, ratio_l, min_ratio, nbars,
+            )
+            if ok_l:
+                return True
+            return _ranking_move_rescue(entry_row, min_pct=min_ratio, label="atr_local_1m_low")
 
     # ATRが無ければ global_data の1分足で旧ロジックを試す
     if symbol:
@@ -653,7 +1211,7 @@ def _range5m_repair_summary_ai_row(entry_row: Any) -> Any:
         source = str(row.get("source") or "").strip().upper()
         if source != "SUMMARY_AI" and source != "SUMMARY":
             return entry_row
-        from core.startup import summary_ai_order_builder_range_repair_patch as repair_mod
+        from trading.filters import summary_ai_range_repair as repair_mod
         repair_fn = getattr(repair_mod, "_repair_row", None)
         update_fn = getattr(repair_mod, "_update_original_row", None)
         if not callable(repair_fn):
@@ -873,16 +1431,45 @@ def _range_5m_filter_from_entry_row(entry_row: Any, min_pct: float = DEFAULT_RAN
     5m値幅が確認できない場合は止める。
     ただしランキング由来でranking_snapshotの新鮮な変動率が十分なら起動直後のみ救済する。
     """
+    # 旧 core/startup/summary_ai_low_move_softpass_patch V3.5 から移設。
+    # SUMMARY_AI の1分即時候補で entry_row 自体のレンジが十分かつ
+    # ranking snapshot の実変動も十分なら、5m代替レンジによる二重ブロックを避ける。
+    # ガード自体は緩和しない (両方満たす場合だけ通す)。
+    from trading.filters import summary_ai_range_bridge as _range_bridge
+
+    # 2026-09-17: まずローカル 1 分足で 直近 5 本レンジ + 当日レンジ を判定する。
+    #   entry_row の高安は「修復」で当日高安に置き換わることがあり (6590: 0.14%→4.5%)、
+    #   bridge / repair より前にここで決める。本数不足のときだけ従来経路へ。
+    if _local_first_enabled():
+        symbol_lf = _normalize_symbol(_row_to_dict(entry_row).get("symbol"))
+        strict = _local_range_strict(symbol_lf, _row_to_dict(entry_row)) if symbol_lf else None
+        if strict is not None:
+            ok_s, det = strict
+            logger.info("[VOL FILTER] RANGE local_strict symbol=%s ok=%s %s", symbol_lf, ok_s, det)
+            if ok_s:
+                try:
+                    if isinstance(entry_row, dict):
+                        entry_row["_vol_local_strict_ok"] = True
+                except Exception:
+                    pass
+                return True
+            return _ranking_move_rescue(entry_row, min_pct=min_pct, label="range_local_strict_low")
+
+    if _range_bridge.allow_by_1m_range_bridge(sys.modules[__name__], entry_row):
+        return True
+
     entry_row = _range5m_repair_summary_ai_row(entry_row)
     if min_pct == DEFAULT_RANGE_5M_MIN_PCT and _looks_ranking_entry(entry_row):
         min_pct = _env_float("RANKING_ENTRY_RANGE_5M_MIN_PCT", 0.006)
+    # 2026-09-30: 昼〜大引けは entry_row 経路の下限も同じ係数で下げる
+    min_pct = float(min_pct) * _midday_range_scale()[0]
 
     if _range_5m_filter_from_entry_row_core(entry_row, min_pct=min_pct):
         return True
     return _range_5m_tonosama_and_ranking_rescue_chain(entry_row, min_pct=min_pct)
 
 
-def _range_5m_filter_from_entry_row_core(entry_row: Any, min_pct: float = DEFAULT_RANGE_5M_MIN_PCT) -> bool:
+def _range_5m_filter_from_entry_row_core(entry_row: Any, min_pct: float = _BASE_RANGE_5M_MIN_PCT) -> bool:
     symbol, close, high, low, _ = _extract_basic_prices(entry_row)
 
     # まず summary行そのものの高安幅を確認する。
@@ -905,6 +1492,21 @@ def _range_5m_filter_from_entry_row_core(entry_row: Any, min_pct: float = DEFAUL
         if ok:
             return True
         return _ranking_move_rescue(entry_row, min_pct=min_pct, label="range_entry_row_low")
+
+    # 2026-09-16: entry_row に高安が無ければ、まずローカル push DB の 1 分足 5 本で判定
+    if symbol:
+        loc = _local_range_5m_ratio(symbol)
+        if loc is not None:
+            h_l, l_l, c_l = loc
+            ratio_l = (h_l - l_l) / c_l
+            ok_l = ratio_l >= float(min_pct)
+            logger.info(
+                "[VOL FILTER] RANGE local_5x1m symbol=%s ok=%s range=%.6f price=%.3f ratio=%.6f min_pct=%.6f",
+                symbol, ok_l, h_l - l_l, c_l, ratio_l, min_pct,
+            )
+            if ok_l:
+                return True
+            return _ranking_move_rescue(entry_row, min_pct=min_pct, label="range_local_low")
 
     if symbol:
         df_5m = _get_global_summary_df(5)
@@ -952,12 +1554,12 @@ def _range_5m_filter_from_entry_row_core(entry_row: Any, min_pct: float = DEFAUL
 # ATR(1分) ベース 実効ボラフィルタ
 # ==========================================================
 
-def atr_1m_filter(
+def _atr_1m_filter_core(
     entry_row: Any = None,
     *,
     df_1m: pd.DataFrame | None = None,
     symbol: str | None = None,
-    min_ratio: float = DEFAULT_ATR_1M_MIN_RATIO,
+    min_ratio: float = _BASE_ATR_1M_MIN_RATIO,
 ):
     """
     1分足 ATR ベースの実効ボラティリティ判定。
@@ -1100,7 +1702,7 @@ def range_5m_filter(
     *,
     df_5m: pd.DataFrame | None = None,
     symbol: str | None = None,
-    min_pct: float = DEFAULT_RANGE_5M_MIN_PCT,
+    min_pct: float = _BASE_RANGE_5M_MIN_PCT,
 ):
     """
     直近5分足の高安値幅による実効ボラ判定。
@@ -1191,3 +1793,197 @@ def range_5m_filter(
         "min_pct": min_pct,
         "price": close,
     }
+
+
+# ============================================================
+# TONOSAMA entry_row / pending レンジ救済
+# (旧 core/startup/volatility_filter_tonosama_entryrow_rescue_patch.py を本文化)
+# ------------------------------------------------------------
+# ATR が NG でも、TONOSAMA の pending / entry_row のレンジ比率が十分なら
+# 通す層。ネイティブは _atr_1m_filter_core へ改名した。
+#
+# 実 install 順を測定した結果、この層は entry_controller.atr_1m_filter を
+# 包む 6 パッチの中で **最後に入り、それまでの層をすべて捨てて native の上に
+# 載せ直す**ものだった (旧 install の
+# `_ORIG_ATR = getattr(cur_atr, "_original", cur_atr)`)。
+# したがって本文へ組み込むのが実挙動と一致する。
+#
+# 旧 install は entry_controller.atr_1m_filter へも同じ関数を代入していたが、
+# entry_controller.py:121 が from-import で束縛しているので、
+# 本文化後は最初からこの実装を掴む。
+# ============================================================
+
+_TVR_INSTALLED = False
+_TVR_ORIG_ATR = None
+
+
+def _tvr_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _tvr_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _tvr_row_to_dict(row: Any) -> dict[str, Any]:
+    try:
+        if row is None:
+            return {}
+        if isinstance(row, dict):
+            return dict(row)
+        if isinstance(row, pd.Series):
+            return row.to_dict()
+        if hasattr(row, "to_dict"):
+            v = row.to_dict()
+            if isinstance(v, dict):
+                return dict(v)
+    except Exception:
+        pass
+    return {}
+
+
+def _tvr_f(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", "").replace("%", ""))
+    except Exception:
+        return float(default)
+
+
+def _tvr_first(row: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any:
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+        except Exception:
+            pass
+    return default
+
+
+def _tvr_norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip()
+        return s[:-2] if s.endswith(".0") else s
+    except Exception:
+        return ""
+
+
+def _tvr_is_tonosama(row: dict[str, Any]) -> bool:
+    s = str(row.get("source") or row.get("pipeline_source") or row.get("entry_type") or "").upper()
+    return "TONOSAMA" in s
+
+
+def _tvr_extract_symbol(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    for key in ("symbol", "code", "stock_code"):
+        if kwargs.get(key) is not None:
+            return _tvr_norm_symbol(kwargs.get(key))
+    for obj in args:
+        if isinstance(obj, (str, int)):
+            s = _tvr_norm_symbol(obj)
+            if s:
+                return s
+    row = _tvr_row_to_dict(args[0]) if args else _tvr_row_to_dict(kwargs.get("entry_row"))
+    return _tvr_norm_symbol(row.get("symbol") or row.get("Symbol"))
+
+
+def _tvr_entry_row_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    if kwargs.get("entry_row") is not None:
+        return kwargs.get("entry_row")
+    if args:
+        if isinstance(args[0], pd.DataFrame):
+            return None
+        return args[0]
+    return None
+
+
+def _tvr_pending_entry_for_symbol(symbol: str) -> dict[str, Any]:
+    sym = _tvr_norm_symbol(symbol)
+    if not sym:
+        return {}
+    try:
+        from global_state import global_data
+        root = getattr(global_data, "pending_entries", None)
+        if isinstance(root, dict):
+            bucket = root.get(sym) or root.get(str(sym))
+            entries = bucket if isinstance(bucket, (list, tuple, set)) else ([bucket] if bucket is not None else [])
+            for e in entries:
+                d = _tvr_row_to_dict(e)
+                if d and _tvr_is_tonosama(d):
+                    return d
+    except Exception:
+        pass
+    try:
+        import trading.entry.pending_manager as pm
+        iter_entries = getattr(pm, "iter_entries", None)
+        if callable(iter_entries):
+            for s, e in list(iter_entries()):
+                if _tvr_norm_symbol(s) == sym:
+                    d = _tvr_row_to_dict(e)
+                    if d and _tvr_is_tonosama(d):
+                        return d
+    except Exception:
+        pass
+    return {}
+
+
+def _tvr_entryrow_range_ratio(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+    close = _tvr_f(_tvr_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
+    high = _tvr_f(_tvr_first(row, ("high_price", "high", "High"), 0.0), 0.0)
+    low = _tvr_f(_tvr_first(row, ("low_price", "low", "Low"), 0.0), 0.0)
+    intrabar_pct = _tvr_f(_tvr_first(row, ("_intrabar_range_pct", "intrabar_range_pct", "range_pct", "row_range_pct"), 0.0), 0.0)
+    ratio_from_ohlc = ((high - low) / close) if high > 0 and low > 0 and close > 0 and high >= low else 0.0
+    ratio_from_pct = intrabar_pct / 100.0 if intrabar_pct > 0 else 0.0
+    ratio = max(ratio_from_ohlc, ratio_from_pct)
+    return ratio, {"close": close, "high": high, "low": low, "intrabar_pct": intrabar_pct, "ratio": ratio}
+
+
+def _tvr_tonosama_vol_rescue(row_obj: Any, *, caller: str, symbol: str = "") -> tuple[bool, dict[str, Any]]:
+    row = _tvr_row_to_dict(row_obj)
+    if not row and symbol:
+        row = _tvr_pending_entry_for_symbol(symbol)
+    if not row:
+        return False, {"reason": "row_missing", "symbol": symbol, "caller": caller}
+    if not _tvr_is_tonosama(row):
+        return False, {"reason": "not_tonosama", "symbol": symbol, "caller": caller, "source": row.get("source") or row.get("entry_type")}
+    ratio, diag = _tvr_entryrow_range_ratio(row)
+    min_ratio = _tvr_env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_RANGE_RATIO", 0.006)
+    min_pct = _tvr_env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_INTRABAR_PCT", 0.6)
+    ok = ratio >= min_ratio or _tvr_f(diag.get("intrabar_pct"), 0.0) >= min_pct
+    diag.update({
+        "caller": caller,
+        "symbol": _tvr_norm_symbol(row.get("symbol") or row.get("Symbol") or symbol),
+        "side": row.get("side"),
+        "source": row.get("source") or row.get("entry_type"),
+        "min_ratio": min_ratio,
+        "min_intrabar_pct": min_pct,
+        "ok": ok,
+    })
+    return bool(ok), diag
+
+
+def atr_1m_filter(*args, **kwargs):
+    if _tvr_env_bool("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", True):
+        try:
+            row_obj = _tvr_entry_row_from_call(args, kwargs)
+            symbol = _tvr_extract_symbol(args, kwargs)
+            ok, diag = _tvr_tonosama_vol_rescue(row_obj, caller="atr_1m_filter", symbol=symbol)
+            if ok:
+                logger.warning("[VOL FILTER TONOSAMA RESCUE] allow ATR by pending/entry_row range diag=%s", diag)
+                return True
+        except Exception:
+            logger.exception("[VOL FILTER TONOSAMA RESCUE] rescue check failed; fall through to core")
+    return _atr_1m_filter_core(*args, **kwargs)

@@ -30,7 +30,7 @@ from pathlib import Path
 from sqlalchemy.engine import Engine
 
 from global_state import global_data
-from core.startup.db_bootstrap import bootstrap_database
+from core.startup.bootstrap.db import bootstrap_database
 
 logger = logging.getLogger(__name__)
 
@@ -168,44 +168,52 @@ def clear_runtime_memory() -> None:
 
 
 def _install_push_summary_history_patch() -> None:
-    try:
-        from core.startup.push_summary_history_runtime_patch import install as install_push_history
-        ok = install_push_history()
-        logger.warning("[STARTUP.RUNTIME] push summary history patch installed=%s", ok)
-    except Exception:
-        logger.exception("[STARTUP.RUNTIME] push summary history patch install failed")
+    # push_summary_history_runtime_patch は削除した。実質デッドだったため。
+    #
+    # 理由: あのパッチは差し替え対象を
+    #   import trading.summary.engine.push_summary_engine as pse
+    # で取っていたが、trading/summary/engine/__init__.py:13 が
+    # `from .push_summary_engine import (..., push_summary_engine, ...)` で
+    # サブモジュールと同名の「関数」をパッケージ名前空間へ入れているため、
+    # `import a.b.c as x` の getattr(sys.modules['a.b'], 'c') が
+    # モジュールではなく関数を返していた。
+    # その結果 getattr(pse, "_resolve_summary_source_df", None) 等がすべて None になり、
+    # _resolve_summary_source_df / _store_push_merged_summary / public 6 関数
+    # (build_summary / build_push_summary / push_summary_engine /
+    #  run_push_summary_engine / run_summary_engine / run) のラップが
+    # 1 つも成立していなかった (実測確認済み)。
+    # install() は True を返し "installed V4" もログへ出るので、
+    # ログ上は動いているように見えていた点に注意。
+    #
+    # 同じ書き方をしていた light_tick_1m (旧 summary_main_1m_light_tick_patch)
+    # の _install_history_patch も
+    # 同じ理由で不発だったため併せて撤去した。
+    # 履歴補完 / mtf-rebuild を本当に有効化するかは別途の仕様判断。
+    return
 
 
 def _install_global_context_summary_repair_patch() -> None:
-    try:
-        from core.startup.global_context_summary_repair_patch import install as install_gc_repair
-        ok = install_gc_repair()
-        logger.warning("[STARTUP.RUNTIME] global context summary repair patch installed=%s", ok)
-    except Exception:
-        logger.exception("[STARTUP.RUNTIME] global context summary repair patch install failed")
+    # global_context_summary_repair_patch は core/global_context/context.py へ
+    # インライン化済み (context.py:1040 付近)。パッチ側は install() が True を
+    # 返すだけの空スタブになっていたのでファイルごと削除した。
+    return
 
 
 def _install_summary_controller_ready_mtf_patch() -> None:
-    try:
-        from core.startup.summary_controller_ready_mtf_patch import install as install_ready_mtf
-        ok = install_ready_mtf()
-        logger.warning("[STARTUP.RUNTIME] summary controller ready mtf patch installed=%s", ok)
-    except Exception:
-        logger.exception("[STARTUP.RUNTIME] summary controller ready mtf patch install failed")
+    """summary_controller_ready_mtf_patch は
+    trading/summary/controller_cache.py / controller_projection.py へ本文化済み
+    (trading/summary/controller_layers.apply_layers の 3 層目 = 最外周)。
+    install は不要になった。
+    """
+    return None
 
 
-def _install_ranking_entry_runtime_fix_patch() -> None:
-    try:
-        from core.startup.ranking_entry_runtime_fix_patch import install as install_ranking_fix
-        ok = install_ranking_fix()
-        logger.warning("[STARTUP.RUNTIME] ranking entry runtime fix patch installed=%s", ok)
-    except Exception:
-        logger.exception("[STARTUP.RUNTIME] ranking entry runtime fix patch install failed")
-
+# ranking_entry_runtime_fix_patch は trading/ranking/entry_from_ranking.py の
+# _normalize_ranking_row_for_entry() / save_ranking_pseudo_technicals() へ native化済み。
 
 def _restore_summary_db_seed_after_bootstrap(summary_db_path) -> None:
     try:
-        from core.startup.summary_db_seed_restore_patch import restore_summary_db_seed
+        from core.startup.summary_db_seed_restore import restore_summary_db_seed
         result = restore_summary_db_seed(summary_db_path)
         logger.warning("[STARTUP.RUNTIME] summary DB seed restore result=%s", result)
     except Exception:
@@ -214,7 +222,6 @@ def _restore_summary_db_seed_after_bootstrap(summary_db_path) -> None:
     _install_push_summary_history_patch()
     _install_global_context_summary_repair_patch()
     _install_summary_controller_ready_mtf_patch()
-    _install_ranking_entry_runtime_fix_patch()
 
 
 def safe_migration_phase(summary_dir, ranking_dir) -> None:

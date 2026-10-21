@@ -24,6 +24,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import time as _ti_time
+
 import numpy as np
 import pandas as pd
 
@@ -186,17 +188,19 @@ def _safe_numeric_series(
                 .str.replace(",", "", regex=False)
                 .str.replace("円", "", regex=False)
                 .str.strip()
+                # 文字列 Series へ np.nan を入れると object->float の
+                # 暗黙ダウンキャスト (非推奨) になるので空文字へ寄せる。
+                # 直後の pd.to_numeric(errors="coerce") で同じ NaN になる。
                 .replace(
                     {
-                        "": np.nan,
-                        "None": np.nan,
-                        "none": np.nan,
-                        "NULL": np.nan,
-                        "null": np.nan,
-                        "nan": np.nan,
-                        "NaN": np.nan,
-                        "<NA>": np.nan,
-                        "pd.NA": np.nan,
+                        "None": "",
+                        "none": "",
+                        "NULL": "",
+                        "null": "",
+                        "nan": "",
+                        "NaN": "",
+                        "<NA>": "",
+                        "pd.NA": "",
                     }
                 )
             )
@@ -308,9 +312,23 @@ def _build_ohlcv_compatible(df: pd.DataFrame) -> pd.DataFrame:
     # --------------------------------------------------------
     # OHLC はすべて同じ price にする
     # --------------------------------------------------------
-    x["open"] = price
-    x["high"] = price
-    x["low"] = price
+    # 2026-09-30: 既に本物の OHLC (Yahoo 1 分足で補った行 / 3・5 分足の
+    #   resample で high=max・low=min になった行) があれば潰さない。
+    #   従来は全行 open=high=low=close にしており ATR などが実際より小さく出ていた。
+    def _real(col_names):
+        out_ = pd.Series(np.nan, index=x.index, dtype="float64")
+        for c_ in col_names:
+            if c_ in x.columns:
+                v_ = _safe_numeric_series(x, c_, default=np.nan)
+                out_ = out_.where(out_.notna(), v_.where(v_ > 0))
+        return out_
+
+    _o = _real(["open", "open_price"])
+    _h = _real(["high", "high_price"])
+    _l = _real(["low", "low_price"])
+    x["open"] = _o.fillna(price)
+    x["high"] = pd.concat([_h.fillna(price), price, x["open"]], axis=1).max(axis=1)
+    x["low"] = pd.concat([_l.fillna(price), price, x["open"]], axis=1).min(axis=1)
     x["close"] = price
 
     # --------------------------------------------------------
@@ -485,6 +503,12 @@ def _fallback_vwap(df: pd.DataFrame) -> pd.Series:
 
 
 def _apply_fallback_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # R18: ここは per-symbol ループなので、通っているなら必ず記録する
+    logger.warning(
+        "[RANKING TECH STAGE] fallback indicators 経路 (per-symbol ループ) rows=%s symbols=%s",
+        len(df) if df is not None else -1,
+        df["symbol"].nunique() if df is not None and "symbol" in df.columns else -1,
+    )
     set_indicator_mode("fallback")
 
     if df is None or df.empty:
@@ -733,7 +757,26 @@ def _merge_indicator_output(base_df: pd.DataFrame, ind_df: pd.DataFrame) -> pd.D
         if alt in out.columns:
             if c in out.columns:
                 try:
-                    out[c] = out[c].combine_first(out[alt])
+                    # 片方が全 NA だと combine_first が空連結の
+                    # FutureWarning を出す。結果は自明なので先に分岐する。
+                    if out[alt].isna().all():
+                        pass
+                    elif out[c].isna().all():
+                        out[c] = out[alt]
+                    else:
+                        a = out[c]
+                        b = out[alt]
+                        # int64 と float64 を混ぜた combine_first だけが
+                        # 空連結の FutureWarning を出す。技術指標列は
+                        # float が本来の型なので、両方数値なら float64 へ揃える。
+                        if (
+                            pd.api.types.is_numeric_dtype(a)
+                            and pd.api.types.is_numeric_dtype(b)
+                            and a.dtype != b.dtype
+                        ):
+                            a = a.astype("float64")
+                            b = b.astype("float64")
+                        out[c] = a.combine_first(b)
                 except Exception:
                     out[c] = out[c].where(out[c].notna(), out[alt])
                 out.drop(columns=[alt], inplace=True, errors="ignore")
@@ -795,14 +838,34 @@ def _apply_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     try:
         from trading.ranking.summary.aggregation import AGG_KEEP_ORDER
 
+        # R18: technical 9-11 秒の内訳を出す
+        _ti_t0 = _ti_time.perf_counter()
+
         base = _build_ohlcv_compatible(df)
         base = _sort_if_possible(base, ["symbol", "datetime"])
         base["hist_len"] = base.groupby("symbol").cumcount() + 1
+        _ti_t1 = _ti_time.perf_counter()
 
         ind = _apply_external_indicators(base)
+        _ti_t2 = _ti_time.perf_counter()
+
         x = _merge_indicator_output(base, ind)
+        _ti_t3 = _ti_time.perf_counter()
 
         x = _sort_if_possible(x, ["symbol", "datetime"])
+
+        try:
+            _ti_total = _ti_t3 - _ti_t0
+            _ti_log = logger.warning if _ti_total >= 3.0 else logger.info
+            _ti_log(
+                "[RANKING TECH STAGE] rows=%s symbols=%s ohlcv=%.3fs "
+                "external_indicators=%.3fs merge=%.3fs total=%.3fs",
+                len(df),
+                df["symbol"].nunique() if "symbol" in df.columns else -1,
+                _ti_t1 - _ti_t0, _ti_t2 - _ti_t1, _ti_t3 - _ti_t2, _ti_total,
+            )
+        except Exception:
+            logger.debug("[RANKING TECH STAGE] ログに失敗", exc_info=True)
 
         if "hist_len" not in x.columns:
             x["hist_len"] = x.groupby("symbol").cumcount() + 1

@@ -103,9 +103,9 @@ def _build_today_ranking_candidates_impl(
 
 def _load_today_ranking_db_fallback_symbols(target: int) -> List[str]:
     try:
-        from trading.ranking.active_symbols import db_ranking_fallback_patch as dbfb
+        from trading.ranking.active_symbols.db_ranking_fallback import load_symbols_from_ranking_db
 
-        return list(dbfb._load_symbols_from_ranking_db(max_rows=max(int(target) * 3, 300)) or [])[: int(target)]
+        return list(load_symbols_from_ranking_db(max_rows=max(int(target) * 3, 300)) or [])[: int(target)]
     except Exception:
         logger.debug("[ACTIVE SOURCE] today_ranking db fallback loader failed", exc_info=True)
         return []
@@ -234,7 +234,7 @@ def _load_daily_watchlist_symbols(limit: int = 200) -> List[str]:
         return []
 
     try:
-        with sqlite3.connect(str(db_path), timeout=3.0) as con:
+        with committing_connect(str(db_path), timeout=3.0) as con:
             cur = con.cursor()
             try:
                 row = cur.execute("SELECT MAX(date) FROM daily_watchlist").fetchone()
@@ -603,6 +603,14 @@ def _supplement_active_to_target_empty_universe_relaxed(
     return active, diag
 
 
+def _momentum_priority_enabled() -> bool:
+    """PUSH 50 枠の選定で当日変化率を優先するか (2026-09-18)。0 で従来の売買代金順。"""
+    import os
+
+    v = str(os.getenv("ACTIVE_SYMBOL_MOMENTUM_PRIORITY", "1")).strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 def _active_symbol_target_fill_score(sym: str, liquidity_map: dict, flag_info: dict, protected: Set[str]) -> tuple:
     info = liquidity_map.get(sym, {}) or {}
     flags = flag_info.get(sym, {}) if isinstance(flag_info, dict) else {}
@@ -634,7 +642,17 @@ def _active_symbol_target_fill_score(sym: str, liquidity_map: dict, flag_info: d
     tick = _fval(info.get("tick_count"))
     price = _fval(info.get("current_price") or info.get("price") or info.get("close"))
     quality = int(_fok(flags.get("ats_ok"))) + int(_fok(flags.get("buy_target"))) + int(_fok(flags.get("sell_target"))) + int(_fok(flags.get("short_ok")))
-    return (1 if sym in protected else 0, value, volume, tick, price, quality, sym)
+    # 2026-09-18: 売買代金順だと大型株ばかりになり、急騰銘柄を拾えていなかった。
+    #   9/18 の急騰 134 件のうち、その瞬間にティックがあったのは 22 件 (16%)。
+    #   09:30 の候補 349 銘柄から 50 枠を選ぶシミュレーションでは
+    #     売買代金順 -> 急騰 7 件 / 変化率順 -> 19 件 (2.7 倍)
+    #   絶対値を使うのは下落側もリバウンドで急騰しやすいため
+    #   (10 日検証で当日 -2% 以下の群の急騰率 38.6%、全体平均 17.3%)。
+    #   流動性フィルタは別途効くので薄い銘柄は入らない。
+    momentum = 0.0
+    if _momentum_priority_enabled():
+        momentum = abs(_fval(info.get("change_percentage")))
+    return (1 if sym in protected else 0, momentum, value, volume, tick, price, quality, sym)
 
 
 def _apply_active_symbol_target_fill(
@@ -788,7 +806,7 @@ def _trim_to_max(
     return set(sorted(items, key=sort_key, reverse=True)[:MAX_ACTIVE_SYMBOLS])
 
 
-def update_active_symbols(force: bool = False) -> List[str]:
+def _update_active_symbols_core(force: bool = False) -> List[str]:
     try:
         return _update_active_symbols_impl(force=force)
     except Exception:
@@ -957,7 +975,7 @@ def _update_active_symbols_impl(force: bool = False) -> List[str]:
     return active_list
 
 
-def get_active_symbols(*args, **kwargs) -> List[str]:
+def _get_active_symbols_core(*args, **kwargs) -> List[str]:
     del args, kwargs
     symbols = dedupe_keep_order(getattr(global_data, "symbols_active", []))
     if not symbols:
@@ -977,27 +995,27 @@ def get_active_symbols(*args, **kwargs) -> List[str]:
     return symbols[:MAX_ACTIVE_SYMBOLS]
 
 
-def get_current_active_symbols(*args, **kwargs) -> List[str]:
+def _get_current_active_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()
 
 
-def get_monitor_symbols(*args, **kwargs) -> List[str]:
+def _get_monitor_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
 
 
-def get_push_symbols(*args, **kwargs) -> List[str]:
+def _get_push_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
 
 
-def get_register_symbols(*args, **kwargs) -> List[str]:
+def _get_register_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
 
 
-def get_subscription_symbols(*args, **kwargs) -> List[str]:
+def _get_subscription_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
 
 
-def get_rotation_symbols(*args, **kwargs) -> List[str]:
+def _get_rotation_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
 
 
@@ -1026,3 +1044,261 @@ def debug_active_symbols() -> dict:
     }
     logger.info("[ACTIVE DEBUG] %s", payload)
     return payload
+
+
+# ============================================================
+# WATCHLIST RECENT LIQUIDITY GUARD
+# (旧 core/startup/watchlist_recent_liquidity_guard_patch.py と
+#  同 _bulk_patch、usercustomize の fail-open ラッパーを本文化)
+# ------------------------------------------------------------
+# 直近の出来高・売買代金が細い銘柄を watchlist から落とす。
+# 3 層の合成 (guard の per-symbol <- bulk が完全置換 <- uc の min_keep
+# fail-open) は trading/ranking/active_symbols/recent_liquidity.py の
+# filter_symbols() が持っている。
+#
+# 旧 install はここの 8 関数と互換ラッパー
+# (trading/ranking/active_symbol_manager) の同名を差し替えていたが、
+# 互換側は trading.ranking.active_symbols から from-import しているので
+# 本文化すれば自動で追従する。
+# ============================================================
+
+from trading.ranking.active_symbols.recent_liquidity import filter_symbols as _wrl_filter
+from sqlite_cm import committing_connect
+
+
+def _update_active_symbols_wrl(force: bool = False) -> List[str]:
+    symbols = _update_active_symbols_core(force)
+    filtered = _wrl_filter(symbols, context="active.update_active_symbols")
+    try:
+        from trading.ranking.active_symbols.reflect import reflect_active_to_global
+
+        reflect_active_to_global(filtered)
+    except Exception:
+        logger.debug("[WATCHLIST RECENT LIQ] reflect after update failed", exc_info=True)
+    return filtered
+
+
+def _get_active_symbols_wrl(*args, **kwargs) -> List[str]:
+    return _wrl_filter(_get_active_symbols_core(*args, **kwargs), context="active.get_active_symbols")
+
+
+# ============================================================
+# PREMARKET GETTER GUARD
+# (旧 trading/ranking/active_symbols/getter_premarket_patch.py)
+# ------------------------------------------------------------
+# 寄前 SBI 由来の銘柄リストは寄付き前だけ有効。場中は、たとえ最後の
+# active リストが寄前 SBI 由来でも、通常のランキング由来ユニバースで
+# 再ガード/再構築して PUSH rotation がライブのランキングに追従するようにする。
+#
+# 旧パッチは manager の getter 7 本を丸ごと差し替えていた
+# (native の _wrl_filter 層は例外時フォールバックでしか呼ばれない)。
+# その構造をそのまま本文へ写してある。
+# ============================================================
+
+
+def _premarket_intraday_sbi_allowed() -> bool:
+    return _env_bool("ACTIVE_ALLOW_INTRADAY_PREMARKET_FALLBACK", False)
+
+
+def _apply_premarket_getter_defaults() -> None:
+    """旧 install() 冒頭の USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY 抑止。"""
+    global USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY
+    if _premarket_intraday_sbi_allowed():
+        return
+    try:
+        USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY = False
+        os.environ["ACTIVE_USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY"] = "0"
+    except Exception:
+        logger.debug("[ACTIVE GETTER PREMARKET] manager fallback override failed", exc_info=True)
+
+
+_apply_premarket_getter_defaults()
+
+
+def _get_active_symbols_premarket(*args, **kwargs) -> List[str]:
+    del args, kwargs
+    symbols = dedupe_keep_order(getattr(global_data, "symbols_active", []))
+    if not symbols:
+        symbols = dedupe_keep_order(get_global_attr("active_symbols", []))
+    if not symbols:
+        symbols = dedupe_keep_order(get_global_attr("monitor_symbols", []))
+
+    if not symbols:
+        return []
+
+    try:
+        current_is_premarket = bool(is_premarket_time(now_dt()))
+        source_premarket = bool(get_global_attr("active_symbol_premarket_mode", False))
+        preserve_premarket = _env_bool("ACTIVE_GETTER_PRESERVE_PREMARKET_MODE", True)
+        skip_guard_when_premarket = _env_bool("ACTIVE_GETTER_SKIP_PRICE_GUARD_FOR_PREMARKET", True)
+        allow_intraday_sbi_now = _premarket_intraday_sbi_allowed()
+
+        if (
+            current_is_premarket
+            and source_premarket
+            and preserve_premarket
+            and skip_guard_when_premarket
+        ):
+            # 寄前時間中だけ、寄前SBI由来リストを再ガードせず保持する。
+            logger.info(
+                "[ACTIVE GETTER PREMARKET] keep premarket symbols before open count=%d head=%s",
+                len(symbols),
+                symbols[:20],
+            )
+            return symbols[:MAX_ACTIVE_SYMBOLS]
+
+        if source_premarket and not current_is_premarket and not allow_intraday_sbi_now:
+            logger.info(
+                "[ACTIVE GETTER PREMARKET] market-hours ranking mode: re-guard former premarket symbols count=%d",
+                len(symbols),
+            )
+
+        premarket_mode = bool(current_is_premarket and source_premarket and preserve_premarket)
+        symbols = final_guard_min_price(
+            symbols,
+            protected=get_protected_symbols(),
+            liquidity_map=build_liquidity_map(),
+            premarket_mode=premarket_mode,
+        )
+    except Exception:
+        logger.debug("[ACTIVE GETTER PREMARKET] getter min price guard failed", exc_info=True)
+        try:
+            return _get_active_symbols_wrl()[:MAX_ACTIVE_SYMBOLS]
+        except Exception:
+            pass
+
+    return symbols[:MAX_ACTIVE_SYMBOLS]
+
+
+# ============================================================
+# TODAY RANKING DB FALLBACK
+# (旧 trading/ranking/active_symbols/db_ranking_fallback_patch.install())
+# ------------------------------------------------------------
+# 場中に today_ranking が 0 件になっても、当日の rankingYYYYMMDD.db から
+# active / push / register symbols を復元する。データ取得部は
+# trading/ranking/active_symbols/db_ranking_fallback.py に残してある。
+# 旧 install はここの getter 群をさらに包んでいたので、その順序
+# (db fallback <- premarket <- native) を本文でも保っている。
+# ============================================================
+
+
+def _db_fallback_symbols(target: int) -> List[str]:
+    try:
+        from .db_ranking_fallback import fallback_symbols
+
+        return list(fallback_symbols(target=target) or [])
+    except Exception:
+        logger.debug("[ACTIVE DB FALLBACK] fallback loader failed", exc_info=True)
+        return []
+
+
+def _db_fallback_target() -> int:
+    try:
+        return int(TARGET_ACTIVE_SYMBOLS or 100)
+    except Exception:
+        return 100
+
+
+def _db_fallback_min_symbols() -> int:
+    """選定結果がこの件数以上あれば「生きている」と見なし、差し替えない。
+
+    2026-09-29: ここが原因で監視銘柄が 1〜2 分ごとに 2 つのリストを往復していた。
+    旧条件は `len(symbols) >= target (=TARGET_ACTIVE_SYMBOLS=100)` で、
+    それ未満なら DB フォールバックで**全部差し替え**ていた (return fb)。
+    設計の「最大100銘柄」は上限であって必須件数ではなく、実測では選定が健全に
+    50 銘柄を返していたのに毎回 100 件の別リストに置き換わっていた。
+    10:46〜11:10 の実測で 50 銘柄のうち 44〜47 銘柄が入れ替わって元に戻る往復を
+    16 回。PUSH の登録替えが走るたびに 3分/5分足の履歴が途切れるので、MTF ゲート
+    に渡る足が 28〜77 銘柄しか揃わず dropped_stale が出ていた。
+
+    このフォールバックの本来の目的はコメントどおり「today_ranking が 0 件に
+    なっても復元する」ことなので、ほぼ空のときだけ差し替える。
+    """
+    try:
+        v = os.environ.get("ACTIVE_DB_FALLBACK_MIN_SYMBOLS")
+        return max(0, int(float(str(v).strip()))) if v not in (None, "") else 20
+    except Exception:
+        return 20
+
+
+def update_active_symbols(force: bool = False) -> List[str]:
+    symbols: List[str] = []
+    try:
+        symbols = list(_update_active_symbols_wrl(force=force) or [])
+    except Exception:
+        logger.exception("[ACTIVE DB FALLBACK] original update failed; try db fallback")
+        symbols = []
+
+    target = _db_fallback_target()
+    if len(symbols) >= target:
+        return symbols
+
+    min_ok = _db_fallback_min_symbols()
+    if len(symbols) >= min_ok > 0:
+        # 選定は生きている。足りない分を**後ろに足すだけ**にして、上位の並び
+        # (PUSH に回る先頭 50) を壊さない。
+        fb = _db_fallback_symbols(target=target)
+        if not fb:
+            return symbols
+        have = set(symbols)
+        add = [s for s in fb if s not in have][: max(0, target - len(symbols))]
+        if add:
+            logger.warning(
+                "[ACTIVE DB FALLBACK] filled (差し替えではなく追加) selected=%d "
+                "added=%d after=%d target=%d min_ok=%d head_selected=%s",
+                len(symbols), len(add), len(symbols) + len(add), target, min_ok,
+                symbols[:20],
+            )
+            return symbols + add
+        return symbols
+
+    fb = _db_fallback_symbols(target=target)
+    if fb:
+        logger.warning(
+            "[ACTIVE DB FALLBACK] recovered active symbols before=%d after=%d "
+            "target=%d min_ok=%d head=%s (選定がほぼ空なので差し替えた)",
+            len(symbols),
+            len(fb),
+            target,
+            min_ok,
+            fb[:20],
+        )
+        return fb
+    return symbols
+
+
+def get_active_symbols(*args, **kwargs) -> List[str]:
+    symbols: List[str] = []
+    try:
+        symbols = list(_get_active_symbols_premarket(*args, **kwargs) or [])
+    except Exception:
+        logger.exception("[ACTIVE DB FALLBACK] original getter failed; try db fallback")
+        symbols = []
+    if symbols:
+        return symbols[:MAX_ACTIVE_SYMBOLS]
+    return _db_fallback_symbols(target=_db_fallback_target())
+
+
+def get_current_active_symbols(*args, **kwargs) -> List[str]:
+    return get_active_symbols(*args, **kwargs)
+
+
+def get_monitor_symbols(*args, **kwargs) -> List[str]:
+    return get_active_symbols(*args, **kwargs)[:MAX_ACTIVE_SYMBOLS]
+
+
+def get_push_symbols(*args, **kwargs) -> List[str]:
+    return get_monitor_symbols(*args, **kwargs)
+
+
+def get_register_symbols(*args, **kwargs) -> List[str]:
+    return get_monitor_symbols(*args, **kwargs)
+
+
+def get_subscription_symbols(*args, **kwargs) -> List[str]:
+    return get_monitor_symbols(*args, **kwargs)
+
+
+def get_rotation_symbols(*args, **kwargs) -> List[str]:
+    return get_monitor_symbols(*args, **kwargs)
+

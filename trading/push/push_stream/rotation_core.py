@@ -261,12 +261,47 @@ def _close_ws_before_register(label: str) -> None:
         time.sleep(settle)
 
 
+def _confirmed_registered_count() -> int:
+    """kabu Station 側に確実に登録できている銘柄数。取れなければ -1。"""
+    try:
+        from trading.push import registration_state
+
+        return int(registration_state.registered_count())
+    except Exception:
+        logger.debug("[push_stream] rotation registered_count 取得に失敗", exc_info=True)
+        return -1
+
+
 def _rotation_failure_backoff_seconds(failure_count: int) -> float:
     base = max(0.0, _env_float("PUSH_ROTATION_FAILURE_BACKOFF_SEC", 180.0))
     max_sec = max(base, _env_float("PUSH_ROTATION_FAILURE_BACKOFF_MAX_SEC", 600.0))
     multiplier = max(1.0, _env_float("PUSH_ROTATION_FAILURE_BACKOFF_MULTIPLIER", 1.5))
     n = max(0, int(failure_count) - 1)
-    return min(max_sec, base * (multiplier ** n))
+    backoff = min(max_sec, base * (multiplier ** n))
+
+    # ------------------------------------------------------------
+    # 登録が 1 件も無いときは、この backoff がそのまま「PUSH 停止時間」になる。
+    #
+    # 2026-09-02 の実測: register が timeout し続け confirmed=0 のまま
+    # backoff が 180s -> 270s -> 600s と伸びた。その間 kabu Station には
+    # 購読銘柄が無いので PUSH WebSocket は 10 秒前後で切られ続け、
+    # 「10 分に 1 回だけ登録を試す / その間データは来ない」状態になっていた。
+    #
+    # 登録済みが 0 件なのは「軽い失敗」ではなく PUSH 全断なので、
+    # 相手が復旧したら速やかに拾えるよう上限を短く抑える。
+    # 1 件でも登録できているなら従来どおり長い backoff でよい
+    # (その場合ローテーションが遅れるだけでデータは流れている)。
+    # ------------------------------------------------------------
+    if _confirmed_registered_count() == 0:
+        empty_cap = max(5.0, _env_float("PUSH_ROTATION_FAILURE_BACKOFF_EMPTY_MAX_SEC", 30.0))
+        if backoff > empty_cap:
+            logger.warning(
+                "[push_stream] rotation backoff を %.1fs -> %.1fs に短縮 "
+                "(確定登録が 0 件 = PUSH 全断。復旧を 10 分待たない) failure_count=%d",
+                backoff, empty_cap, failure_count,
+            )
+            return empty_cap
+    return backoff
 
 
 def _run_rotation_side(*, label: str, symbols: list[str], failure_count: int = 0) -> bool:
@@ -294,6 +329,16 @@ def _run_rotation_side(*, label: str, symbols: list[str], failure_count: int = 0
             setattr(state, "_rotation_register_in_progress", False)
         except Exception:
             pass
+        try:
+            import datetime as _dt
+
+            now = _dt.datetime.now()
+            if ok:
+                state._last_register_ok_at = now
+            else:
+                state._last_register_fail_at = now
+        except Exception:
+            logger.debug("[push_stream] register outcome record failed", exc_info=True)
 
     if not ok:
         backoff = _rotation_failure_backoff_seconds(failure_count)
@@ -329,6 +374,26 @@ def _run_rotation_side(*, label: str, symbols: list[str], failure_count: int = 0
 
 
 def _rotation_worker() -> None:
+    # PUSH の register リストはセッション共有資源なので、
+    # WebSocket を所有していないプロセスは rotation してはいけない。
+    # 2026-08-31: main.py が所有者でないまま rotation を回し、
+    # unregister/all を 7 秒おきに撃って push_receiver の購読を消していた。
+    if _env_bool("PUSH_ROTATION_REQUIRE_WS_OWNER", True):
+        try:
+            from .ws_owner import is_push_ws_owner, owned_elsewhere
+
+            if not is_push_ws_owner():
+                elsewhere, holder = owned_elsewhere()
+                logger.error(
+                    "[push_stream][MULTI_WS_DETECTED] rotation worker abort: "
+                    "このプロセスは PUSH WebSocket の所有者ではない pid=%s owned_elsewhere=%s holder=%s",
+                    os.getpid(), elsewhere, holder,
+                )
+                state._rotation_enabled = False
+                return
+        except Exception:
+            logger.exception("[push_stream] rotation owner check failed -> continue")
+
     fixed_slots, variable_slots = _rotation_slot_sizes()
     logger.info(
         "[push_stream] rotation worker started version=%s hold=%.3fs register_timeout=%.3fs chunk=%d fixed_slots=%d variable_slots=%d keep_ws_default=True failure_backoff=%.1fs",
@@ -364,6 +429,12 @@ def _rotation_worker() -> None:
 
             ws_wait_count = 0
             targets = resolve_register_targets()
+            # 2026-10-03: 2 つ目の口座の中継があれば 51〜100 番目をそちらに回し、ここは先頭 50 だけ登録する
+            try:
+                from trading.push.push_relay_server import split_targets_for_relay
+                targets = split_targets_for_relay(list(targets or []))
+            except Exception:
+                logger.exception("[push_stream] push relay split failed")
             if not targets:
                 empty_count += 1
                 if empty_count == 1 or empty_count % 15 == 0:
@@ -413,3 +484,28 @@ def _rotation_worker() -> None:
 
 
 __all__ = ["VERSION", "enable_rotation", "_rotation_worker"]
+
+
+# ============================================================
+# ROTATION STABILITY (旧 rotation_stability_patch._patch_batches /
+#                     _patch_target_resolution の rotation_core 側束縛)
+# ------------------------------------------------------------
+# A=50 / B=50 のローテーション用バッチ生成と、登録ターゲット解決を
+# rotation_stability の実装へ委譲する。旧 install と同じ束縛を
+# import 時に張るだけで、実装は rotation_stability.py にある。
+# ============================================================
+
+
+def _build_protected_rotation_batches(targets):
+    from . import rotation_stability
+
+    return rotation_stability.build_protected_rotation_batches(targets)
+
+
+def resolve_register_targets():
+    from . import rotation_stability
+
+    return rotation_stability.resolve_register_targets()
+
+
+_STABILITY_PATCHED_BATCHES = True

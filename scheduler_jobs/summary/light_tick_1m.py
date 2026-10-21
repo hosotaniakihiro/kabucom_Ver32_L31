@@ -1,0 +1,517 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# File   : scheduler_jobs/summary/light_tick_1m.py
+# Version: V5-MAIN-1M-LIGHT-AI-SCORED-FRESH-GUARD  (VERSION 定数と一致。ログに出る)
+# ------------------------------------------------------------
+# main.py is entry-only: do not wait for/save/display heavy summary work.
+# It only calculates PUSH 1m quickly, submits Summary-AI asynchronously, reads
+# recent 1m history from summaryYYYYMMDD.db, and blocks slow raw push DB fallback
+# from main.py 1m fallback path.
+#
+# V6:
+#   - job_summary/run_push_summary_job/job_1m への差し替えを撤去した。
+#     scheduler_jobs/summary/direct_push_1m.py・scheduler_jobs/summary/memory_latest_1m.py
+#     と合わせて3本が同じ3関数を奪い合っていた (それぞれ再代入するだけの
+#     total-overwrite方式で、direct_push_force側の永続watcherがstale原本
+#     キャッシュを使って毎回再上書きしてしまうバグにより、実質的に
+#     このファイルの高速経路は本番で一度も選ばれていなかった)。
+#     ビルド本体を build_light_1m_summary() として切り出し、
+#     scheduler_jobs/summary/runner_core.py の job_summary (tier2) から
+#     直接呼ぶ形にインライン化した。_save_summary_if_owner /
+#     _run_push_ai_entry_before_display のラップは引き続きここで行う。
+#
+# V5:
+#   - Summary AI async submit直前で入力DFを検査する。
+#   - score_buy/score_sell/score_total/final_score/display_score が全て0のDFは
+#     AIへ渡さず、GlobalContext上の scored completed 1m PUSH summary に差し替える。
+#   - scored summary が無い/古すぎる場合は no_candidates を増やさないためAIをスキップ。
+# ============================================================
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import os
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Optional
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+VERSION = "V5-MAIN-1M-LIGHT-AI-SCORED-FRESH-GUARD"
+_INSTALLED = False
+_AI_EXECUTOR: ThreadPoolExecutor | None = None
+_AI_LOCK = threading.RLock()
+_AI_RUNNING_KEYS: set[str] = set()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return int(float(str(v).strip()))
+    except Exception:
+        pass
+    return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return float(str(v).strip())
+    except Exception:
+        pass
+    return float(default)
+
+
+def _argv_text() -> str:
+    try:
+        return " ".join(str(x).replace("\\", "/").lower() for x in (sys.argv or []))
+    except Exception:
+        return ""
+
+
+def _is_main_py() -> bool:
+    argv = _argv_text()
+    if any(x in argv for x in ("main_database.py", "data_collectors_runner.py", "summary_database_runner.py", "push_receiver_runner.py")):
+        return False
+    return "main.py" in argv
+
+
+def _is_entry_only_context() -> bool:
+    try:
+        role = str(os.getenv("SUMMARY_DB_WRITER_ROLE") or "").strip().lower()
+        return _is_main_py() or _env_bool("SUMMARY_MAIN_ENTRY_ONLY", False) or role in {"entry_only", "main_entry_only", "read_only", "no_save"}
+    except Exception:
+        return _is_main_py()
+
+
+def _executor() -> ThreadPoolExecutor:
+    global _AI_EXECUTOR
+    if _AI_EXECUTOR is None:
+        _AI_EXECUTOR = ThreadPoolExecutor(
+            max_workers=max(1, _env_int("SUMMARY_MAIN_ASYNC_AI_WORKERS", 1)),
+            thread_name_prefix="summary-main-ai-async",
+        )
+    return _AI_EXECUTOR
+
+
+def _normalize_dt(s: Any) -> Any:
+    try:
+        return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
+    except Exception:
+        try:
+            return pd.to_datetime(s, errors="coerce", utc=True).dt.tz_convert(None)
+        except Exception:
+            return s
+
+
+def _normalize_df_light(df: pd.DataFrame, *, now: dt.datetime) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    try:
+        out = df.copy(deep=False)
+        out = out.loc[:, ~pd.Index(out.columns).duplicated()].copy()
+        if "datetime" in out.columns:
+            out["datetime"] = _normalize_dt(out["datetime"])
+            cutoff = pd.Timestamp(now).tz_localize(None)
+            out = out[out["datetime"].isna() | (out["datetime"] <= cutoff)]
+        if "symbol" in out.columns:
+            out["symbol"] = out["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+            out = out[out["symbol"].ne("")]
+        return out.reset_index(drop=True)
+    except Exception:
+        logger.exception("[SUMMARY MAIN LIGHT TICK] normalize failed")
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+
+def _num_series(df: pd.DataFrame, names: tuple[str, ...], default: float = 0.0) -> pd.Series:
+    for name in names:
+        try:
+            if name in df.columns:
+                return pd.to_numeric(df[name], errors="coerce").fillna(default).astype(float)
+        except Exception:
+            continue
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
+def _score_profile(df: Any) -> dict[str, Any]:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {"rows": 0, "score_nonzero": 0, "buy_pos": 0, "sell_pos": 0, "latest": None, "age": None}
+        buy = _num_series(df, ("ai_disp_buy_score", "config_buy_score", "score_buy", "buy_score", "buy", "buy_signal_score"), 0.0)
+        sell = _num_series(df, ("ai_disp_sell_score", "config_sell_score", "score_sell", "sell_score", "sell", "sell_signal_score"), 0.0).abs()
+        total = _num_series(df, ("ai_disp_total_score", "score_total", "total_score", "combined_score", "final_score", "display_score", "score"), 0.0)
+        latest = None
+        age = None
+        if "datetime" in df.columns:
+            try:
+                dts = pd.to_datetime(df["datetime"], errors="coerce")
+                try:
+                    dts = dts.dt.tz_localize(None)
+                except Exception:
+                    pass
+                latest_ts = dts.max()
+                if pd.notna(latest_ts):
+                    latest = latest_ts.to_pydatetime() if hasattr(latest_ts, "to_pydatetime") else latest_ts
+                    age = (dt.datetime.now().replace(tzinfo=None) - latest.replace(tzinfo=None)).total_seconds()
+            except Exception:
+                pass
+        return {
+            "rows": len(df),
+            "score_nonzero": int(((buy.abs() > 0) | (sell.abs() > 0) | (total.abs() > 0)).sum()),
+            "buy_pos": int((buy > 0).sum()),
+            "sell_pos": int((sell > 0).sum()),
+            "total_pos": int((total > 0).sum()),
+            "total_neg": int((total < 0).sum()),
+            "buy_max": float(buy.max()) if len(buy) else 0.0,
+            "sell_max": float(sell.max()) if len(sell) else 0.0,
+            "latest": latest,
+            "age": age,
+        }
+    except Exception:
+        return {"rows": 0, "score_nonzero": 0, "buy_pos": 0, "sell_pos": 0, "latest": None, "age": None}
+
+
+def _fresh_enough(df: pd.DataFrame) -> bool:
+    prof = _score_profile(df)
+    age = prof.get("age")
+    if age is None:
+        return True
+    return float(age) <= _env_float("SUMMARY_MAIN_AI_MAX_SCORE_AGE_SEC", 300.0)
+
+
+def _get_scored_context_summary(*, now: dt.datetime) -> pd.DataFrame:
+    if not _env_bool("SUMMARY_MAIN_AI_USE_SCORED_CONTEXT", True):
+        return pd.DataFrame()
+    try:
+        import core.global_context.context as ctx
+        calls = (
+            ("get_push_merged_summary", {"tf": 1}),
+            ("get_push_merged_summary", {"interval": 1}),
+            ("get_merged_summary", {"tf": 1, "source": "push"}),
+            ("get_merged_summary", {"interval": 1, "source": "push"}),
+            ("get_push_summary", {"tf": 1}),
+            ("get_push_summary", {"interval": 1}),
+        )
+        best = pd.DataFrame()
+        best_prof: dict[str, Any] = {"score_nonzero": -1, "age": None}
+        best_name = ""
+        for name, kwargs in calls:
+            fn = getattr(ctx, name, None)
+            if not callable(fn):
+                continue
+            try:
+                df = fn(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            x = _normalize_df_light(df, now=now) if isinstance(df, pd.DataFrame) else pd.DataFrame()
+            if x.empty:
+                continue
+            prof = _score_profile(x)
+            if int(prof.get("score_nonzero", 0) or 0) <= 0:
+                continue
+            if not _fresh_enough(x):
+                logger.warning(
+                    "[SUMMARY MAIN AI INPUT GUARD] skip stale scored context source=%s rows=%s latest=%s age=%s score_nonzero=%s",
+                    name, prof.get("rows"), prof.get("latest"), prof.get("age"), prof.get("score_nonzero"),
+                )
+                continue
+            if int(prof.get("score_nonzero", 0)) > int(best_prof.get("score_nonzero", -1)):
+                best = x
+                best_prof = prof
+                best_name = name
+        if isinstance(best, pd.DataFrame) and not best.empty:
+            logger.warning(
+                "[SUMMARY MAIN AI INPUT GUARD] selected scored context source=%s rows=%s latest=%s age=%s score_nonzero=%s buy_pos=%s sell_pos=%s",
+                best_name, best_prof.get("rows"), best_prof.get("latest"), best_prof.get("age"), best_prof.get("score_nonzero"), best_prof.get("buy_pos"), best_prof.get("sell_pos"),
+            )
+            return best
+    except Exception:
+        logger.exception("[SUMMARY MAIN AI INPUT GUARD] scored context lookup failed")
+    return pd.DataFrame()
+
+
+def _prepare_ai_submit_df(df: pd.DataFrame, *, interval: int, now: dt.datetime, reason: str) -> pd.DataFrame:
+    x = _normalize_df_light(df, now=now)
+    if x.empty:
+        return x
+    if int(interval) != 1 or not _env_bool("SUMMARY_MAIN_AI_REQUIRE_SCORED_INPUT", True):
+        return x
+    prof = _score_profile(x)
+    has_score = int(prof.get("score_nonzero", 0) or 0) > 0
+    is_fresh = _fresh_enough(x)
+    if has_score and is_fresh:
+        logger.warning(
+            "[SUMMARY MAIN AI INPUT GUARD] using current scored df rows=%s latest=%s age=%s score_nonzero=%s buy_pos=%s sell_pos=%s reason=%s",
+            prof.get("rows"), prof.get("latest"), prof.get("age"), prof.get("score_nonzero"), prof.get("buy_pos"), prof.get("sell_pos"), reason,
+        )
+        return x
+    repl = _get_scored_context_summary(now=now)
+    if isinstance(repl, pd.DataFrame) and not repl.empty:
+        rprof = _score_profile(repl)
+        logger.warning(
+            "[SUMMARY MAIN AI INPUT GUARD] replaced AI input current_rows=%s current_score_nonzero=%s current_latest=%s current_age=%s replacement_rows=%s replacement_score_nonzero=%s replacement_latest=%s replacement_age=%s reason=%s",
+            prof.get("rows"), prof.get("score_nonzero"), prof.get("latest"), prof.get("age"),
+            rprof.get("rows"), rprof.get("score_nonzero"), rprof.get("latest"), rprof.get("age"), reason,
+        )
+        return repl
+    logger.warning(
+        "[SUMMARY MAIN AI INPUT GUARD] async AI skipped reason=no_fresh_scored_df current_rows=%s current_score_nonzero=%s latest=%s age=%s submit_reason=%s",
+        prof.get("rows"), prof.get("score_nonzero"), prof.get("latest"), prof.get("age"), reason,
+    )
+    return pd.DataFrame()
+
+
+def _install_no_raw_db_watchdog() -> bool:
+    """main.py 1分足の raw/DB fallback 禁止ガード。
+
+    旧 core/startup/summary_main_no_raw_db_fallback_watchdog_patch は削除した。
+    同パッチの _patch_loader_once() は、fallback_loader 側に
+    _main_1m_raw_db_fallback_blocked() が存在する場合はラップせず即 return する
+    設計で、その関数は fallback_loader.py:546 に既に本文化済みだったため、
+    差し替えは一度も行われていなかった (45回×1秒の watchdog も同じ早期returnを
+    繰り返すだけだった)。
+    残っていた env setdefault 3件も実効が無いことを確認済み:
+      - SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK: fallback_loader.py:111 が
+        モジュール読み込み時に同じ "1" を setdefault 済み。読み手の既定も True。
+      - SUMMARY_MAIN_SKIP_PUSH_DB_FALLBACK: 下の _install_light_tick 側で
+        同じ "1" を setdefault 済み。読み手の既定も True。
+      - PUSH_SUMMARY_RAW_DB_FALLBACK_ENABLED_IN_MAIN: 読み手がリポジトリに存在しない。
+    ガード本体は scheduler_jobs/summary/fallback_loader.py が持っている。
+    """
+    return True
+
+
+def _submit_async_ai(df: pd.DataFrame, *, interval: int, now: dt.datetime, run_entry: bool, reason: str) -> None:
+    if not (_is_entry_only_context() and _env_bool("SUMMARY_MAIN_ASYNC_AI_ENTRY", True) and run_entry and int(interval) in (1, 3, 5)):
+        return
+    now_i = (now or dt.datetime.now()).replace(microsecond=0) if isinstance(now, dt.datetime) else dt.datetime.now().replace(microsecond=0)
+    df_ai = _prepare_ai_submit_df(df, interval=int(interval), now=now_i, reason=reason)
+    rows = len(df_ai) if isinstance(df_ai, pd.DataFrame) else 0
+    if rows <= 0:
+        logger.warning("[SUMMARY MAIN LIGHT TICK] async AI not submitted interval=%s reason=%s rows=0", interval, reason)
+        return
+    key = f"summary-ai:{int(interval)}:{now_i.strftime('%Y%m%d%H%M%S')}"
+    with _AI_LOCK:
+        if key in _AI_RUNNING_KEYS:
+            logger.warning("[SUMMARY MAIN LIGHT TICK] async AI skipped already_running key=%s rows=%s", key, rows)
+            return
+        _AI_RUNNING_KEYS.add(key)
+    df_copy = df_ai.copy(deep=False)
+
+    def _task() -> None:
+        try:
+            prof = _score_profile(df_copy)
+            logger.warning(
+                "[SUMMARY MAIN LIGHT TICK] async AI start key=%s interval=%s rows=%s reason=%s latest=%s score_nonzero=%s buy_pos=%s sell_pos=%s",
+                key, interval, rows, reason, prof.get("latest"), prof.get("score_nonzero"), prof.get("buy_pos"), prof.get("sell_pos"),
+            )
+            from scheduler_jobs.summary.summary_ai_entry_hook_v20 import run_summary_ai_entry_safe
+            run_summary_ai_entry_safe(interval=int(interval), now=now_i, df=df_copy, source="SUMMARY")
+        except Exception:
+            logger.exception("[SUMMARY MAIN LIGHT TICK] async AI failed key=%s interval=%s", key, interval)
+        finally:
+            with _AI_LOCK:
+                _AI_RUNNING_KEYS.discard(key)
+            logger.warning("[SUMMARY MAIN LIGHT TICK] async AI done key=%s interval=%s", key, interval)
+
+    _executor().submit(_task)
+    logger.warning("[SUMMARY MAIN LIGHT TICK] async AI submitted key=%s interval=%s rows=%s reason=%s", key, interval, rows, reason)
+
+
+def build_light_1m_summary(interval: int, *, now: dt.datetime, display: bool = True, run_entry: bool = True, **kwargs) -> pd.DataFrame:
+    """本物の push summary runner を呼ぶが、保存/表示はスキップして高速化する経路。
+    旧 job_summary_light の本体。呼び出し元 (scheduler_jobs/summary/runner_core.py の
+    job_summary tier2) が _is_entry_only_context() / interval==1 の事前条件を確認してから呼ぶ。
+    失敗時・空の場合は空の DataFrame を返すのみで、呼び出し元が基底の job_summary へ
+    フォールバックする。"""
+    import scheduler_jobs.summary.runner_core as rc
+
+    interval_i = int(interval)
+    now_i = (now or rc.now_naive()).replace(microsecond=0)
+    t0 = time.perf_counter()
+    try:
+        _install_no_raw_db_watchdog()
+        # P0-1: 重い段の手前で予算を確認できるように、tier2 の中を割る。
+        try:
+            from scheduler_jobs.summary import stage_tracker as _st
+        except Exception:
+            _st = None
+
+        runner = rc.resolve_push_summary_runner()
+        if not callable(runner):
+            raise RuntimeError("push summary runner is not available")
+        logger.warning("[SUMMARY MAIN LIGHT TICK] light job start interval=%s display=%s run_entry=%s now=%s", interval_i, display, run_entry, now_i)
+
+        if _st is not None and _st.should_stop("light_before_runner"):
+            logger.warning("[SUMMARY MAIN LIGHT TICK] cooperative stop before runner interval=%s elapsed=%.3fs",
+                           interval_i, time.perf_counter() - t0)
+            return pd.DataFrame()
+
+        if _st is not None:
+            with _st.stage("light_push_runner"):
+                result = rc.call_runner_with_optional_now(runner, interval=interval_i, now=now_i, **kwargs)
+        else:
+            result = rc.call_runner_with_optional_now(runner, interval=interval_i, now=now_i, **kwargs)
+        df, meta = rc.normalize_runner_output(result)
+
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            # fallback は NAS を触りうるので、予算が尽きていたらここで降りる。
+            if _st is not None and _st.should_stop("light_before_fallback"):
+                logger.warning("[SUMMARY MAIN LIGHT TICK] budget exhausted before fallback interval=%s elapsed=%.3fs",
+                               interval_i, time.perf_counter() - t0)
+                return pd.DataFrame()
+            logger.warning("[SUMMARY MAIN LIGHT TICK] light runner empty interval=%s -> fallback", interval_i)
+            if _st is not None:
+                with _st.stage("light_fallback"):
+                    df = rc.fallback_push_summary_df(interval_i, now=now_i)
+            else:
+                df = rc.fallback_push_summary_df(interval_i, now=now_i)
+
+        if _st is not None:
+            with _st.stage("light_normalize"):
+                df = _normalize_df_light(df, now=now_i)
+        else:
+            df = _normalize_df_light(df, now=now_i)
+        if not df.empty:
+            try:
+                rc.log_job_result("job_summary(PUSH-LIGHT)", interval_i, df, meta if isinstance(meta, dict) else {})
+            except Exception:
+                pass
+            # AI/Entry の submit は予算切れでも実行する。
+            # ここを飛ばすと候補が作られず発注が消えるため。
+            if _st is not None:
+                with _st.stage("light_ai_submit"):
+                    _submit_async_ai(df, interval=interval_i, now=now_i, run_entry=run_entry, reason="early_after_runner")
+            else:
+                _submit_async_ai(df, interval=interval_i, now=now_i, run_entry=run_entry, reason="early_after_runner")
+        logger.warning("[SUMMARY MAIN LIGHT TICK] light job return interval=%s rows=%s elapsed=%.3fs display_skipped=%s", interval_i, len(df) if isinstance(df, pd.DataFrame) else 0, time.perf_counter() - t0, not _env_bool("SUMMARY_MAIN_LIGHT_DISPLAY", False))
+        if _env_bool("SUMMARY_MAIN_LIGHT_DISPLAY", False):
+            try:
+                rc._display_push_sync_or_async(df, interval_i, now_i, display)
+            except Exception:
+                logger.exception("[SUMMARY MAIN LIGHT TICK] optional display submit failed interval=%s", interval_i)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        logger.exception("[SUMMARY MAIN LIGHT TICK] light job build failed interval=%s", interval_i)
+        return pd.DataFrame()
+
+
+def skip_sync_save_in_main(df: pd.DataFrame, interval: int, *, source: str) -> bool:
+    """main (entry-only) では 1m summary の同期 DB 保存をスキップするか。
+
+    True を返したら呼び出し側は保存せずに return する。
+    保存の担当は main_database.py 側。
+
+    旧構成では install() が scheduler_jobs.summary.runner_core._save_summary_if_owner
+    を _save_light で差し替えていた。ラッパは呼び出しのたびに
+    _is_entry_only_context() と SUMMARY_MAIN_SKIP_SYNC_SAVE を見ていたので、
+    その判定をそのままこの関数へ移し、runner_core 側から直接呼ぶ形にした。
+    """
+    if _is_entry_only_context() and _env_bool("SUMMARY_MAIN_SKIP_SYNC_SAVE", True):
+        logger.warning(
+            "[SUMMARY MAIN LIGHT TICK] sync save skipped in main interval=%s source=%s rows=%s reason=database_owner_main_database",
+            interval, source, len(df) if isinstance(df, pd.DataFrame) else 0,
+        )
+        return True
+    return False
+
+
+def handle_push_ai_entry_in_main(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> bool:
+    """main (entry-only) では同期 AI hook の代わりに非同期 submit する。
+
+    True を返したら呼び出し側は同期 hook を実行せずに return する。
+
+    旧構成では install() が scheduler_jobs.summary.runner_core
+    ._run_push_ai_entry_before_display を _ai_light で「置換」していた
+    (元実装は一切呼ばない)。install() 自体が _is_entry_only_context() で
+    非 main を弾いていたので、その条件をこの関数の入口へ移した。
+    実際に submit するかどうかは _submit_async_ai 側が
+    SUMMARY_MAIN_ASYNC_AI_ENTRY / run_entry / interval で再判定する
+    (旧ラッパと同じく、submit しなくても同期 hook へは戻さない)。
+    """
+    if not _is_entry_only_context():
+        return False
+    _submit_async_ai(df, interval=int(interval), now=now, run_entry=run_entry, reason="original_ai_hook_async")
+    return True
+
+
+def install() -> bool:
+    global _INSTALLED
+    if _INSTALLED:
+        return True
+    if not _is_entry_only_context():
+        logger.warning("[SUMMARY MAIN LIGHT TICK] skipped non-main context version=%s", VERSION)
+        return False
+    try:
+        os.environ.setdefault("SUMMARY_MAIN_ASYNC_AI_ENTRY", "1")
+        os.environ.setdefault("SUMMARY_MAIN_SKIP_SYNC_SAVE", "1")
+        os.environ.setdefault("SUMMARY_MAIN_ASYNC_AI_WORKERS", "1")
+        os.environ.setdefault("SUMMARY_MAIN_EARLY_RETURN_AFTER_AI_SUBMIT", "1")
+        os.environ.setdefault("SUMMARY_MAIN_LIGHT_DISPLAY", "0")
+        os.environ.setdefault("SUMMARY_MAIN_LOAD_DB_HISTORY", "1")
+        os.environ.setdefault("SUMMARY_MAIN_HISTORY_BARS", "90")
+        os.environ.setdefault("SUMMARY_MAIN_HISTORY_LOOKBACK_MIN", "180")
+        os.environ.setdefault("SUMMARY_MAIN_HISTORY_MAX_SYMBOLS", "160")
+        os.environ.setdefault("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK", "1")
+        os.environ.setdefault("SUMMARY_MAIN_SKIP_PUSH_DB_FALLBACK", "1")
+        os.environ.setdefault("SUMMARY_MAIN_AI_REQUIRE_SCORED_INPUT", "1")
+        os.environ.setdefault("SUMMARY_MAIN_AI_USE_SCORED_CONTEXT", "1")
+        os.environ.setdefault("SUMMARY_MAIN_AI_MAX_SCORE_AGE_SEC", "300")
+        _install_no_raw_db_watchdog()
+
+        # runner_core._save_summary_if_owner / _run_push_ai_entry_before_display
+        # への差し替えは撤去した。runner_core 側が skip_sync_save_in_main() /
+        # handle_push_ai_entry_in_main() を tier1/tier2 と同じ形で直接呼ぶ。
+
+        # job_summary/run_push_summary_job/job_1m の差し替えは撤去した。
+        # scheduler_jobs/summary/runner_core.py の job_summary (tier2) が
+        # build_light_1m_summary() を直接呼ぶ形にインライン化済み。
+
+        _INSTALLED = True
+        logger.warning(
+            "[SUMMARY MAIN LIGHT TICK] installed version=%s main=%s db_history=%s no_raw_db=%s ai_scored_guard=%s ai_max_age=%s",
+            VERSION, _is_main_py(), os.getenv("SUMMARY_MAIN_LOAD_DB_HISTORY"), os.getenv("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK"),
+            os.getenv("SUMMARY_MAIN_AI_REQUIRE_SCORED_INPUT"), os.getenv("SUMMARY_MAIN_AI_MAX_SCORE_AGE_SEC"),
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY MAIN LIGHT TICK] install failed")
+        return False
+
+
+try:
+    install()
+except Exception:
+    logger.exception("[SUMMARY MAIN LIGHT TICK] auto install failed")
+
+__all__ = [
+    "VERSION",
+    "install",
+    "build_light_1m_summary",
+    "skip_sync_save_in_main",
+    "handle_push_ai_entry_in_main",
+    "_is_entry_only_context",
+    "_env_bool",
+]

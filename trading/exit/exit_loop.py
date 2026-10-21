@@ -98,6 +98,36 @@ def exit_loop_5s() -> None:
             pos = positions[symbol]
 
             try:
+                # 2026-10-03: 急騰銘柄の空売り (SURGE_SHORT) の建玉は、その戦略の
+                #   損切り (+5%) と時間決済 (60 分) だけで扱い、通常の決済ルールは通さない。
+                try:
+                    from trading.strategies.surge_short import handle_exit as _surge_handle_exit
+                    if _surge_handle_exit(symbol, pos, now) is not None:
+                        continue
+                except Exception:
+                    logger.exception("[EXIT LOOP] surge_short handle_exit failed symbol=%s", symbol)
+                # 2026-10-19: 日足の上がりすぎ売り (OVEREXT_SHORT) の建玉は 翌営業日 15:15 の時間決済と逆指値だけで扱う
+                try:
+                    from trading.strategies.overext_short import handle_exit as _overext_handle_exit
+                    if _overext_handle_exit(symbol, pos, now) is not None:
+                        continue
+                except Exception:
+                    logger.exception("[EXIT LOOP] overext_short handle_exit failed symbol=%s", symbol)
+                # 2026-10-06: セリングクライマックスの買い建玉は 損切り 1% / 30 分 で扱う
+                try:
+                    from trading.strategies.selling_climax import handle_exit as _climax_handle_exit
+                    if _climax_handle_exit(symbol, pos, now) is not None:
+                        continue
+                except Exception:
+                    logger.exception("[EXIT LOOP] selling_climax handle_exit failed symbol=%s", symbol)
+                # 2026-10-03: 殿様イナゴ由来の買い建玉は 損切り 1.5% / 60 分 で扱う
+                try:
+                    from trading.strategies.tonosama_exit import handle_exit as _tonosama_handle_exit
+                    if _tonosama_handle_exit(symbol, pos, now) is not None:
+                        continue
+                except Exception:
+                    logger.exception("[EXIT LOOP] tonosama_exit handle_exit failed symbol=%s", symbol)
+
                 # 通常のAI/トレーリング/時間EXITより先に、吹き上げ利確を確認する。
                 if _apply_blowoff_profit_take_safe(symbol, pos, regime):
                     continue

@@ -1,6 +1,6 @@
 # ============================================================
 # File   : utils/alerts_util.py
-# Version: Ver3.4-DISCORD-WEBHOOK-URL-GUARD
+# Version: Ver3.5-DISCORD-SECRET-MASK-AND-TRANSPORT-BREAKER
 # ------------------------------------------------------------
 # Discord通知ユーティリティ
 # - settings.ini の [discord] webhook_url を優先
@@ -9,17 +9,32 @@
 # - 長文分割対応
 # - SUMMARY/AI PASSED 系の横長1行通知を送信直前に3行化
 # - DataFrame repr が混入したSUMMARY見出しを送信直前に修復
+#
+# Ver3.5 (2026-09-01 の障害対応):
+# - 例外ログに Webhook URL 全体 (ID + トークン) がそのまま出ていた。
+#   ログもトレースバックも必ずマスクしてから出す。
+# - TLS 検証失敗 (CERTIFICATE_VERIFY_FAILED) が 385 件連続し、
+#   そのたびにフルトレースバックを吐いてログと負荷を膨らませていた。
+#   通信レイヤの失敗には指数バックオフのサーキットブレーカーを入れ、
+#   開いている間はネットワークに触らず即座に諦める。
+# - verify=False は使わない。CA は
+#   settings.ini [discord]/[alerts] ca_bundle -> REQUESTS_CA_BUNDLE /
+#   SSL_CERT_FILE -> certifi の順で解決する。
+#   それでも解決できない場合は環境要因 (TLS 傍受プロキシ等) なので、
+#   検証を無効化せず診断ログを出して運用側へ回す。
 # ============================================================
 
 from __future__ import annotations
 
 import configparser
 import logging
+import os
 import re
 import time
+import traceback
 from datetime import datetime
 from threading import Lock
-from typing import Any, Callable, Iterable, List, Optional
+from typing import Any, Callable, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -42,6 +57,48 @@ DEFAULT_MAX_LEN = 1800
 
 _last_send_time = 0.0
 _send_lock = Lock()
+
+# 2026-09-09: 送信のたびに requests.post を呼ぶと、その都度 TLS ハンドシェイクが
+# 走る。この送信は summary の tick の中から呼ばれるため、ハンドシェイクの時間が
+# そのまま 25 秒バジェットを押し上げていた (py-spy 実測で、summary ワーカー
+# スレッドのサンプルの 5.2% が ssl_wrap_socket だった)。接続を使い回す。
+_session: Optional["requests.Session"] = None
+_session_lock = Lock()
+
+
+def _get_session() -> "requests.Session":
+    """Discord 送信用の使い回しセッション。keep-alive で TLS を張り直さない。"""
+    global _session
+    s = _session
+    if s is not None:
+        return s
+    with _session_lock:
+        if _session is None:
+            _session = requests.Session()
+        return _session
+
+# ------------------------------------------------------------
+# 通信失敗のサーキットブレーカー
+# ------------------------------------------------------------
+# TLS 検証失敗のように「同じ条件では必ず失敗する」障害で連打しないため。
+# HTTP 応答が返った失敗 (4xx/5xx) は対象外。応答が返っている＝通信は生きている。
+_TRANSPORT_BACKOFF_SEC = (30.0, 60.0, 300.0, 900.0)
+_breaker_lock = Lock()
+_breaker_open_until = 0.0
+_breaker_streak = 0
+_breaker_last_error = ""
+_breaker_skips = 0
+_breaker_last_skip_log = 0.0
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).strip())
+    except Exception:
+        return float(default)
 
 _PLACEHOLDER_WEBHOOK_VALUES = {
     "",
@@ -77,6 +134,229 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return default
+
+
+# ------------------------------------------------------------
+# 秘密値マスク
+# ------------------------------------------------------------
+# Webhook URL は「ID + トークン」でそのまま投稿権限になる。
+# 例外メッセージ / トレースバックには URL がそのまま入るので、
+# ログへ出す前に必ずここを通す。
+_WEBHOOK_URL_RE = re.compile(
+    r"(https?://[^\s'\"]*?/api/webhooks/)(\d+)/([A-Za-z0-9._\-]+)",
+    re.IGNORECASE,
+)
+_WEBHOOK_PATH_RE = re.compile(
+    r"(/api/webhooks/)(\d+)/([A-Za-z0-9._\-]+)",
+    re.IGNORECASE,
+)
+
+
+def _mask_webhook_url(url: Optional[str]) -> str:
+    """ログ出力用にマスクした Webhook URL を返す。
+
+    ホスト名だけは診断に要るので残し、ID とトークンは伏せる。
+    """
+    s = _safe_str(url).strip()
+    if not s:
+        return "(unset)"
+    masked = _WEBHOOK_URL_RE.sub(r"\1***/***", s)
+    if masked != s:
+        return masked
+    try:
+        parsed = urlparse(s)
+        if parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}/***"
+    except Exception:
+        pass
+    return "***"
+
+
+def _mask_secrets(text: Any) -> str:
+    """任意のテキスト (例外文字列 / トレースバック) から秘密値を落とす。"""
+    s = _safe_str(text)
+    if not s:
+        return s
+    s = _WEBHOOK_URL_RE.sub(r"\1***/***", s)
+    s = _WEBHOOK_PATH_RE.sub(r"\1***/***", s)
+    # 設定済みの実 URL が別形式で混ざっていても必ず落とす。
+    try:
+        real = _safe_str(DISCORD_WEBHOOK).strip()
+        if real and real in s:
+            s = s.replace(real, _mask_webhook_url(real))
+    except Exception:
+        pass
+    return s
+
+
+# ------------------------------------------------------------
+# CA バンドル解決 (verify=False は使わない)
+# ------------------------------------------------------------
+_ca_bundle_cache: Optional[Any] = None
+
+
+def _resolve_ca_bundle() -> Any:
+    """requests に渡す verify 値を返す。
+
+    優先順位:
+      1. settings.ini [discord]/[alerts] ca_bundle
+      2. 環境変数 REQUESTS_CA_BUNDLE / SSL_CERT_FILE
+      3. certifi.where()
+      4. True (requests 既定)
+
+    verify=False は返さない。TLS 検証は落とさない。
+    """
+    global _ca_bundle_cache
+    if _ca_bundle_cache is not None:
+        return _ca_bundle_cache
+
+    for section in ("discord", "alerts", "Alerts"):
+        try:
+            if conf.has_section(section):
+                v = _safe_str(conf.get(section, "ca_bundle", fallback="")).strip()
+                if v and os.path.exists(v):
+                    logger.info("[DISCORD TLS] CA bundle from settings.ini [%s] ca_bundle", section)
+                    _ca_bundle_cache = v
+                    return _ca_bundle_cache
+        except Exception:
+            continue
+
+    for env_name in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        v = _safe_str(os.getenv(env_name)).strip()
+        if v and os.path.exists(v):
+            logger.info("[DISCORD TLS] CA bundle from env %s", env_name)
+            _ca_bundle_cache = v
+            return _ca_bundle_cache
+
+    # certifi だけでは足りない環境がある (2026-09-01 実測)。
+    # この PC はセキュリティソフトが TLS を傍受しており、差し替え後の
+    # 証明書の発行元は Windows 証明書ストアにしか無いため、
+    # certifi 単体だと CERTIFICATE_VERIFY_FAILED になる。
+    #   certifi のみ                -> discord.com 検証失敗
+    #   certifi + Windows ROOT 合成 -> discord.com status 200
+    # verify=False にはせず、この PC が実際に信頼している CA を足す。
+    try:
+        from utils.ca_bundle import build_bundle
+
+        merged = build_bundle()
+        if merged and os.path.exists(merged):
+            logger.warning(
+                "[DISCORD TLS] CA bundle = certifi + Windows 証明書ストア合成 path=%s "
+                "(TLS 検証は維持)",
+                merged,
+            )
+            _ca_bundle_cache = merged
+            return _ca_bundle_cache
+    except Exception:
+        logger.debug("[DISCORD TLS] merged CA bundle unavailable", exc_info=True)
+
+    try:
+        import certifi
+
+        path = certifi.where()
+        if path and os.path.exists(path):
+            _ca_bundle_cache = path
+            return _ca_bundle_cache
+    except Exception:
+        logger.debug("[DISCORD TLS] certifi unavailable", exc_info=True)
+
+    _ca_bundle_cache = True
+    return _ca_bundle_cache
+
+
+# ------------------------------------------------------------
+# 通信失敗ブレーカー
+# ------------------------------------------------------------
+
+def _is_transport_failure(exc: BaseException) -> bool:
+    """HTTP 応答が返らなかった種類の失敗か。"""
+    return isinstance(
+        exc,
+        (
+            requests.exceptions.SSLError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ProxyError,
+        ),
+    )
+
+
+def _breaker_blocked() -> Tuple[bool, float]:
+    global _breaker_skips, _breaker_last_skip_log
+    with _breaker_lock:
+        now = time.monotonic()
+        if _breaker_open_until <= now:
+            return False, 0.0
+        wait = _breaker_open_until - now
+        _breaker_skips += 1
+        should_log = (now - _breaker_last_skip_log) >= 60.0
+        if should_log:
+            _breaker_last_skip_log = now
+    if should_log:
+        logger.warning(
+            "⚠️ Discord送信スキップ: 通信ブレーカーが開いています retry_in=%.0fs streak=%d skips=%d err=%s",
+            wait, _breaker_streak, _breaker_skips, _mask_secrets(_breaker_last_error)[:160],
+        )
+    return True, wait
+
+
+def _breaker_note_success() -> None:
+    global _breaker_open_until, _breaker_streak, _breaker_last_error, _breaker_skips
+    with _breaker_lock:
+        recovered = _breaker_streak > 0
+        _breaker_open_until = 0.0
+        _breaker_streak = 0
+        _breaker_last_error = ""
+        skips = _breaker_skips
+        _breaker_skips = 0
+    if recovered:
+        logger.warning("✅ Discord通信ブレーカーを閉じました (復旧) skipped_while_open=%d", skips)
+
+
+def _breaker_note_transport_failure(exc: BaseException) -> float:
+    global _breaker_open_until, _breaker_streak, _breaker_last_error
+    scale = max(0.0, _env_float("DISCORD_TRANSPORT_BACKOFF_SCALE", 1.0))
+    with _breaker_lock:
+        idx = min(_breaker_streak, len(_TRANSPORT_BACKOFF_SEC) - 1)
+        wait = _TRANSPORT_BACKOFF_SEC[idx] * scale
+        _breaker_streak += 1
+        _breaker_last_error = f"{type(exc).__name__}: {exc}"
+        _breaker_open_until = time.monotonic() + wait
+        streak = _breaker_streak
+    logger.error(
+        "❌ Discord通信失敗 (%s) -> %.0fs バックオフ streak=%d detail=%s "
+        "（verify=False にはしません。CA/プロキシ設定を確認してください）",
+        type(exc).__name__, wait, streak, _mask_secrets(exc)[:300],
+    )
+    if streak == 1:
+        # 初回だけ、マスク済みトレースバックを DEBUG に残す。
+        logger.debug("[DISCORD TRANSPORT] %s", _mask_secrets(traceback.format_exc()))
+    return wait
+
+
+def discord_transport_status() -> dict:
+    with _breaker_lock:
+        now = time.monotonic()
+        return {
+            "open": _breaker_open_until > now,
+            "retry_in_sec": max(0.0, _breaker_open_until - now),
+            "streak": _breaker_streak,
+            "skips": _breaker_skips,
+            "last_error": _mask_secrets(_breaker_last_error)[:200],
+        }
+
+
+def reset_discord_transport_breaker() -> None:
+    """テスト / 手動復旧用。"""
+    global _breaker_open_until, _breaker_streak, _breaker_last_error, _breaker_skips, _breaker_last_skip_log
+    global _ca_bundle_cache
+    with _breaker_lock:
+        _breaker_open_until = 0.0
+        _breaker_streak = 0
+        _breaker_last_error = ""
+        _breaker_skips = 0
+        _breaker_last_skip_log = 0.0
+    _ca_bundle_cache = None
 
 
 def _is_valid_discord_webhook_url(url: Optional[str]) -> bool:
@@ -407,10 +687,20 @@ def _post_discord(payload, *, webhook_url: Optional[str] = None, timeout: int = 
         logger.warning("⚠️ Discord送信スキップ: payload empty")
         return False
 
+    # 通信ブレーカーが開いている間はネットワークに触らない。
+    blocked, _wait = _breaker_blocked()
+    if blocked:
+        return False
+
+    verify = _resolve_ca_bundle()
+
     with _send_lock:
         _wait_rate_limit()
         try:
-            r = requests.post(resolved_webhook, json=payload, timeout=timeout)
+            r = _get_session().post(resolved_webhook, json=payload, timeout=timeout, verify=verify)
+            # HTTP 応答が返った時点で通信レイヤは生きている。
+            _breaker_note_success()
+
             if r.status_code in (200, 204):
                 logger.info("✅ Discord送信成功 status=%s", r.status_code)
                 return True
@@ -419,26 +709,41 @@ def _post_discord(payload, *, webhook_url: Optional[str] = None, timeout: int = 
                 retry_after = _safe_float(r.headers.get("Retry-After", 1), 1.0)
                 logger.warning("Discord rate limit hit. sleeping %ss", retry_after)
                 time.sleep(retry_after)
-                r = requests.post(resolved_webhook, json=payload, timeout=timeout)
+                r = _get_session().post(resolved_webhook, json=payload, timeout=timeout, verify=verify)
                 if r.status_code in (200, 204):
                     logger.info("✅ Discord再送信成功 status=%s", r.status_code)
                     return True
-                logger.warning("⚠️ Discord retry response status=%s body=%s", r.status_code, getattr(r, "text", "")[:300])
+                logger.warning(
+                    "⚠️ Discord retry response status=%s body=%s",
+                    r.status_code, _mask_secrets(getattr(r, "text", ""))[:300],
+                )
                 return False
 
-            logger.warning("⚠️ Discord response status=%s body=%s", r.status_code, getattr(r, "text", "")[:300])
+            logger.warning(
+                "⚠️ Discord response status=%s body=%s",
+                r.status_code, _mask_secrets(getattr(r, "text", ""))[:300],
+            )
             return False
-        except requests.exceptions.MissingSchema as e:
-            logger.warning("⚠️ Discord送信スキップ: webhook_url 不正 err=%s", e)
-            return False
-        except requests.exceptions.InvalidSchema as e:
-            logger.warning("⚠️ Discord送信スキップ: webhook_url 不正 err=%s", e)
-            return False
-        except requests.exceptions.InvalidURL as e:
-            logger.warning("⚠️ Discord送信スキップ: webhook_url 不正 err=%s", e)
+        except (
+            requests.exceptions.MissingSchema,
+            requests.exceptions.InvalidSchema,
+            requests.exceptions.InvalidURL,
+        ) as e:
+            logger.warning(
+                "⚠️ Discord送信スキップ: webhook_url 不正 url=%s err=%s",
+                _mask_webhook_url(resolved_webhook), _mask_secrets(e)[:200],
+            )
             return False
         except Exception as e:
-            logger.error("❌ Discord送信エラー: %s", e, exc_info=True)
+            # 例外文字列にもトレースバックにも Webhook URL が入る。必ずマスクする。
+            if _is_transport_failure(e):
+                _breaker_note_transport_failure(e)
+            else:
+                logger.error(
+                    "❌ Discord送信エラー url=%s type=%s detail=%s",
+                    _mask_webhook_url(resolved_webhook), type(e).__name__, _mask_secrets(e)[:300],
+                )
+                logger.debug("[DISCORD SEND] %s", _mask_secrets(traceback.format_exc()))
             return False
 
 

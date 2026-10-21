@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import logging
+import os as _os
 from typing import Any
 
 import pandas as pd
@@ -98,6 +99,9 @@ logger = logging.getLogger(__name__)
 # constants
 # ============================================================
 
+# 以下 SNAPSHOT_PRELOAD_* / FULL_FALLBACK_* は
+# 「最大これだけ読む」という **読み上限** であって、
+# 「最低これだけ必要」という要件値ではない。
 SNAPSHOT_PRELOAD_MIN_BARS_1M = 400
 SNAPSHOT_PRELOAD_MIN_BARS_3M = 120
 SNAPSHOT_PRELOAD_MIN_BARS_5M = 120
@@ -112,6 +116,31 @@ DELTA_KEEP_RECENT_BARS_5M = 3
 HTF_SOURCE_BUFFER_BARS_1M = 12
 SMALL_DELTA_THRESHOLD_ROWS = 500
 FULL_FALLBACK_BARS_1M = 500
+
+# --- warmup 判定の最低本数 --------------------------------------
+# summaryYYYYMMDD.db は 1 日 1 ファイルで、1分足は 1 日あたり
+# 最大 ~300 本しか存在しない (実測: 08/19 max=344 median=77、
+# 450 本以上は 0/4136 銘柄)。
+# そのため SNAPSHOT_PRELOAD_MIN_BARS_1M + BUFFER = 450 を
+# _bars_ok() の合格基準に使うと構造的に必ず short になり、
+# 毎起動 summary tail -> push rebuild -> full fallback
+# (全銘柄 500 本の NAS 読み) まで落ちていた。
+# 実際の indicator 要件は MA75 = 75 本で、
+# trading/summary/recovery/loaders_summary.HISTORY_REQUIRED_HINT_BY_INTERVAL
+# も同じ 75 を required_hint として使っているのでそちらへ揃える。
+# 読み自体は従来通り 450 本上限のまま (取れるなら多く取る)。
+try:
+    WARMUP_REQUIRED_BARS_1M = max(1, int(_os.getenv("SUMMARY_WARMUP_REQUIRED_BARS_1M", "75") or 75))
+except Exception:
+    WARMUP_REQUIRED_BARS_1M = 75
+
+
+def _warmup_required(required_bars: int) -> int:
+    """読み上限 (required_bars) と warmup 最低本数の小さい方。"""
+    try:
+        return max(1, min(int(required_bars), int(WARMUP_REQUIRED_BARS_1M)))
+    except Exception:
+        return int(WARMUP_REQUIRED_BARS_1M)
 
 
 # ============================================================
@@ -525,7 +554,7 @@ def _merge_dense_tail_and_push_supplement(
             int(required_bars),
         )
 
-        _bars_ok(merged, required_bars, label="dense_1m_tail_plus_push")
+        _bars_ok(merged, _warmup_required(required_bars), label="dense_1m_tail_plus_push")
 
         log_source_date_breakdown(
             merged,
@@ -583,7 +612,7 @@ def _load_full_fallback_1m_history(
             anchor_day=anchor_day,
             required_bars_per_symbol=bars_to_load,
         )
-        _bars_ok(df, required_bars, label="dense_1m_full_fallback")
+        _bars_ok(df, _warmup_required(required_bars), label="dense_1m_full_fallback")
 
         return df
 
@@ -638,11 +667,13 @@ def _load_dense_1m_history_for_delta_symbols(
                     required_bars_per_symbol=required_bars,
                 )
 
-                if _bars_ok(dense_tail, required_bars, label="dense_1m_summary_tail"):
+                if _bars_ok(dense_tail, _warmup_required(required_bars), label="dense_1m_summary_tail"):
                     return dense_tail
 
                 logger.warning(
-                    "[summary_recovery] summary tail warmup insufficient -> merge push rebuild supplement required_bars=%d",
+                    "[summary_recovery] summary tail warmup insufficient -> merge push rebuild supplement "
+                    "warmup_required=%d load_cap=%d",
+                    _warmup_required(required_bars),
                     required_bars,
                 )
             else:
@@ -667,7 +698,7 @@ def _load_dense_1m_history_for_delta_symbols(
         anchor_day=anchor_day,
     )
 
-    if not merged.empty and _bars_ok(merged, required_bars, label="dense_1m_tail_plus_push_final"):
+    if not merged.empty and _bars_ok(merged, _warmup_required(required_bars), label="dense_1m_tail_plus_push_final"):
         return merged
 
     logger.warning(
@@ -1031,7 +1062,7 @@ def bootstrap_incremental_rebuild_from_push(
             anchor_day=anchor_day,
             required_bars_per_symbol=required_1m_bars,
         )
-        _bars_ok(full_1m_raw, required_1m_bars, label="full_1m_raw_before_indicators")
+        _bars_ok(full_1m_raw, _warmup_required(required_1m_bars), label="full_1m_raw_before_indicators")
 
         full_1m_raw = apply_indicators_and_scoring_tail(
             full_1m_raw,
@@ -1057,7 +1088,7 @@ def bootstrap_incremental_rebuild_from_push(
             anchor_day=anchor_day,
             required_bars_per_symbol=required_1m_bars,
         )
-        _bars_ok(full_1m_raw, required_1m_bars, label="full_1m_raw_after_indicators")
+        _bars_ok(full_1m_raw, _warmup_required(required_1m_bars), label="full_1m_raw_after_indicators")
 
         delta_1m_raw = full_1m_raw.copy()
 

@@ -42,9 +42,13 @@ from typing import Any, Dict, Iterable, List, Optional
 import numpy as np
 import pandas as pd
 
+# P0-2/P0-9: `with sqlite3.connect(...)` は close しないため必ずこちらを使う。
+from database.sqlite_util import closing_connect, readonly_connect
+from nas_root import nas_path, nas_root
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_RANKING_DIR = r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking"
+DEFAULT_RANKING_DIR = nas_path(r"raw_data\kabu_station\ranking")
 TABLE_NAME = "ranking_technical_1min"
 
 
@@ -149,6 +153,41 @@ os.environ.setdefault("RANKING_ENTRY_FAST_MAX_PER_SIDE", "22")
 os.environ.setdefault("RANKING_ENTRY_FAST_MAX_PER_TYPE", "10")
 
 _TECH_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# P0-9: テーブルが存在しないことの負のキャッシュ。
+# RANKING_ENTRY_SKIP_TECH_SAVE=1 の既定では ranking_technical_1min を
+# 誰も作らないため、毎 tick NAS へ sqlite_master を引きに行って
+# 1.259 秒を捨てていた。恒久 skip ではなく TTL 付きで再確認する。
+os.environ.setdefault("RANKING_ENTRY_TECH_TABLE_PROBE_TTL_SEC", "60")
+_TECH_TABLE_MISSING_AT: Dict[str, float] = {}
+
+
+def _tech_table_probe_ttl() -> float:
+    return max(0.0, _env_float("RANKING_ENTRY_TECH_TABLE_PROBE_TTL_SEC", 60.0))
+
+
+def _tech_table_known_missing(db: str) -> float:
+    """直近で table_missing を確認済みなら、その経過秒を返す。無ければ -1。"""
+    ttl = _tech_table_probe_ttl()
+    if ttl <= 0:
+        return -1.0
+    ts = _TECH_TABLE_MISSING_AT.get(db)
+    if not ts:
+        return -1.0
+    age = dt.datetime.now().timestamp() - float(ts)
+    if age > ttl:
+        # TTL 切れ。次回また実際に確かめる (恒久 skip にしない)
+        _TECH_TABLE_MISSING_AT.pop(db, None)
+        return -1.0
+    return age
+
+
+def _tech_table_mark_missing(db: str) -> None:
+    _TECH_TABLE_MISSING_AT[db] = dt.datetime.now().timestamp()
+
+
+def _tech_table_mark_present(db: str) -> None:
+    _TECH_TABLE_MISSING_AT.pop(db, None)
 
 
 def _readonly_side(row: Dict[str, Any]) -> str:
@@ -283,12 +322,23 @@ def _read_latest_tech_from_db(db: str, symbols: List[str]) -> Dict[str, Dict[str
         return {}
     batch_size = max(10, _env_int("RANKING_ENTRY_TECH_READ_BATCH_SIZE", 40))
     chunks = []
-    with sqlite3.connect(db, timeout=1.5) as conn:
-        conn.execute("PRAGMA query_only=ON")
-        conn.execute("PRAGMA busy_timeout=1200")
+    # 直近で「テーブルが無い」と確認済みなら NAS を叩き直さない (TTL 付き)
+    _age = _tech_table_known_missing(db)
+    if _age >= 0:
+        logger.info(
+            "[RANKING TECH] readonly tech skipped reason=table_missing_cached "
+            "db=%s table=%s age=%.1fs ttl=%.0fs (TTL 経過後に再確認する)",
+            db, TABLE_NAME, _age, _tech_table_probe_ttl(),
+        )
+        return {}
+    # `with sqlite3.connect(...)` は close しない (transaction の CM)。
+    # Ranking Entry は毎 tick 走るのでここが leak の温床になる。
+    with readonly_connect(db, timeout=1.5, busy_timeout_ms=1200) as conn:
         if not _table_exists(conn, TABLE_NAME):
+            _tech_table_mark_missing(db)
             logger.warning("[RANKING TECH] readonly tech skipped reason=table_missing db=%s table=%s", db, TABLE_NAME)
             return {}
+        _tech_table_mark_present(db)
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i:i + batch_size]
             placeholders = ",".join(["?"] * len(batch))
@@ -634,7 +684,67 @@ def _calc_one_symbol(g: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
+def _ranking_filter_rescue_period_volume_from_cumulative(
+    df: pd.DataFrame, *, volume_col: str = "volume", datetime_col: str = "datetime"
+) -> pd.DataFrame:
+    """累計出来高を symbol + 当日単位で差分化し、対象足出来高へ変換する。
+
+    旧 core/startup/ranking_entry_filter_rescue_patch V1.7 の
+    _period_volume_from_cumulative を移設 (summary_incremental_engine._build_bars
+    にも同名ロジックを複製している。パッチ側も1つの関数を2箇所から使っていたのを
+    本文化にあたりファイルごとに複製した)。
+    """
+    if df is None or getattr(df, "empty", True) or volume_col not in df.columns:
+        return df
+    out = df.copy()
+    raw = pd.to_numeric(out[volume_col], errors="coerce").fillna(0.0)
+    out["_raw_cumulative_volume"] = raw
+    if "symbol" not in out.columns or datetime_col not in out.columns:
+        out["_period_volume"] = raw.clip(lower=0.0)
+        return out
+    dt_s = pd.to_datetime(out[datetime_col], errors="coerce")
+    out["_trade_date_for_volume"] = dt_s.dt.date
+    out["_volume_order"] = range(len(out))
+    out = out.sort_values(["symbol", "_trade_date_for_volume", datetime_col, "_volume_order"], kind="stable")
+    prev = out.groupby(["symbol", "_trade_date_for_volume"], sort=False)["_raw_cumulative_volume"].shift(1)
+    diff = out["_raw_cumulative_volume"] - prev
+    # 初回行は直前累計が不明なので0扱い。累計リセット/異常なマイナスも0にする。
+    period = diff.where(prev.notna(), 0.0)
+    period = period.where(period >= 0, 0.0).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    out["_period_volume"] = period
+    out = out.sort_values("_volume_order", kind="stable").drop(columns=["_volume_order", "_trade_date_for_volume"], errors="ignore")
+    return out
+
+
 def _calculate_technicals(history: pd.DataFrame) -> pd.DataFrame:
+    """ランキング履歴からテクニカル指標を計算する (期間出来高補正版)。
+
+    旧 core/startup/ranking_entry_filter_rescue_patch V1.7 が (env gate なしで
+    無条件に) この関数を差し替え、volume を累計値から期間出来高 (diff) に、
+    turnover を close×期間出来高に補正してから計算する形にしていた。常時有効
+    だったためそのまま本文化する。_calculate_technicals_core は補正前の
+    計算本体。
+    """
+    h = history.copy() if isinstance(history, pd.DataFrame) else pd.DataFrame()
+    if h.empty:
+        return _calculate_technicals_core(history)
+    if "datetime" in h.columns:
+        h["datetime"] = pd.to_datetime(h["datetime"], errors="coerce")
+        h = h.dropna(subset=["datetime"]).copy()
+    if "volume" in h.columns:
+        h = _ranking_filter_rescue_period_volume_from_cumulative(h, volume_col="volume", datetime_col="datetime")
+        h["cumulative_volume"] = h.get("_raw_cumulative_volume", h["volume"])
+        h["volume"] = h["_period_volume"]
+    if "turnover" in h.columns:
+        # 売買代金も累計の可能性が高い。volume差分×closeを優先して期間代金にする。
+        close = pd.to_numeric(h.get("close", 0), errors="coerce").fillna(0.0)
+        vol = pd.to_numeric(h.get("volume", 0), errors="coerce").fillna(0.0)
+        h["cumulative_turnover"] = pd.to_numeric(h["turnover"], errors="coerce").fillna(0.0)
+        h["turnover"] = close * vol
+    return _calculate_technicals_core(h)
+
+
+def _calculate_technicals_core(history: pd.DataFrame) -> pd.DataFrame:
     if history.empty:
         return history
     out = []
@@ -752,8 +862,10 @@ def save_ranking_pseudo_technicals(rows: List[Dict[str, Any]], lookback_rows: in
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         symbols = sorted(set(bars["symbol"].astype(str)))
 
-        with sqlite3.connect(path, timeout=30.0) as conn:
+        with closing_connect(path, timeout=30.0) as conn:
             _ensure_schema(conn)
+            # 書き込み経路を通ったのでテーブルは存在する
+            _tech_table_mark_present(path)
             _upsert_basic_bars(conn, bars)
             history = _load_history(conn, symbols, lookback_rows=lookback_rows)
             calc = _calculate_technicals(history)
@@ -765,6 +877,9 @@ def save_ranking_pseudo_technicals(rows: List[Dict[str, Any]], lookback_rows: in
                 else:
                     target = calc.copy()
                 _upsert_technicals(conn, target)
+            # closing_connect は commit しないので明示する
+            # (各 _upsert_* は内部で commit するが、取りこぼしを残さない)
+            conn.commit()
 
         latest = _latest_map(calc, symbols) if not calc.empty else {}
         logger.info(

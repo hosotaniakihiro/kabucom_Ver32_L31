@@ -321,6 +321,13 @@ def derive_summary_db_paths_for_dates(dates: Optional[Iterable[Any]]) -> list[st
         else:
             logger.warning("[summary_runtime] summary seed db file not found path=%s", p)
 
+    # 2026-09-17: 当日以外の DB はローカルへミラーしてから読む (NAS のランダム読みで 10〜30 分かかっていた)
+    try:
+        from trading.summary.summary_db_local_mirror import mirror_paths
+        existing = mirror_paths(existing)
+    except Exception:
+        logger.debug("[summary_runtime] local mirror skipped", exc_info=True)
+
     logger.info(
         "[summary_runtime] summary seed db paths resolved count=%d paths=%s",
         len(existing),

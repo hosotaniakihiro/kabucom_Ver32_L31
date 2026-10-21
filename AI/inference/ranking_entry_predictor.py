@@ -18,13 +18,79 @@ import joblib
 import numpy as np
 import logging
 import math
+import os
 
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
 # model path
 # ------------------------------------------------------------
-MODEL_FILE = Path("AI/model/ranking_entry_lgbm.pkl")
+# 以前は Path("AI/model/ranking_entry_lgbm.pkl") という相対パスで、
+# cwd 依存だった。リポジトリルート基準の絶対パスへ解決する。
+# env RANKING_ENTRY_MODEL_PATH で明示指定できる。
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+MODEL_FILENAME = "ranking_entry_lgbm.pkl"
+
+
+def _model_path_candidates() -> list[Path]:
+    out: list[Path] = []
+    try:
+        env = os.getenv("RANKING_ENTRY_MODEL_PATH")
+        if env and str(env).strip():
+            out.append(Path(str(env).strip()))
+    except Exception:
+        logger.exception("[RANKING AI] RANKING_ENTRY_MODEL_PATH read failed")
+    for rel in (
+        Path("AI") / "model" / MODEL_FILENAME,
+        Path("AI") / "models" / MODEL_FILENAME,
+    ):
+        out.append(_REPO_ROOT / rel)
+        out.append(Path.cwd() / rel)
+    # 重複除去 (順序維持)
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for c in out:
+        k = str(c)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(c)
+    return uniq
+
+
+def resolve_model_file() -> Path | None:
+    for c in _model_path_candidates():
+        try:
+            if c.exists():
+                return c
+        except Exception:
+            logger.exception("[RANKING AI] model path check failed path=%s", c)
+    return None
+
+
+_MISSING_LOGGED = False
+
+
+def model_available() -> bool:
+    """モデルが実在するか。無いことを 1 回だけログに残す。"""
+    global _MISSING_LOGGED
+    if _model is not None:
+        return True
+    found = resolve_model_file()
+    if found is not None:
+        return True
+    if not _MISSING_LOGGED:
+        _MISSING_LOGGED = True
+        logger.error(
+            "[RANKING AI] model=ABSENT ranking entry LGBM モデルが見つからない。"
+            " 以後この銘柄群の ranking AI 推論は行わず fail-open で通す "
+            "(confidence は AI 出力ではない)。探した場所=%s "
+            "env RANKING_ENTRY_MODEL_PATH で明示指定できる。",
+            [str(x) for x in _model_path_candidates()],
+        )
+    return False
+
+
+MODEL_FILE = resolve_model_file() or (_REPO_ROOT / "AI" / "model" / MODEL_FILENAME)
 
 # ------------------------------------------------------------
 # singleton
@@ -40,10 +106,14 @@ def _load_model():
     """
     global _model, _label_encoder
 
-    if not MODEL_FILE.exists():
-        raise FileNotFoundError(f"❌ ranking entry model not found: {MODEL_FILE}")
+    found = resolve_model_file()
+    if found is None:
+        raise FileNotFoundError(
+            "ranking entry model not found (model=ABSENT): %s"
+            % [str(x) for x in _model_path_candidates()]
+        )
 
-    obj = joblib.load(MODEL_FILE)
+    obj = joblib.load(found)
 
     _model = obj.get("model")
     _label_encoder = obj.get("label_encoder")
@@ -51,7 +121,7 @@ def _load_model():
     if _model is None or _label_encoder is None:
         raise ValueError("❌ invalid model file (missing model or label_encoder)")
 
-    logger.info("✅ ranking_entry_lgbm model loaded")
+    logger.info("✅ ranking_entry_lgbm model loaded path=%s", found)
 
 
 # ------------------------------------------------------------
@@ -168,6 +238,53 @@ def ranking_signal(row: dict) -> bool:
 
 
 # ------------------------------------------------------------
+def _derive_features(row: dict) -> dict:
+    """価格スケールに依存しない比率特徴量を row に足す (学習側 train_ranking_entry.py の
+    derive() と同じ名前・同じ式)。既にあるキーは上書きしない。"""
+    out = dict(row or {})
+
+    def f(k):
+        try:
+            v = float(out.get(k))
+            return v if not (math.isnan(v) or math.isinf(v)) else 0.0
+        except Exception:
+            return 0.0
+
+    close = f("close") or f("current_price") or f("price")
+
+    def gap(k):
+        v = f(k)
+        return (close / v - 1.0) if (v > 0 and close > 0) else 0.0
+
+    out.setdefault("ma5_gap", gap("ma5"))
+    out.setdefault("ma25_gap", gap("ma25"))
+    out.setdefault("ma75_gap", gap("ma75"))
+    m5, m25 = f("ma5"), f("ma25")
+    out.setdefault("ma5_ma25_gap", (m5 / m25 - 1.0) if (m5 > 0 and m25 > 0) else 0.0)
+    for k in ("macd", "signal", "hist"):
+        out.setdefault(f"{k}_pct", (f(k) / close) if close > 0 else 0.0)
+    out.setdefault("vwap_gap", gap("vwap"))
+    out.setdefault("log_volume", math.log1p(max(f("volume"), 0.0)))
+    if "minute_of_day" not in out:
+        try:
+            import datetime as _dt
+            dtv = out.get("datetime")
+            if not isinstance(dtv, _dt.datetime):
+                dtv = _dt.datetime.fromisoformat(str(dtv).replace("T", " ")[:19]) if dtv else _dt.datetime.now()
+            out["minute_of_day"] = dtv.hour * 60 + dtv.minute
+        except Exception:
+            out["minute_of_day"] = 0
+    return out
+
+
+def _legacy_signal_required() -> bool:
+    """旧 ma75_slope ベースの前段シグナルを必須にするか。
+    2026-09-15: ランキング行に ma75_slope が無いと常に NONE になり、entry_gate が
+    ranking_ai_mismatch で全件ブロックしてしまうため、既定では要求しない。"""
+    v = os.getenv("RANKING_AI_LEGACY_SIGNAL_REQUIRED", "0")
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def predict_entry(row: dict) -> dict:
     """
     ranking entry AI 推論
@@ -180,7 +297,9 @@ def predict_entry(row: dict) -> dict:
     # --------------------------------------------------------
     # ranking 最終シグナル（前段フィルタ）
     # --------------------------------------------------------
-    if not ranking_signal(row):
+    row = _derive_features(row)
+
+    if _legacy_signal_required() and not ranking_signal(row):
         return {
             "action": "NONE",
             "confidence": 0.0,

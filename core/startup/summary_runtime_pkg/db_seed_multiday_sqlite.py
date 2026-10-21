@@ -44,6 +44,7 @@ from .dataframe_utils import normalize_datetime_for_tf, dedupe_symbol_datetime, 
 from .db_seed_anchor import derive_summary_db_paths_for_dates
 from .db_seed_diagnostics import log_history_quality, safe_symbols_count
 from .db_seed_policy import get_summary_table, latest_dt
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -124,27 +125,46 @@ def _normalize_seed_df(
 # sqlite helpers
 # ============================================================
 
-def sqlite_table_exists(db_path: str, table: str) -> bool:
+def probe_summary_db(db_path: str, table: str) -> tuple[bool, str]:
+    """(tableがあるか, 理由) を返す。
+
+    旧実装の sqlite_table_exists() は sqlite の例外をすべて debug ログへ
+    抜いて False を返していたため、周辺ログでは
+      "テーブルが未作成" / "DBファイルが破損" / "ロックでタイムアウト"
+    の区別が一切つかなかった。
+    実際 2026-08-24 の起動では前営業日 DB が
+      DatabaseError: database disk image is malformed
+    だったのに "table not found" としか出ていなかった。
+    """
+    # sqlite3.connect() は存在しないパスでも空 DB を **作ってしまう**。
+    # summary フォルダに空の summaryYYYYMMDD.db を残さないよう先に存在確認する。
     try:
-        with sqlite3.connect(db_path, timeout=5.0) as con:
+        import os as _os
+
+        if not _os.path.exists(db_path):
+            return False, "file_missing"
+    except Exception:
+        pass
+    try:
+        with committing_connect(db_path, timeout=5.0) as con:
             row = con.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                 (table,),
             ).fetchone()
-            return row is not None
-    except Exception:
-        logger.debug(
-            "[summary_runtime] sqlite table exists failed db=%s table=%s",
-            db_path,
-            table,
-            exc_info=True,
-        )
-        return False
+            return (row is not None), ("ok" if row is not None else "table_missing")
+    except sqlite3.DatabaseError as e:
+        return False, "db_error:%s" % (e,)
+    except Exception as e:  # pragma: no cover - パス不正等
+        return False, "open_error:%r" % (e,)
+
+
+def sqlite_table_exists(db_path: str, table: str) -> bool:
+    return probe_summary_db(db_path, table)[0]
 
 
 def sqlite_table_columns(db_path: str, table: str) -> list[str]:
     try:
-        with sqlite3.connect(db_path, timeout=5.0) as con:
+        with committing_connect(db_path, timeout=5.0) as con:
             rows = con.execute(f'PRAGMA table_info("{table}")').fetchall()
             return [str(r[1]) for r in rows if len(r) > 1 and r[1]]
     except Exception:
@@ -323,12 +343,24 @@ def read_tail_from_one_summary_db(
     if not table:
         return pd.DataFrame()
 
-    if not sqlite_table_exists(db_path, table):
-        logger.warning(
-            "[summary_runtime] direct multi-day seed table not found db=%s table=%s",
-            db_path,
-            table,
-        )
+    exists, reason = probe_summary_db(db_path, table)
+    if not exists:
+        if reason.startswith("db_error") or reason.startswith("open_error"):
+            # テーブル未作成ではなく DB 自体が読めない。
+            # 履歴不足の直接原因になるので別メッセージで出す。
+            logger.error(
+                "[summary_runtime] direct multi-day seed db unreadable db=%s table=%s reason=%s "
+                "=> this day contributes 0 bars (history shortage cause)",
+                db_path,
+                table,
+                reason,
+            )
+        else:
+            logger.warning(
+                "[summary_runtime] direct multi-day seed table not found db=%s table=%s",
+                db_path,
+                table,
+            )
         return pd.DataFrame()
 
     cols = sqlite_table_columns(db_path, table)
@@ -423,7 +455,7 @@ def read_tail_from_one_summary_db(
     """
 
     try:
-        with sqlite3.connect(db_path, timeout=10.0) as con:
+        with committing_connect(db_path, timeout=10.0) as con:
             try:
                 df = pd.read_sql_query(sql_with_rowid, con, params=params)
             except Exception as e:
@@ -499,6 +531,46 @@ def _dates_iso_set(dates: Optional[Iterable[Any]]) -> set[str]:
     return out
 
 
+def _extra_lookback_db_paths(known_paths: list[str], max_extra_days: int) -> list[str]:
+    """known_paths と同じフォルダにある、より古い summaryYYYYMMDD.db を返す。
+
+    前営業日の DB が破損していたり欠落していると、当日分しか残らず
+    朝一番の起動では 1分足が数本しか無い状態になる。
+    その場合だけ、さらに古い日の DB へ遡って補う。
+    """
+    import os
+
+    if max_extra_days <= 0 or not known_paths:
+        return []
+    try:
+        folder = os.path.dirname(known_paths[0])
+        known = {os.path.normcase(os.path.abspath(x)) for x in known_paths}
+        cands = []
+        for name in os.listdir(folder):
+            m = re.fullmatch(r"summary(\d{8})\.db", name)
+            if not m:
+                continue
+            full = os.path.join(folder, name)
+            if os.path.normcase(os.path.abspath(full)) in known:
+                continue
+            cands.append((m.group(1), full))
+        # 新しい日から順に max_extra_days 件
+        cands.sort(key=lambda x: x[0], reverse=True)
+        return [full for _, full in cands[:max_extra_days]]
+    except Exception:
+        logger.debug("[summary_runtime] extra lookback scan failed", exc_info=True)
+        return []
+
+
+def _min_bars_per_symbol(df: "pd.DataFrame") -> int:
+    try:
+        if df is None or df.empty or "symbol" not in df.columns:
+            return 0
+        return int(df.groupby("symbol").size().min())
+    except Exception:
+        return 0
+
+
 def load_summary_seed_by_multiday_sqlite_direct(
     tf: int,
     *,
@@ -519,6 +591,7 @@ def load_summary_seed_by_multiday_sqlite_direct(
     allowed_dates = _dates_iso_set(dates)
 
     frames: list[pd.DataFrame] = []
+    missing_days: list[str] = []
 
     for p in db_paths:
         target_date = _db_target_date_iso(p)
@@ -542,6 +615,50 @@ def load_summary_seed_by_multiday_sqlite_direct(
         )
         if isinstance(one, pd.DataFrame) and not one.empty:
             frames.append(one)
+        else:
+            missing_days.append(p)
+
+    # 対象日のうち読めなかった日があり、かつ履歴が不足している場合に限り、
+    # さらに古い営業日の DB へ遡って補う。
+    # (正常時は余分な NAS 読みをしないよう条件を厳しくする)
+    if missing_days:
+        import os as _os
+
+        try:
+            max_extra = int(_os.getenv("SUMMARY_SEED_EXTRA_LOOKBACK_DAYS", "3") or 3)
+        except Exception:
+            max_extra = 3
+        try:
+            need = int(_os.getenv("SUMMARY_SEED_MIN_BARS_1M", "75") or 75) if int(tf) == 1 else 0
+        except Exception:
+            need = 75 if int(tf) == 1 else 0
+
+        cur = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+        have = _min_bars_per_symbol(cur)
+        if need > 0 and have < need:
+            extra_paths = _extra_lookback_db_paths(db_paths, max_extra)
+            logger.warning(
+                "[summary_runtime] direct multi-day seed extending lookback tf=%s "
+                "unreadable_or_empty=%s min_bars=%s need=%s extra_dbs=%s",
+                tf,
+                [str(x) for x in missing_days],
+                have,
+                need,
+                [str(x) for x in extra_paths],
+            )
+            for p in extra_paths:
+                one = read_tail_from_one_summary_db(
+                    db_path=p,
+                    tf=int(tf),
+                    bars_per_symbol=int(bars_per_symbol),
+                    max_allowed_dt=max_allowed_dt,
+                    target_date=_db_target_date_iso(p),
+                )
+                if isinstance(one, pd.DataFrame) and not one.empty:
+                    frames.append(one)
+                    cur = pd.concat(frames, ignore_index=True, sort=False)
+                    if _min_bars_per_symbol(cur) >= need:
+                        break
 
     if not frames:
         return pd.DataFrame()
@@ -579,6 +696,7 @@ def load_summary_seed_by_multiday_sqlite_direct(
 
 
 __all__ = [
+    "probe_summary_db",
     "sqlite_table_exists",
     "sqlite_table_columns",
     "build_direct_dt_expr",

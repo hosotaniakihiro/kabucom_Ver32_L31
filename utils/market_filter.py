@@ -17,6 +17,7 @@ import sqlite3
 from typing import List, Set
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 # DB PATH
 # ============================================================
 
-DB_PATH = r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db"
+DB_PATH = nas_path(r"Basic\symbol_flags.db")
 
 # ============================================================
 # SQL

@@ -48,3 +48,6 @@ pytest
 #   もしくは https://github.com/cgohlke/talib-build/releases から
 #   お使いのPython/OSに合った .whl をダウンロードして pip install
 # talib
+
+# P0-6: resource monitor (handles / open_files / net_connections / threads)
+psutil>=5.9

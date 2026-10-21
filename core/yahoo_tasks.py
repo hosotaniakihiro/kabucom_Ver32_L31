@@ -20,8 +20,10 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import sys
 import threading
 import time
+from typing import Any, Iterable
 
 import schedule
 
@@ -86,9 +88,82 @@ _yahoo_run_count = 0
 _yahoo_skip_count = 0
 _yahoo_stuck_detach_count = 0
 
+# ------------------------------------------------------------
+# generation guard (2026-09-03)
+# ------------------------------------------------------------
+# detach された旧 worker はスレッドとしては走り続ける。
+# 「自分はもう旧世代か」を worker 自身が判定できるようにして、
+# summary DB 書き込みなどの重い副作用の手前で降りられるようにする。
+_yahoo_worker_local = threading.local()
+
+
+def current_yahoo_worker_id() -> int:
+    """このスレッドが担当している Yahoo worker の世代番号 (worker 外なら 0)。"""
+    return int(getattr(_yahoo_worker_local, "worker_id", 0) or 0)
+
+
+def yahoo_worker_should_stop(label: str = "") -> bool:
+    """このスレッドの Yahoo worker が既に旧世代 (detached) かどうか。
+
+    True を返したら、呼び出し側は DB 書き込み等の副作用を行わずに降りること。
+    Yahoo worker スレッドの外 (worker_id=0) では常に False を返すので、
+    単体実行・起動時 1 回実行の経路には影響しない。
+
+    YAHOO_TASK_GENERATION_GUARD=0 で無効化できる。
+    """
+    v = os.environ.get("YAHOO_TASK_GENERATION_GUARD")
+    if v is not None and str(v).strip().lower() in {"0", "false", "no", "off"}:
+        return False
+
+    wid = current_yahoo_worker_id()
+    if wid <= 0:
+        return False
+
+    with _yahoo_lock:
+        detached = wid in _yahoo_detached_worker_ids
+        superseded = (_yahoo_active_worker_id != 0 and wid != _yahoo_active_worker_id)
+        active = _yahoo_active_worker_id
+
+    if not (detached or superseded):
+        return False
+
+    logger.warning(
+        "[YAHOO TASK][GENERATION GUARD] 旧世代 worker なので中断する "
+        "label=%s worker_id=%s active_worker_id=%s detached=%s superseded=%s",
+        label or "-", wid, active, detached, superseded,
+    )
+    return True
+
 
 def _is_before_start_time(now: dt.datetime) -> bool:
     return now.time() < YAHOO_START_TIME
+
+
+# ------------------------------------------------------------
+# 引け後の時間帯 (2026-10-19)
+# ------------------------------------------------------------
+# 引け後の Yahoo 補完は 1 日分を毎回まとめて upsert する (1 分足 1 万行超)。
+# これが summary_database / push_receiver の引け後の書き込みと重なった直後に
+# summary DB が壊れていた (9/10, 9/17, 9/24, 10/05, 10/07, 10/16)。
+# 他プロセスの書き込みが落ち着く YAHOO_POSTCLOSE_START まで待ち、
+# YAHOO_POSTCLOSE_END で止める (従来は夜通し毎分、同じ 1 日分を書き直していた)。
+# yahoo_minutely_complement_job は失敗しても例外を上げないので、
+# 「1 回成功したら終わり」にはせず、窓の中では毎分やり直す。
+# YAHOO_POSTCLOSE_START_HHMM=15:30 / END=23:59 で従来に近い動きに戻せる。
+YAHOO_MARKET_CLOSE_TIME = dt.time(15, 30)
+YAHOO_POSTCLOSE_START_TIME = _env_time_hhmm("YAHOO_POSTCLOSE_START_HHMM", "16:15")
+YAHOO_POSTCLOSE_END_TIME = _env_time_hhmm("YAHOO_POSTCLOSE_END_HHMM", "16:45")
+
+
+def _postclose_skip_reason(now: dt.datetime) -> str:
+    t = now.time()
+    if t < YAHOO_MARKET_CLOSE_TIME:
+        return ""
+    if t < YAHOO_POSTCLOSE_START_TIME:
+        return f"引け後 {YAHOO_POSTCLOSE_START_TIME:%H:%M} までは他プロセスの summary 書き込みと重ねない"
+    if t >= YAHOO_POSTCLOSE_END_TIME:
+        return f"引け後の補完時間 ({YAHOO_POSTCLOSE_START_TIME:%H:%M}-{YAHOO_POSTCLOSE_END_TIME:%H:%M}) を過ぎた"
+    return ""
 
 
 def _is_worker_alive() -> bool:
@@ -198,6 +273,10 @@ def _run_yahoo_job_body(started_at: dt.datetime, worker_id: int) -> None:
     _yahoo_last_error = ""
     _yahoo_last_started_at_text = started_at.strftime("%Y-%m-%d %H:%M:%S")
 
+    # このスレッドの世代番号を残す。detach された後に
+    # yahoo_worker_should_stop() が True を返せるようにするため。
+    _yahoo_worker_local.worker_id = int(worker_id)
+
     try:
         logger.info("[YAHOO TASK] worker start at=%s worker_id=%s purpose=download_1m_calc_technicals_save_summary_db intervals=1,3,5", _yahoo_last_started_at_text, worker_id)
         heartbeat("yahoo_complement_task", status="RUNNING", detail={"started_at": _yahoo_last_started_at_text, "intervals": [1, 3, 5], "worker_id": worker_id})
@@ -234,7 +313,7 @@ def _run_yahoo_job_body(started_at: dt.datetime, worker_id: int) -> None:
                 _yahoo_detached_worker_ids.discard(worker_id)
 
 
-def _start_yahoo_worker(now: dt.datetime) -> bool:
+def _start_yahoo_worker_core(now: dt.datetime) -> bool:
     global _yahoo_running
     global _yahoo_started_at_epoch
     global _yahoo_worker_thread
@@ -278,6 +357,10 @@ def _yahoo_wrapper():
     now = dt.datetime.now()
     if _is_before_start_time(now):
         logger.info("⏳ Yahoo補完: %s までは実行しません（スキップ）", YAHOO_START_TIME.strftime("%H:%M"))
+        return
+    reason = _postclose_skip_reason(now)
+    if reason:
+        logger.info("⏳ Yahoo補完: スキップ (%s)", reason)
         return
     started = _start_yahoo_worker(now)
     if not started:
@@ -354,3 +437,126 @@ def register_yahoo_tasks():
 
 
 __all__ = ["yahoo_minutely_complement_job", "register_yahoo_tasks", "get_yahoo_task_status"]
+
+
+# ============================================================
+# 旧 core/startup/intraday_load_guard_patch._patch_yahoo_tasks を本文化。
+# 日中の Yahoo 補完 worker が 1 分ごとに重複起動しないよう、
+# 最短起動間隔 (YAHOO_COMPLEMENT_MIN_START_GAP_SEC) でスロットルする。
+# 適用スコープは旧 _safe_install の allowed 集合
+# (DB|TRADING|HELPER = ほぼ全 context) を _ilg_scope_enabled() で再現。
+# ============================================================
+
+_ILG_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_ILG_CONTEXTS = {
+    "main_database", "db_prepare", "push_receiver", "summary_database",
+    "ranking_collector", "yahoo_complement", "main", "helper",
+}
+
+
+def _ilg_argv_context() -> str:
+    """core/startup/runtime_env/installer.py の _argv_context() と同一。"""
+    try:
+        text = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if "main_database.py" in text:
+            return "main_database"
+        if text.endswith("main.py") or "/main.py" in text:
+            return "main"
+        if "db_prepare_runner.py" in text:
+            return "db_prepare"
+        if "push_receiver_runner.py" in text:
+            return "push_receiver"
+        if "summary_database_runner.py" in text:
+            return "summary_database"
+        if "ranking_collector_runner.py" in text:
+            return "ranking_collector"
+        if "yahoo_complement_runner.py" in text:
+            return "yahoo_complement"
+        if "data_collectors_runner.py" in text:
+            return "main_database"
+        if text:
+            return "helper"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _ilg_scope_enabled() -> bool:
+    if str(os.environ.get("DISABLE_INTRADAY_LOAD_GUARD_PATCH", "")).strip() == "1":
+        return False
+    if _ilg_env_bool("DISABLE_INTRADAY_LOAD_GUARD_PATCH", False):
+        return False
+    return _ilg_argv_context() in _ILG_CONTEXTS
+
+
+def _ilg_env_bool(name: str, default: bool = False) -> bool:
+    try:
+        raw = str(os.getenv(name, "")).strip().lower()
+        if raw in _ILG_TRUE:
+            return True
+        if raw in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _ilg_env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        v = int(float(str(os.getenv(name, str(default))).replace(",", "")))
+    except Exception:
+        v = int(default)
+    if min_value is not None:
+        v = max(v, min_value)
+    if max_value is not None:
+        v = min(v, max_value)
+    return int(v)
+
+
+def _ilg_norm_symbol(symbol: Any) -> str:
+    s = str(symbol or "").strip().upper()
+    if s.endswith(".T"):
+        s = s[:-2]
+    return s
+
+
+def _ilg_dedupe_limit(items: Iterable[Any], limit: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in items or []:
+        s = _ilg_norm_symbol(x)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out
+
+
+_ilg_last_attempt_at = 0.0
+_ilg_skip_counter = 0
+
+
+def _start_yahoo_worker(now: dt.datetime) -> bool:
+    global _ilg_last_attempt_at, _ilg_skip_counter
+    if not _ilg_scope_enabled():
+        return _start_yahoo_worker_core(now)
+    min_gap = _ilg_env_int("YAHOO_COMPLEMENT_MIN_START_GAP_SEC", 240, min_value=0, max_value=3600)
+    now_ts = time.time()
+    if min_gap > 0 and _ilg_last_attempt_at > 0 and (now_ts - _ilg_last_attempt_at) < min_gap:
+        _ilg_skip_counter += 1
+        every = _ilg_env_int("YAHOO_COMPLEMENT_SKIP_LOG_EVERY", 5, min_value=1, max_value=100)
+        if _ilg_skip_counter == 1 or _ilg_skip_counter % every == 0:
+            logger.warning(
+                "[INTRADAY LOAD GUARD] Yahoo complement throttled elapsed=%.1fs min_gap=%ss skip_count=%s",
+                now_ts - _ilg_last_attempt_at,
+                min_gap,
+                _ilg_skip_counter,
+            )
+        return False
+    started = bool(_start_yahoo_worker_core(now))
+    if started:
+        _ilg_last_attempt_at = now_ts
+        _ilg_skip_counter = 0
+    return started

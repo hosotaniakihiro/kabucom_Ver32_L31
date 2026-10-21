@@ -16,24 +16,38 @@ import datetime as dt
 import logging
 import os
 from typing import List, Optional, Tuple
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
 
 REGISTER_MAX_SYMBOLS = 100
 
-RANKING_DB_BASE_DIRS = [
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking",
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\Ranking",
+def _local_ranking_dir() -> list:
+    """ranking DB のローカル置き場 (2026-09-07 に既定をローカルへ移した)。
+
+    先頭に置かないと、この経路だけ NAS の複製 (最大で複製間隔ぶん古い)
+    を読むことになる。
+    """
+    try:
+        from trading.ranking import ranking_db_location
+
+        return [str(ranking_db_location.ranking_db_dir())]
+    except Exception:
+        return []
+
+
+RANKING_DB_BASE_DIRS = _local_ranking_dir() + [
+    nas_path(r"raw_data\kabu_station\ranking"),
+    nas_path(r"raw_data\kabu_station\Ranking"),
 ]
 
 SBI_PREMARKET_DIR = (
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\SBI\SBI_yorimae_ranking"
+    nas_path(r"raw_data\SBI\SBI_yorimae_ranking")
 )
 
-SUBSCRIPTION_HISTORY_DB = (
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking"
-    r"\push_subscription_symbols_history.db"
+SUBSCRIPTION_HISTORY_DB = nas_path(
+    r"raw_data\kabu_station\ranking\push_subscription_symbols_history.db"
 )
 
 MARKET_OPEN = dt.time(9, 0)

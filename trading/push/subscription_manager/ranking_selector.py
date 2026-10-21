@@ -22,11 +22,13 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_NAS_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_NAS_ROOT = nas_root()
 TABLE_CANDIDATES = ("ranking_snapshot_1min", "ranking_raw_1min", "ranking")
 
 GAINER_TOP_N = 50
@@ -85,7 +87,24 @@ def _get_nas_root() -> str:
 
 def _default_ranking_db_path(yyyymmdd: Any = None) -> str:
     d = _normalize_yyyymmdd(yyyymmdd)
+    # 2026-09-07: ranking DB はローカルへ移した。ここを NAS 固定にすると
+    # この経路だけ複製 (最大で複製間隔ぶん古い) を読むことになる。
+    try:
+        from trading.ranking import ranking_db_location
+
+        return str(ranking_db_location.ranking_db_path(_as_date(d)))
+    except Exception:
+        pass
     return str(Path(_get_nas_root()) / "raw_data" / "kabu_station" / "ranking" / f"ranking{d}.db")
+
+
+def _as_date(yyyymmdd: str):
+    import datetime as _dt
+
+    try:
+        return _dt.datetime.strptime(str(yyyymmdd), "%Y%m%d").date()
+    except Exception:
+        return None
 
 
 def _resolve_ranking_db_path(db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None) -> Optional[str]:
@@ -223,7 +242,35 @@ def _normalize_df(df: pd.DataFrame, *, table_name: str = "") -> pd.DataFrame:
     return out
 
 
-def _load_ranking_df(*, db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None) -> pd.DataFrame:
+def _align_all_na_dtypes_for_concat(frames: list) -> list:
+    """concat 前に all-NA 列の dtype を揃える。
+
+    trading/push/push_stream/dataframe._align_all_na_dtypes() の考え方を
+    複数フレーム向けに一般化したもの。
+
+    - object dtype の全 NA 列を float64 へ明示する (実測でこれだけで警告が消える)
+    - int64/bool 列は NaN を入れられないので触らない
+    - float64 は pandas が将来この連結で採用する型そのもの
+    値は全て NA のままなので、結果の値と列集合は変わらない。
+    """
+    out = []
+    for f in frames:
+        try:
+            cast = {}
+            for c in f.columns:
+                col = f[c]
+                # object dtype の全 NA 列だけを float64 へ。
+                # int64/bool 列を astype しようとすると NaN が入らず例外になるので触らない。
+                if col.dtype == object and col.isna().all():
+                    cast[c] = "float64"
+            out.append(f.astype(cast) if cast else f)
+        except Exception:
+            logger.debug("[PUSH RANKING SELECTOR] all-NA dtype align failed for one frame", exc_info=True)
+            out.append(f)
+    return out
+
+
+def _load_ranking_df_core(*, db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None) -> pd.DataFrame:
     path = _resolve_ranking_db_path(db_path=db_path, yyyymmdd=yyyymmdd)
     if not path:
         logger.warning("[PUSH RANKING SELECTOR] ranking db path unresolved")
@@ -248,9 +295,17 @@ def _load_ranking_df(*, db_path: Optional[str | os.PathLike] = None, yyyymmdd: A
             ndf["_source_table"] = table
             frames.append(ndf)
             logger.info("[PUSH RANKING SELECTOR] loaded table=%s rows=%d path=%s", table, len(ndf), path)
+        # 全 NA のフレームを含むと
+        #   FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries
+        # になる。使えるデータが無いフレームだけ除く (情報は落ちない)。
+        frames = [f for f in frames if isinstance(f, pd.DataFrame) and not f.empty and not f.isna().all().all()]
         if not frames:
             logger.warning("[PUSH RANKING SELECTOR] no usable ranking tables path=%s tables=%s", path, tables)
             return pd.DataFrame()
+        # ranking テーブルごとに来る列が違うため、あるフレームでだけ
+        # 全 NA になる列ができる。そのまま concat すると dtype 判定が
+        # 将来変わるため、先に dtype を明示しておく。
+        frames = _align_all_na_dtypes_for_concat(frames)
         all_df = pd.concat(frames, ignore_index=True, sort=False)
         all_df = all_df[all_df["symbol"].astype(str).str.len() > 0].copy()
         logger.info("[PUSH RANKING SELECTOR] loaded total rows=%d symbols=%d path=%s", len(all_df), all_df["symbol"].nunique(), path)
@@ -291,7 +346,7 @@ def _apply_freshness(df: pd.DataFrame, fresh_minutes: float = DEFAULT_FRESH_MINU
     return out
 
 
-def _apply_min_liquidity(df: pd.DataFrame, *, min_price: float = MIN_PRICE, min_trading_value: float = MIN_TRADING_VALUE, min_volume: float = MIN_VOLUME, min_tick_count: float = MIN_TICK_COUNT, strict: bool = False) -> pd.DataFrame:
+def _apply_min_liquidity_core(df: pd.DataFrame, *, min_price: float = MIN_PRICE, min_trading_value: float = MIN_TRADING_VALUE, min_volume: float = MIN_VOLUME, min_tick_count: float = MIN_TICK_COUNT, strict: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
@@ -310,6 +365,105 @@ def _apply_min_liquidity(df: pd.DataFrame, *, min_price: float = MIN_PRICE, min_
     apply_cond("volume", min_volume)
     apply_cond("tick_count", min_tick_count)
     logger.info("[PUSH RANKING SELECTOR] liquidity filter before=%d after=%d min_price=%.1f min_value=%.1f min_volume=%.1f min_tick=%.1f strict=%s", before, len(out), min_price, min_trading_value, min_volume, min_tick_count, strict)
+    return out
+
+
+# ============================================================
+# 流動性フィルタが全件 0 件になったときの段階緩和
+#   旧 core/startup/liquidity_empty_fallback_patch.py (V1)
+# ------------------------------------------------------------
+# 代金列の単位違いや未補完で after=0 になり、
+#   [PUSH RANKING SELECTOR] liquidity filter before=2753 after=0
+# のまま候補が消えるのを防ぐ。完全な unfiltered には落とさず、
+# turnover_5m -> turnover_1m -> price+volume -> price のみ、と段階的に緩める。
+#
+# 旧パッチは ENABLE_LIQ_EMPTY_FALLBACK_PATCH が真のときだけ install される
+# opt-in (既定 OFF) だった。そのスコープを _liq_empty_fallback_enabled() で再現する。
+# ============================================================
+_LIQ_RELAX_STEPS = (
+    ("turnover_5m", 5_000_000.0, None, None),
+    ("turnover_1m", 1_000_000.0, None, 0.0),
+    ("price_volume_only", 0.0, None, 0.0),
+    ("price_only", 0.0, 0.0, 0.0),
+)
+
+
+def _liq_empty_fallback_enabled() -> bool:
+    """旧 sitecustomize._install_liq_empty_fallback_only_if_enabled() の判定を再現する。
+
+    ENABLE_LIQ_EMPTY_FALLBACK_PATCH が真のときだけ install されていた (既定 OFF)。
+    無効時は sitecustomize が DISABLE_LIQ_EMPTY_FALLBACK_PATCH=1 を setdefault する。
+    """
+    try:
+        if str(os.environ.get("DISABLE_LIQ_EMPTY_FALLBACK_PATCH", "")).strip() == "1":
+            return False
+        v = os.environ.get("ENABLE_LIQ_EMPTY_FALLBACK_PATCH")
+        if v is None or str(v).strip() == "":
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return False
+
+
+def _apply_min_liquidity(
+    df: pd.DataFrame,
+    *,
+    min_price: float = None,
+    min_trading_value: float = None,
+    min_volume: float = None,
+    min_tick_count: float = None,
+    strict: bool = False,
+) -> pd.DataFrame:
+    # 既定値はモジュール定数を「呼び出し時に」読む。
+    # (旧パッチが getattr(rs, "MIN_PRICE", ...) で解決していた挙動に合わせる)
+    if min_price is None:
+        min_price = float(MIN_PRICE)
+    if min_trading_value is None:
+        min_trading_value = float(MIN_TRADING_VALUE)
+    if min_volume is None:
+        min_volume = float(MIN_VOLUME)
+    if min_tick_count is None:
+        min_tick_count = float(MIN_TICK_COUNT)
+
+    before = 0 if df is None else len(df)
+    out = _apply_min_liquidity_core(
+        df,
+        min_price=min_price,
+        min_trading_value=min_trading_value,
+        min_volume=min_volume,
+        min_tick_count=min_tick_count,
+        strict=strict,
+    )
+    if not _liq_empty_fallback_enabled():
+        return out
+    if out is not None and not out.empty:
+        return out
+    if df is None or getattr(df, "empty", True):
+        return pd.DataFrame()
+
+    for label, tv, vol, tick in _LIQ_RELAX_STEPS:
+        vol = min_volume if vol is None else vol
+        tick = min_tick_count if tick is None else tick
+        try:
+            cand = _apply_min_liquidity_core(
+                df,
+                min_price=min_price,
+                min_trading_value=tv,
+                min_volume=vol,
+                min_tick_count=tick,
+                strict=False,
+            )
+        except Exception:
+            logger.debug("[LIQ EMPTY FALLBACK] selector relax failed step=%s", label, exc_info=True)
+            continue
+        if cand is not None and not cand.empty:
+            logger.warning(
+                "[LIQ EMPTY FALLBACK] PUSH selector liquidity relaxed step=%s before=%d after=%d original_min_value=%.1f min_price=%.1f min_volume=%.1f",
+                label, before, len(cand), float(min_trading_value), float(min_price), float(vol),
+            )
+            return cand
+
+    logger.warning("[LIQ EMPTY FALLBACK] PUSH selector liquidity still empty before=%d -> keep original empty", before)
     return out
 
 
@@ -601,3 +755,25 @@ __all__ = [
     "split_push_ranking_symbols_for_rotation",
     "pick_push_ranking_symbols_for_rotation",
 ]
+
+
+# ============================================================
+# NAS/SMB sqlite I/O ガード (旧 core/startup/nas_sqlite_io_guard_patch.py)
+# ============================================================
+
+def _load_ranking_df(*, db_path=None, yyyymmdd=None) -> pd.DataFrame:
+    from utils import nas_sqlite_io_guard as _guard
+
+    path = None
+    try:
+        path = db_path
+        if path is None:
+            path = _resolve_ranking_db_path(db_path=None, yyyymmdd=yyyymmdd)
+        if path and _guard.is_bad(path):
+            logger.warning("[NAS SQLITE IO GUARD] skip ranking_selector bad path=%s", path)
+            return pd.DataFrame()
+        return _load_ranking_df_core(db_path=db_path, yyyymmdd=yyyymmdd)
+    except Exception as e:
+        if path and _guard.handle_error(path, e):
+            return pd.DataFrame()
+        raise

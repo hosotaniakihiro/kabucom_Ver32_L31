@@ -1,0 +1,26 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>買いVS空売り</title><style>
+:root{--bg:#ffffff;--fg:#1b1f24;--mut:#667;--card:#f6f8fa;--bd:#d9dee4;--accent:#2563eb;--pos:#128a4c;--neg:#c0392b}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1317;--fg:#e6edf3;--mut:#9aa7b3;--card:#171c22;--bd:#2b333b;--accent:#5b9bff;--pos:#3fb950;--neg:#f85149}}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,"Segoe UI",Meiryo,sans-serif;background:var(--bg);color:var(--fg);line-height:1.5}
+.wrap{max-width:1200px;margin:0 auto;padding:20px}
+h1{font-size:22px;margin:8px 0}h2{font-size:17px;margin:22px 0 8px;border-bottom:2px solid var(--bd);padding-bottom:4px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:14px 0}
+.kpi{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px}
+.kpi .l{font-size:12px;color:var(--mut)}.kpi .v{font-size:18px;font-weight:700;margin-top:4px}
+.pos{color:var(--pos)}.neg{color:var(--neg)}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid var(--bd);padding:6px 8px;text-align:right}
+th{background:var(--card);cursor:pointer;position:sticky;top:0}td.l,th.l{text-align:left}
+.scroll{overflow-x:auto;border:1px solid var(--bd);border-radius:8px}
+.note{background:var(--card);border-left:4px solid var(--accent);padding:10px 12px;border-radius:6px;margin:10px 0;font-size:13px;color:var(--mut)}
+.controls{margin:10px 0}button,input{font:inherit;padding:5px 10px;border:1px solid var(--bd);border-radius:6px;background:var(--card);color:var(--fg)}
+img{max-width:100%;height:auto;background:#fff;border:1px solid var(--bd);border-radius:8px}
+small{color:var(--mut)}
+</style></head><body><div class="wrap"><h1>⚖️ 買い VS 空売り (§9C)</h1>
+<small>C_OHLC・標準条件。空売りは仮想(売建可否履歴なし)。</small>
+<h2>ギャップ別</h2><div class="scroll"><table><thead><tr><th class="l">ギャップ</th><th>買い(勝率/期待値)</th><th>空売り(勝率/期待値)</th></tr></thead><tbody><tr><td class="l">FLAT(-3,3)</td><td>33.9% / -746.5円 (n=44616)</td><td>36.0% / -678.8円 (n=62659)</td></tr><tr><td class="l">GD3-5</td><td>39.6% / -796.8円 (n=1791)</td><td>42.6% / -722.4円 (n=2572)</td></tr><tr><td class="l">GD5-7</td><td>38.8% / -941.8円 (n=611)</td><td>44.4% / -732.7円 (n=851)</td></tr><tr><td class="l">GD<=-7</td><td>38.3% / -940.2円 (n=459)</td><td>38.4% / -908.1円 (n=630)</td></tr><tr><td class="l">GU3-5</td><td>42.1% / -745.0円 (n=1455)</td><td>41.8% / -742.8円 (n=2087)</td></tr><tr><td class="l">GU5-7</td><td>40.4% / -906.9円 (n=508)</td><td>44.6% / -735.8円 (n=746)</td></tr><tr><td class="l">GU>=7</td><td>37.9% / -966.2円 (n=650)</td><td>39.3% / -929.1円 (n=950)</td></tr><tr><td class="l">UNKNOWN</td><td>35.5% / -743.0円 (n=8299)</td><td>35.9% / -733.3円 (n=11276)</td></tr></tbody></table></div>
+<h2>初動5分足の陽線/陰線別</h2><div class="scroll"><table><thead><tr><th class="l">初動5分足</th><th>買い(勝率/期待値)</th><th>空売り(勝率/期待値)</th></tr></thead><tbody><tr><td class="l">陰線</td><td>35.9% / -738.8円 (n=7956)</td><td>36.8% / -718.1円 (n=11440)</td></tr><tr><td class="l">陽線</td><td>34.9% / -750.6円 (n=22853)</td><td>36.4% / -685.7円 (n=31903)</td></tr></tbody></table></div>
+<h2>エントリー時間帯別</h2><div class="scroll"><table><thead><tr><th class="l">時間帯</th><th>買い(勝率/期待値)</th><th>空売り(勝率/期待値)</th></tr></thead><tbody><tr><td class="l">0905-0915</td><td>43.0% / -737.1円 (n=2477)</td><td>43.5% / -717.6円 (n=8896)</td></tr><tr><td class="l">0915-0930</td><td>39.1% / -762.0円 (n=14736)</td><td>39.7% / -722.6円 (n=20586)</td></tr><tr><td class="l">0930+</td><td>32.6% / -753.4円 (n=41176)</td><td>34.1% / -680.5円 (n=52289)</td></tr></tbody></table></div>
+<h2>VWAP上/下別</h2><div class="scroll"><table><thead><tr><th class="l">VWAP位置</th><th>買い(勝率/期待値)</th><th>空売り(勝率/期待値)</th></tr></thead><tbody><tr><td class="l">ABOVE</td><td>34.8% / -764.7円 (n=38137)</td><td>35.6% / -664.6円 (n=21528)</td></tr><tr><td class="l">BELOW</td><td>34.4% / -733.6円 (n=19712)</td><td>36.8% / -708.9円 (n=59427)</td></tr></tbody></table></div>
+<p><small><a href="backtest_16strategies.html">← ダッシュボード</a></small></p></div></body></html>

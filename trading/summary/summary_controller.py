@@ -33,7 +33,7 @@ import pandas as pd
 from global_state import global_data
 
 from trading.logger.timeframe_logger import log_tf_close
-from trading.ranking.ranking_pipeline import run_ranking_pipeline
+from trading.ranking.ranking_pipeline import run_ranking_pipeline as _run_ranking_pipeline_impl
 from trading.summary.controller_cache import (
     choose_merged_cache_payload,
     dedupe_symbol_datetime,
@@ -57,9 +57,9 @@ from trading.summary.controller_utils import normalize_summary_df
 from trading.summary.engine.summary_engine import run_summary_engine
 from trading.summary.notify.discord_notifier import notify_entry_signals
 from trading.summary.notify.tonosama_notifier import notify_tonosama
-from trading.summary.persistence.summary_persistence import save_summary
-from trading.summary.pipeline.ai_pipeline import run_ai_pipeline
-from trading.summary.pipeline.entry_pipeline import run_entry_pipeline
+from trading.summary.persistence.summary_persistence import save_summary as _save_summary_persisted
+from trading.summary.pipeline.ai_pipeline import run_ai_pipeline as _run_ai_pipeline_impl
+from trading.summary.pipeline.entry_pipeline import run_entry_pipeline as _run_entry_pipeline_impl
 from trading.summary.pipeline.fetch_pipeline import run_fetch_pipeline
 from trading.summary.pipeline.indicator_pipeline import run_indicator_pipeline
 from trading.summary.summary_logger_bridge import (
@@ -112,7 +112,7 @@ def _thread_name() -> str:
         return "unknown"
 
 
-def _enter_interval(interval: int) -> bool:
+def _enter_interval_core(interval: int) -> bool:
     interval = int(interval)
     now = dt.datetime.now()
 
@@ -242,7 +242,103 @@ def _build_reason_from_row(row: pd.Series, side: str) -> str:
     return "-"
 
 
+def _controller_enrich_runtime(df: Any, *, interval: int, context: str) -> Any:
+    """旧 core/startup/summary_controller_enrich_runtime_patch.py の _enrich_df。
+
+    本ファイル下部の _enrich() とは意図的に別実装。旧パッチは
+    enrich_summary_latest() だけを呼び、intraday MTF 補完や score alias 修復は
+    行わないため、挙動を変えないようパッチ側のロジックをそのまま移植した。
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    try:
+        from trading.summary.controller_enrich import enrich_summary_latest
+
+        out = enrich_summary_latest(df, interval=interval, context=context)
+        logger.info(
+            "[SUMMARY CONTROLLER ENRICH PATCH] context=%s interval=%s rows=%s cols=%s",
+            context,
+            interval,
+            len(out) if isinstance(out, pd.DataFrame) else None,
+            len(out.columns) if isinstance(out, pd.DataFrame) else None,
+        )
+        return out
+    except Exception:
+        logger.exception(
+            "[SUMMARY CONTROLLER ENRICH PATCH] enrich failed context=%s interval=%s",
+            context,
+            interval,
+        )
+        return df
+
+
+def _controller_enrich_detect_interval(args: tuple, kwargs: dict, default: int = 1) -> int:
+    """旧パッチ _detect_interval の移植。args 中の最初の整数を interval とみなす。"""
+    try:
+        if "interval" in kwargs:
+            return int(kwargs.get("interval") or default)
+        for v in args:
+            if isinstance(v, int):
+                return int(v)
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+    except Exception:
+        pass
+    return int(default)
+
+
+def _controller_enrich_df_first(fn, context: str, args: tuple, kwargs: dict):
+    """旧パッチ _patch_df_first_func の移植。
+
+    先頭の位置引数が DataFrame ならそれを、無ければ df_latest / df kwarg を
+    補強してから元の関数へ渡す。
+    """
+    interval = _controller_enrich_detect_interval(args, kwargs, default=1)
+    if args and isinstance(args[0], pd.DataFrame):
+        args = (_controller_enrich_runtime(args[0], interval=interval, context=context),) + tuple(args[1:])
+    elif isinstance(kwargs.get("df_latest"), pd.DataFrame):
+        kwargs = dict(kwargs)
+        kwargs["df_latest"] = _controller_enrich_runtime(kwargs["df_latest"], interval=interval, context=context)
+    elif isinstance(kwargs.get("df"), pd.DataFrame):
+        kwargs = dict(kwargs)
+        kwargs["df"] = _controller_enrich_runtime(kwargs["df"], interval=interval, context=context)
+    return fn(*args, **kwargs)
+
+
+def run_ranking_pipeline(*args: Any, **kwargs: Any):
+    return _controller_enrich_df_first(
+        _run_ranking_pipeline_impl, "before-ranking-pipeline", args, kwargs
+    )
+
+
+def run_ai_pipeline(*args: Any, **kwargs: Any):
+    return _controller_enrich_df_first(
+        _run_ai_pipeline_impl, "before-ai-pipeline", args, kwargs
+    )
+
+
+def run_entry_pipeline(*args: Any, **kwargs: Any):
+    return _controller_enrich_df_first(
+        _run_entry_pipeline_impl, "before-entry-pipeline", args, kwargs
+    )
+
+
+def save_summary(df: Any, interval: int = 1, *args: Any, **kwargs: Any):
+    """保存直前に df を補強してから永続化層へ渡す。
+
+    旧 summary_controller_enrich_runtime_patch が sc_mod.save_summary を
+    差し替えて行っていた処理の本文化。呼び出し側 (diff_update) は既に
+    _enrich() 済みの df を渡すが、旧パッチ適用時も同じく二重に補強されて
+    いたため、その合成挙動をそのまま維持する。
+    """
+    df = _controller_enrich_runtime(df, interval=int(interval or 1), context="before-save")
+    return _save_summary_persisted(df, interval, *args, **kwargs)
+
+
 def _safe_run_display(interval: int, df_latest: pd.DataFrame) -> None:
+    df_latest = _controller_enrich_runtime(
+        df_latest, interval=int(interval or 1), context="before-display"
+    )
     try:
         push_fn, _ranking_fn = _resolve_display_functions_once()
         if callable(push_fn):
@@ -662,6 +758,30 @@ def _enrich(df: Any, *, interval: int | None = None, context: str = "runtime") -
         return _repair_score_aliases(fallback, interval=interval, context=context)
 
 
+def _log_probe_enrich_enabled() -> bool:
+    """ログ専用 probe で enrich を通すか (既定 False)。"""
+    try:
+        v = os.getenv("SUMMARY_LOG_PROBE_ENRICH")
+        if v is None or str(v).strip() == "":
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return False
+
+
+def _enrich_for_log(df: Any, *, interval: int | None = None, context: str = "log") -> Any:
+    """ログを出すためだけの enrich。既定では enrich せず素の df を返す。
+
+    _enrich() は ranking DB (NAS) を読む。TTL 30 秒に対し読みが
+    数十秒〜100 秒超になる時間帯があり、ログ 1 行のために毎分の
+    Summary を止めていた (2026-08-26 実測)。
+    戻り値はログ関数にしか渡らないので、既定では素通しにする。
+    """
+    if _log_probe_enrich_enabled():
+        return _enrich(df, interval=interval, context=context)
+    return df
+
+
 def _call_global_setter(name: str, interval: int, df: pd.DataFrame) -> None:
     try:
         fn = getattr(global_data, name, None)
@@ -734,7 +854,27 @@ class SummaryController:
             logger.exception("[summary_controller] engine failed")
         return pd.DataFrame()
 
-    def diff_update(self, interval: int) -> pd.DataFrame:
+    def diff_update(self, interval: int, *args, **kwargs) -> pd.DataFrame:
+        """MTF ブリッジ込みの diff_update 入口。
+
+        旧構成では core/startup/summary_mtf_diff_from_1m_patch.install() が
+        SummaryController.diff_update をクラス属性ごと差し替えて
+        1m/3m/5m の publish と NAS スキップ時の再サンプリングを足していた。
+        差し替えをやめ、こちらから diff_update_with_mtf() を直接呼ぶ形にした。
+
+        ブリッジが無効/未 install のときは _diff_update_core をそのまま呼ぶ。
+        そのとき *args/**kwargs もそのまま渡すので、display= のような
+        余分な引数は従来どおり TypeError になる (パッチ未適用時の挙動を維持)。
+        """
+        hook = _mtf_diff_update_hook()
+        if hook is None:
+            return self._diff_update_core(interval, *args, **kwargs)
+        # 未束縛の関数を渡すこと。ブリッジ側の _invoke_original_diff_update は
+        # orig(self, interval) と呼ぶため、束縛メソッドを渡すと self が二重になる
+        # (旧構成は getattr(cls, "diff_update") = 未束縛を退避していた)。
+        return hook(self, interval, type(self)._diff_update_core, *args, **kwargs)
+
+    def _diff_update_core(self, interval: int) -> pd.DataFrame:
         df_latest = pd.DataFrame()
         hist_payload = pd.DataFrame()
         try:
@@ -764,13 +904,13 @@ class SummaryController:
                     df_hist = normalize_summary_df(df_hist)
                     df_hist = _ensure_reason_and_ai_columns(df_hist, interval, "after-indicator-history")
                     log_df_state("after-indicator-history", interval, df_hist)
-                    log_scoring_probe("after-indicator-history", interval, _enrich(df_hist, interval=interval, context="log-after-indicator-history"))
+                    log_scoring_probe("after-indicator-history", interval, _enrich_for_log(df_hist, interval=interval, context="log-after-indicator-history"))
                     from trading.scoring.core.scoring_pipeline import run_scoring_pipeline
                     df_hist = run_scoring_pipeline(df_hist, interval=f"{interval}min")
                     df_hist = normalize_summary_df(df_hist)
                     df_hist = _ensure_reason_and_ai_columns(df_hist, interval, "after-scoring-history")
                     log_df_state("after-scoring-history", interval, df_hist)
-                    log_scoring_probe("after-scoring-history", interval, _enrich(df_hist, interval=interval, context="log-after-scoring-history"))
+                    log_scoring_probe("after-scoring-history", interval, _enrich_for_log(df_hist, interval=interval, context="log-after-scoring-history"))
                 except Exception:
                     logger.exception("[summary_controller] indicator/scoring failed interval=%s", interval)
                     try:
@@ -795,7 +935,7 @@ class SummaryController:
                     df_latest = rebuild_technical_ready(df_latest)
                     df_latest = _ensure_reason_and_ai_columns(df_latest, interval, "after-latest-projection")
                     log_df_state("after-latest-projection", interval, df_latest)
-                    log_scoring_probe("after-latest-projection", interval, _enrich(df_latest, interval=interval, context="log-after-latest-projection"))
+                    log_scoring_probe("after-latest-projection", interval, _enrich_for_log(df_latest, interval=interval, context="log-after-latest-projection"))
                 except Exception:
                     logger.exception("[summary_controller] latest projection failed interval=%s", interval)
                     df_latest = latest_row_per_symbol(base_df, normalize_summary_df)
@@ -846,7 +986,7 @@ class SummaryController:
                             logger.exception("[summary_controller] save failed interval=%s", interval)
                     except Exception:
                         logger.exception("[summary_controller] save failed interval=%s", interval)
-                log_scoring_probe("before-cache-sync", interval, _enrich(df_latest, interval=interval, context="log-before-cache-sync"))
+                log_scoring_probe("before-cache-sync", interval, _enrich_for_log(df_latest, interval=interval, context="log-before-cache-sync"))
                 try:
                     safe_global_set_history(interval, hist_payload)
                     safe_global_set_latest(interval, _enrich(df_latest.copy(), interval=interval, context="cache-latest"))
@@ -870,7 +1010,16 @@ class SummaryController:
                 except Exception:
                     pass
                 try:
-                    df_entry = run_ranking_pipeline(_enrich(df_latest, interval=interval, context="before-ranking-pipeline"), interval)
+                    # run_ranking_pipeline は mom / trend / velocity / ma5_slope /
+                    # ma25_slope を symbol 単位の diff()/pct_change()/rolling() で作り、
+                    # そのあと自分で select_latest_rows() して銘柄あたり1行に畳む。
+                    # ここで df_latest (既に銘柄あたり1行) を渡していたため履歴が無く、
+                    # 実測で history stats min=1 max=1 short(<3)=204/204、
+                    # mom / trend / _score_velocity が全銘柄ゼロ、
+                    # [pre-latest] missing col=ma25_slope が毎分出ていた。
+                    # 履歴を持つ df_hist を渡す (戻り値は従来どおり銘柄あたり1行)。
+                    ranking_input = df_hist if isinstance(df_hist, pd.DataFrame) and not df_hist.empty else df_latest
+                    df_entry = run_ranking_pipeline(_enrich(ranking_input, interval=interval, context="before-ranking-pipeline"), interval)
                 except Exception:
                     logger.exception("[summary_controller] ranking failed")
                     return df_latest
@@ -905,3 +1054,118 @@ class SummaryController:
 
 
 summary_controller = SummaryController()
+
+
+def _mtf_diff_update_hook():
+    """core/startup/summary_mtf_diff_from_1m_patch の MTF ブリッジを取得する。
+
+    install() が成功している (= SUMMARY_MTF_DIFF_FROM_1M_ENABLED を通っている)
+    ときだけ関数を返す。旧構成で差し替えが起きる条件と同じ。
+    取得できない場合は None を返し、呼び出し側は素の実装を使う。
+    """
+    try:
+        from trading.summary import mtf_diff_from_1m as _mtf
+    except Exception:
+        return None
+    try:
+        if not getattr(_mtf, "_INSTALLED", False):
+            return None
+        fn = getattr(_mtf, "diff_update_with_mtf", None)
+        return fn if callable(fn) else None
+    except Exception:
+        return None
+
+
+# ============================================================
+# INFLIGHT STALE CLEAR
+# (旧 core/startup/summary_no_overlap_runtime_patch.py の
+#  _patch_summary_controller_inflight_stale_clear を本文化)
+# ------------------------------------------------------------
+# timeout した worker スレッドが残した per-interval の diff_update
+# inflight ロックを、規定秒数を超えていたら入場前に解放する。
+# ネイティブは _enter_interval_core へ改名した。
+#
+# 旧パッチの本体だった run_time_locked_summary_jobs のラッパーは
+# 移していない。実呼び出しで確認したところ、既定 (=1) では
+# summary_parallel_executor_reset_patch がティック処理を丸ごと
+# 再実装して _ORIG を呼ばず、SUMMARY_PARALLEL_INTERVALS_ENABLED=0 でも
+# native を直接呼ぶため、どちらの設定でも no_overlap のラッパーには
+# 一度も入らない = 死んだラッパーだった。
+#
+# env 既定値 5 件 (_sno_set_default_env) は旧 install() と同じ setdefault。
+# ============================================================
+
+def _sno_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _sno_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return max(1.0, float(v))
+    except Exception:
+        return float(default)
+
+
+def _sno_set_default_env() -> None:
+    """未設定時だけ、安全側のデフォルト値を入れる。"""
+    defaults = {
+        "SUMMARY_PARALLEL_INTERVAL_WORKERS": "1",
+        "SUMMARY_PARALLEL_RANKING_ENABLED": "0",
+        "SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC": "25",
+        "SUMMARY_PARALLEL_SKIP_IF_ANY_RUNNING": "1",
+        "SUMMARY_CONTROLLER_INFLIGHT_STALE_CLEAR_SEC": "45",
+    }
+    for k, v in defaults.items():
+        if os.getenv(k) is None or str(os.getenv(k)).strip() == "":
+            os.environ[k] = v
+            logger.warning("[SUMMARY NO OVERLAP] default env set %s=%s", k, v)
+
+
+def _enter_interval(interval: int) -> bool:
+    try:
+        interval_i = int(interval)
+    except Exception:
+        interval_i = interval
+    stale_sec = _sno_env_float("SUMMARY_CONTROLLER_INFLIGHT_STALE_CLEAR_SEC", 45.0)
+    try:
+        now = dt.datetime.now()
+        with _SUMMARY_INFLIGHT_GUARD:
+            meta = _SUMMARY_INFLIGHT.get(interval_i)
+            if meta and bool(meta.get("running", False)):
+                started_at = meta.get("started_at")
+                held_sec = 0.0
+                try:
+                    if isinstance(started_at, dt.datetime):
+                        held_sec = max(0.0, (now - started_at).total_seconds())
+                except Exception:
+                    held_sec = 0.0
+                if held_sec >= stale_sec:
+                    logger.error(
+                        "[SUMMARY NO OVERLAP][INFLIGHT STALE CLEAR] interval=%s held=%.3fs stale_sec=%.1f holder_tid=%s holder_thread=%s -> clear stale running flag",
+                        interval_i,
+                        held_sec,
+                        stale_sec,
+                        meta.get("tid"),
+                        meta.get("thread"),
+                    )
+                    _SUMMARY_INFLIGHT[interval_i] = {"running": False, "started_at": None, "tid": None, "thread": None}
+    except Exception:
+        logger.exception("[SUMMARY NO OVERLAP][INFLIGHT STALE CLEAR] pre-clear failed interval=%s", interval)
+    return _enter_interval_core(interval)
+
+
+_sno_set_default_env()

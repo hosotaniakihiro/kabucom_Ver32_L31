@@ -12,7 +12,10 @@ from .backfill_state import restore_db_backfilled_state, mark_download_result
 from .target_resolver import resolve_all_ranking_symbols_for_reflect, resolve_download_symbols_from_reflect_symbols
 from .time_window import resolve_yahoo_reflect_end_dt
 from .dataframe_utils import normalize_downloaded_df, save_intraday_by_date
-from .summary_reflector import reflect_saved_yahoo_to_summary_db
+# 旧 full_pipeline_stability_runtime_patch がこの束縛を包んでいた
+# (pre-download / empty-download の全銘柄 reflect を飛ばす)。本文化に伴い
+# core を束縛し、下の reflect_saved_yahoo_to_summary_db がその層になる。
+from .summary_reflector import reflect_saved_yahoo_to_summary_db as _reflect_saved_yahoo_to_summary_db_core
 logger = logging.getLogger(__name__)
 
 
@@ -236,3 +239,23 @@ def run_startup_yahoo_complement():
 
 
 __all__ = ["run_periodic_yahoo_complement", "run_periodic_yahoo_complement_main_cache_only", "run_startup_yahoo_complement"]
+
+# ============================================================
+# YAHOO DIFFERENTIAL REFLECT
+# (旧 core/startup/full_pipeline_stability_runtime_patch._install_yahoo_differential_reflect)
+# ------------------------------------------------------------
+# ダウンロード自体は差分だが、pre-download / empty-download で
+# 全ランキング銘柄を再計算する reflect が重い。そこだけ飛ばす。
+# ============================================================
+
+
+def reflect_saved_yahoo_to_summary_db(*args, **kwargs):
+    try:
+        from kabu_api import pipeline_stability as _ps
+    except Exception:
+        return _reflect_saved_yahoo_to_summary_db_core(*args, **kwargs)
+    if not _ps.pipeline_stability_enabled():
+        return _reflect_saved_yahoo_to_summary_db_core(*args, **kwargs)
+    return _ps.reflect_saved_yahoo_differential(
+        _reflect_saved_yahoo_to_summary_db_core, *args, **kwargs
+    )

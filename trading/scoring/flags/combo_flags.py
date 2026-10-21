@@ -31,6 +31,31 @@ def _flag(expr):
 
 
 # ============================================================
+# 0/1 フラグ列判定
+# ============================================================
+
+def _is_binary_flag_column(s) -> bool:
+    """0/1 (もしくは bool) だけを取る列か。
+
+    文字列列 (flag_score_reasons) や集計スコア列 (flag_score_*_total) を
+    multi_signal_cluster のカウントから除外するための判定。
+    """
+    try:
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        if s.dtype == bool:
+            return True
+        if not pd.api.types.is_numeric_dtype(s):
+            return False
+        vals = s.dropna()
+        if vals.empty:
+            return True
+        return bool(vals.isin([0, 1, 0.0, 1.0, True, False]).all())
+    except Exception:
+        return False
+
+
+# ============================================================
 # main
 # ============================================================
 
@@ -72,9 +97,19 @@ def generate_combo_flags(df: pd.DataFrame) -> pd.DataFrame:
     # multi signal cluster
     # --------------------------------------------------------
 
+    # "flag_" で始まる列には 0/1 のフラグ以外に
+    #   flag_score_reasons      (文字列: flag_pattern_score_bridge)
+    #   flag_score_buy_total 等 (集計スコア: 単体で 5 を超える)
+    # が含まれる。前者は sum() で
+    #   TypeError: unsupported operand type(s) for +: 'float' and 'str'
+    # を起こし、generate_combo_flags が丸ごと [FLAG GEN] module failed と
+    # なって flag_bull_big_combo / flag_multi_signal_cluster の両方が
+    # 生成されなくなっていた。
+    # 本来の意図は "0/1 のフラグが何本立ったか" なので、
+    # bool / 0・1 だけを取る数値列に限定して数える。
     flag_cols = [
         c for c in df.columns
-        if c.startswith("flag_")
+        if c.startswith("flag_") and _is_binary_flag_column(df[c])
     ]
 
     if len(flag_cols) > 0:

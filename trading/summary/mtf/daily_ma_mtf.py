@@ -219,6 +219,21 @@ def attach_daily_ma_mtf_to_summary(
     if summary_df is None or summary_df.empty:
         return summary_df
 
+    # P0-8/P0-9: DAILY MTF は realtime 経路。日足 MA を貼るのに
+    # 銘柄あたり 65 本の分足履歴は要らない。22,851 行に貼っていたのを
+    # latest projection (349 行) に落とす。
+    # 履歴側へ日足列が必要な場合は realtime_history_guard を通さない
+    # 別経路 (storage / indicator seed) から呼ぶこと。
+    try:
+        from trading.summary.realtime_history_guard import to_latest_projection
+
+        summary_df = to_latest_projection(summary_df, caller="DAILY_MTF_realtime")
+    except Exception:
+        logger.debug("[DAILY MTF] realtime guard unavailable", exc_info=True)
+
+    if summary_df is None or summary_df.empty:
+        return summary_df
+
     out = summary_df.copy()
 
     symbol_col = _find_col(out, ["symbol", "code", "Symbol", "stock_code"])

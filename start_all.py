@@ -24,6 +24,28 @@
 
 from __future__ import annotations
 
+# 2026-09-25: Norton が注入する SSLKEYLOGFILE を外す。
+#   プロセス環境に SSLKEYLOGFILE=\\.\nllMonFltProxy\... が入っており
+#   (Machine/User の環境変数には無い。Norton が各プロセスへ注入する)、
+#   urllib3 は HTTPS 接続ごとにこれを読んで ssl context の
+#   keylog_filename に設定する。その setter が Norton の名前付きパイプを
+#   open() しようとして応答待ちになり、スレッドが永久に止まる。
+#   socket より手前なので timeout= は効かない。
+#   9/25 は ranking_summary_bg が Discord 通知の中でこれに掛かり、
+#   generation=1 のまま 20 分以上完走しなかった。
+#   env AUTOSTOCK_KEEP_SSLKEYLOGFILE=1 で従来どおり残す。
+import os as _autostock_os
+
+if _autostock_os.environ.get("SSLKEYLOGFILE") and str(
+    _autostock_os.environ.get("AUTOSTOCK_KEEP_SSLKEYLOGFILE", "0")
+).strip().lower() not in ("1", "true", "yes", "on"):
+    _autostock_keylog = _autostock_os.environ.pop("SSLKEYLOGFILE", None)
+    print(
+        "[TLS ENV GUARD] SSLKEYLOGFILE を外した (Norton の TLS 監視が"
+        " HTTPS 接続を固めるため): %s" % (_autostock_keylog,)
+    )
+
+
 import argparse
 import os
 import subprocess
@@ -239,6 +261,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         "AUTOSTOCK_DATA_COLLECTORS_PROCESS": "1",
         "AUTOSTOCK_MAIN_DATABASE_PROCESS": "1",
         "AUTOSTOCK_SUMMARY_SAVE_OWNER": "database",
+        # ------------------------------------------------------------
+        # 2026-09-09: summary の 1 tick を 25 秒で打ち切ると足が publish
+        # されず、entry が「足が古い」で全滅する。
+        #
+        # 実測 (2026-09-09 の 1 日):
+        #     STALE_CANDIDATE_SKIP 75 件、理由は全部 bar_age
+        #     bar_age 最小 188.1s / 中央 225.0s / 最大 590.4s (上限 180s)
+        #     AI_GATE_OK は 180 件通っているのに APPROVED>0 は 0 回
+        # 25 秒で切られた分の足が出ないので、判断時に手元にある最新足が
+        # 3 分以上前になっていた。最小値が 188 秒なので、あと 1 分足りない。
+        #
+        # tick 間隔は 60 秒。同じ (source, interval) の重複実行は
+        # parallel_intervals の inflight ガードが防ぐので、45 秒まで
+        # 広げても積み上がらない。完走すれば足は毎分出るので bar_age は
+        # 60-120 秒に収まる。
+        #
+        # main.py 側は発注と PUSH 監視を止めない方を優先するため、
+        # _main_tick_timeout_cap_enabled() が 25 秒に抑える (据え置き)。
+        # ここは main_database.py の系だけに効かせる。
+        # ------------------------------------------------------------
+        "SUMMARY_STAGE_BUDGET_SEC": "45",
+        "SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC": "45",
+        "SUMMARY_PARALLEL_TIMEOUT_MIN_SEC": "45",
     }
 
     main_env = {

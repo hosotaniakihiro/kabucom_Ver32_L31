@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import time
 from typing import Iterable, Optional, Any
 
 import pandas as pd
@@ -57,6 +58,59 @@ except Exception:
         "[RANKING SUMMARY RUNNER] persistence import failed -> persist disabled",
         exc_info=True,
     )
+
+
+# ============================================================
+# [RANKING SUMMARY PERF]
+# ------------------------------------------------------------
+# interval=1 が 65〜160 秒かかり budget(60s) を超えて 3m/5m が
+# 着手すらできない状態が続いていた。前回の計測で
+#   leg_total=159.8s  runner=146.4s  post_runner=13.4s
+# まで割れ、runner が 92% と分かったが、その内訳は
+# base_df / technical の 2 段しか無かった。
+#
+# ここでは runner 内の各段を 1 行にまとめる。DB 読みの内訳は
+# loader 側の [RANKING DB READ STAGE] (connect/execute/fetch) が持つので、
+# その累計をここへ合流させる。
+# 計測のみで、処理も判定も変えない。
+# ============================================================
+
+def _ranking_db_read_totals() -> dict:
+    """loader が積んだ DB 読み時間の累計 (あれば)。"""
+    try:
+        from trading.ranking.summary import loader as _ld
+
+        fn = getattr(_ld, "ranking_db_read_totals", None)
+        if callable(fn):
+            return dict(fn() or {})
+        stats = getattr(_ld, "ranking_snapshot_cache_stats", None)
+        if callable(stats):
+            return {"snapshot_cache": stats()}
+    except Exception:
+        logger.debug("[RANKING SUMMARY PERF] db read totals unavailable", exc_info=True)
+    return {}
+
+
+def _emit_ranking_perf(*, interval, total, base, technical, persist, latest, cache, display, rows,
+                       latest_rows=0.0, ensure_score=0.0) -> None:
+    try:
+        accounted = sum(float(x or 0.0) for x in (base, technical, persist, latest, cache, display))
+        log = logger.warning if float(total or 0.0) >= 10.0 else logger.info
+        log(
+            "[RANKING SUMMARY PERF] interval=%s total=%.3fs rows=%s "
+            "base_df=%.3fs technical=%.3fs persist=%.3fs latest=%.3fs(rows=%.3fs score=%.3fs) "
+            "cache=%.3fs display=%.3fs "
+            "accounted=%.3fs unaccounted=%.3fs db_read=%s "
+            "(base_df の内訳は [RANKING DB READ STAGE] connect/execute/fetch を参照)",
+            interval, float(total or 0.0), rows,
+            float(base or 0.0), float(technical or 0.0), float(persist or 0.0),
+            float(latest or 0.0), float(latest_rows or 0.0), float(ensure_score or 0.0),
+            float(cache or 0.0), float(display or 0.0),
+            accounted, max(0.0, float(total or 0.0) - accounted),
+            _ranking_db_read_totals() or "-",
+        )
+    except Exception:
+        logger.debug("[RANKING SUMMARY PERF] emit failed", exc_info=True)
 
 
 def run_ranking_summary_once(
@@ -100,9 +154,30 @@ def run_ranking_summary_once(
         use_discord,
     )
 
+    # P0-3: どの段で時間を使っているのかを必ず出す。
+    def _rs_stage():
+        try:
+            from scheduler_jobs.summary import stage_tracker as _st
+            return _st
+        except Exception:
+            return None
+
+    _st = _rs_stage()
+    _t_all = time.perf_counter()
+
+    # 終わらせられないと分かっている仕事は始めない。
+    # (始めてから捨てると、その時間がまるごと無駄になる)
+    if _st is not None and _st.should_stop("ranking_summary_before_base"):
+        logger.warning(
+            "[RANKING SUMMARY STAGE] cooperative stop before base_df interval=%s "
+            "(予算切れのため着手しない)", interval,
+        )
+        return pd.DataFrame()
+
     # --------------------------------------------------------
-    # 1. technical 前の base_df を構築
+    # 1. technical 前の base_df を構築 (ranking DB resolve/read/7 type load/aggregate)
     # --------------------------------------------------------
+    _t0 = time.perf_counter()
     base_df = build_ranking_summary_base_df(
         trade_date=trade_date,
         interval=interval,
@@ -131,10 +206,36 @@ def run_ranking_summary_once(
         base_df["datetime"].max() if "datetime" in base_df.columns else None,
     )
 
+    _el_base = time.perf_counter() - _t0
+    _log = logger.warning if _el_base >= 3.0 else logger.info
+    _log("[RANKING SUMMARY STAGE] interval=%s base_df=%.3fs rows=%s",
+         interval, _el_base, len(base_df) if base_df is not None else -1)
+
+    # base_df が出来ているなら捨てない。
+    # 予算が尽きていたら technical だけ飛ばして base_df を使う。
+    # これは同ファイルの "built empty -> use base_df fallback" と同じ扱い。
+    _skip_technical = False
+    if _st is not None and _st.should_stop("ranking_summary_after_base"):
+        if base_df is not None and not base_df.empty:
+            _skip_technical = True
+            logger.warning(
+                "[RANKING SUMMARY STAGE] budget exhausted after base_df interval=%s "
+                "elapsed=%.3fs rows=%s -> technical を飛ばして base_df を使う "
+                "(完成した行は捨てない; technical 列は欠落する)",
+                interval, time.perf_counter() - _t_all, len(base_df),
+            )
+        else:
+            logger.warning(
+                "[RANKING SUMMARY STAGE] cooperative stop after base_df interval=%s "
+                "elapsed=%.3fs (base_df も空)", interval, time.perf_counter() - _t_all,
+            )
+            return pd.DataFrame()
+
     # --------------------------------------------------------
     # 2. technical 指標付与
     # --------------------------------------------------------
-    df = call_external_technical(
+    _t0 = time.perf_counter()
+    df = pd.DataFrame() if _skip_technical else call_external_technical(
         base_df,
         interval=interval,
         trade_date=trade_date,
@@ -164,6 +265,12 @@ def run_ranking_summary_once(
             interval,
         )
         df = base_df.copy()
+
+    _el_tech = time.perf_counter() - _t0
+    _log = logger.warning if _el_tech >= 3.0 else logger.info
+    _log("[RANKING SUMMARY STAGE] interval=%s technical=%.3fs rows=%s total=%.3fs",
+         interval, _el_tech, len(df) if df is not None else -1,
+         time.perf_counter() - _t_all)
 
     # --------------------------------------------------------
     # 3. 必須列保証
@@ -209,6 +316,8 @@ def run_ranking_summary_once(
     # --------------------------------------------------------
     # 4. 保存
     # --------------------------------------------------------
+    _t_persist = time.perf_counter()
+    _el_persist = 0.0
     if persist:
         if callable(save_ranking_summary):
             try:
@@ -233,12 +342,17 @@ def run_ranking_summary_once(
                 "[RANKING SUMMARY RUNNER] persist skipped interval=%s reason=save_ranking_summary_unavailable",
                 interval,
             )
+    _el_persist = time.perf_counter() - _t_persist
 
     # --------------------------------------------------------
     # 5. 最新行抽出
     # --------------------------------------------------------
+    _t_latest = time.perf_counter()
     latest = get_latest_rows(df)
+    _el_latest_rows = time.perf_counter() - _t_latest
+    _t_score = time.perf_counter()
     latest = ensure_score_columns(latest)
+    _el_ensure_score = time.perf_counter() - _t_score
 
     if latest is None:
         latest = pd.DataFrame()
@@ -261,11 +375,15 @@ def run_ranking_summary_once(
     # --------------------------------------------------------
     # 6. cache 更新
     # --------------------------------------------------------
+    _el_latest = time.perf_counter() - _t_latest
+    _t_cache = time.perf_counter()
     update_ranking_summary_cache(df, latest, interval=interval)
+    _el_cache = time.perf_counter() - _t_cache
 
     # --------------------------------------------------------
     # 7. 表示 / Discord
     # --------------------------------------------------------
+    _t_disp = time.perf_counter()
     announced = announce_if_requested(
         interval=interval,
         display=display,
@@ -279,6 +397,15 @@ def run_ranking_summary_once(
             interval=interval,
             top_n=top_n,
         )
+
+    _el_disp = time.perf_counter() - _t_disp
+    _emit_ranking_perf(
+        interval=interval, total=time.perf_counter() - _t_all,
+        base=_el_base, technical=_el_tech, persist=_el_persist,
+        latest=_el_latest, latest_rows=_el_latest_rows, ensure_score=_el_ensure_score,
+        cache=_el_cache, display=_el_disp,
+        rows=len(df) if df is not None else -1,
+    )
 
     logger.info(
         "[RANKING SUMMARY RUNNER] done interval=%s rows=%s latest_rows=%s "

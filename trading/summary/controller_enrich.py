@@ -16,7 +16,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -117,7 +120,7 @@ def attach_daily_mtf_for_display(df: pd.DataFrame, *, interval: int, context: st
         return out
 
     try:
-        from trading.summary.mtf.daily_runtime_patch import merge_daily_mtf_for_ai
+        from trading.summary.mtf.daily_runtime import merge_daily_mtf_for_ai
 
         before_nonzero = int((_num(out.get("score_mtf", pd.Series(index=out.index))) != 0).sum()) if "score_mtf" in out.columns else 0
         out = merge_daily_mtf_for_ai(out, source=f"SUMMARY_CONTROLLER_{context}_{interval}m")
@@ -179,7 +182,231 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [str(r[1]) for r in cur.fetchall()]
 
 
+# ranking DB からの読み出しキャッシュ。
+#
+# _read_ranking_df_from_db は 1 tick で複数回呼ばれ (実測 5 回/tick)、
+# そのたびに NAS 上の ranking DB から SELECT * ... LIMIT 20000 を投げていた。
+# ranking_collector は 1 分に 1 回しか書かないので、同じ tick の中で
+# 読み直しても内容は変わらない。実測ではこの読み出しが 1 tick 88 秒のうち
+# 最大の繰り返しコストだった。
+_RANKING_DF_CACHE: "tuple[float, pd.DataFrame] | None" = None
+_RANKING_DF_LOCK = threading.RLock()
+
+
+def _ranking_df_cache_ttl() -> float:
+    try:
+        return max(0.0, float(os.getenv("SUMMARY_ENRICH_RANKING_DB_CACHE_TTL_SEC", "30")))
+    except Exception:
+        return 30.0
+
+
+def reset_ranking_df_cache() -> None:
+    global _RANKING_DF_CACHE
+    with _RANKING_DF_LOCK:
+        _RANKING_DF_CACHE = None
+
+
+def _enrich_env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _enrich_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return default
+        return float(str(v).strip())
+    except Exception:
+        return default
+
+
+def _ranking_bg_refresh_enabled() -> bool:
+    return _enrich_env_bool("SUMMARY_ENRICH_RANKING_BG_REFRESH", True)
+
+
+def _ranking_db_budget_sec() -> float:
+    return max(0.2, _enrich_env_float("SUMMARY_ENRICH_RANKING_DB_BUDGET_SEC", 3.0))
+
+
+def _ranking_stale_max_sec() -> float:
+    """これより古いキャッシュは背景更新を待たず同期で読み直す。
+
+    stale をいつまでも使い続けないための上限。
+    stale 判定そのもの (TTL) は変えない。
+    """
+    return max(0.0, _enrich_env_float("SUMMARY_ENRICH_RANKING_STALE_MAX_SEC", 300.0))
+
+
+# 背景リフレッシュの single-flight
+_RANKING_BG_THREAD: "threading.Thread | None" = None
+_RANKING_BG_LOCK = threading.Lock()
+
+
+def _ranking_bg_running() -> bool:
+    with _RANKING_BG_LOCK:
+        th = _RANKING_BG_THREAD
+    return bool(th is not None and th.is_alive())
+
+
+def _start_ranking_bg_refresh(limit: int) -> bool:
+    """ranking DB の読み直しを background worker へ出す (同時に 1 本だけ)。"""
+    global _RANKING_BG_THREAD
+    with _RANKING_BG_LOCK:
+        th = _RANKING_BG_THREAD
+        if th is not None and th.is_alive():
+            return False
+
+        def _work() -> None:
+            global _RANKING_DF_CACHE
+            t0 = time.perf_counter()
+            try:
+                df = _read_ranking_df_from_db_uncached(limit=limit)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    with _RANKING_DF_LOCK:
+                        _RANKING_DF_CACHE = (time.monotonic(), df.copy())
+                    logger.warning(
+                        "[SUMMARY ENRICH][RANKING] bg refresh done rows=%s elapsed=%.3fs",
+                        len(df), time.perf_counter() - t0,
+                    )
+                else:
+                    logger.warning(
+                        "[SUMMARY ENRICH][RANKING] bg refresh empty elapsed=%.3fs "
+                        "(既存キャッシュは維持する)",
+                        time.perf_counter() - t0,
+                    )
+            except Exception:
+                logger.exception(
+                    "[SUMMARY ENRICH][RANKING] bg refresh failed elapsed=%.3fs",
+                    time.perf_counter() - t0,
+                )
+
+        t = threading.Thread(target=_work, name="ranking-enrich-refresh", daemon=True)
+        _RANKING_BG_THREAD = t
+    t.start()
+    return True
+
+
 def _read_ranking_df_from_db(limit: int = 20000) -> pd.DataFrame:
+    """hot path から呼ばれる ranking 取得。
+
+    P0-2: ここで NAS を同期で読むのをやめる。
+    キャッシュがあれば TTL 切れでもまず返し、更新は背景に投げる。
+    同期で読むのは「キャッシュが無い」か「古すぎる」ときだけ。
+    """
+    global _RANKING_DF_CACHE
+
+    ttl = _ranking_df_cache_ttl()
+    with _RANKING_DF_LOCK:
+        cached = _RANKING_DF_CACHE
+    age = None if cached is None else (time.monotonic() - cached[0])
+
+    if cached is not None and ttl > 0 and age is not None and age <= ttl:
+        logger.info(
+            "[SUMMARY ENRICH][RANKING] db source cached rows=%s age=%.1fs ttl=%.0fs",
+            len(cached[1]), age, ttl,
+        )
+        return cached[1].copy()
+
+    if cached is not None and _ranking_bg_refresh_enabled():
+        stale_max = _ranking_stale_max_sec()
+        too_old = bool(stale_max > 0 and age is not None and age > stale_max)
+        if not too_old:
+            started = _start_ranking_bg_refresh(limit)
+            logger.warning(
+                "[SUMMARY ENRICH][RANKING] serve stale from cache rows=%s age=%.1fs "
+                "ttl=%.0fs bg_refresh=%s (hot path で NAS を同期読みしない)",
+                len(cached[1]), age, ttl,
+                "started" if started else "already_running",
+            )
+            return cached[1].copy()
+        logger.warning(
+            "[SUMMARY ENRICH][RANKING] cache too old age=%.1fs > stale_max=%.0fs "
+            "-> 同期で読み直す",
+            age, stale_max,
+        )
+
+    df = _read_ranking_df_from_db_uncached(limit=limit)
+    if ttl > 0 and isinstance(df, pd.DataFrame) and not df.empty:
+        with _RANKING_DF_LOCK:
+            _RANKING_DF_CACHE = (time.monotonic(), df.copy())
+    elif cached is not None and (not isinstance(df, pd.DataFrame) or df.empty):
+        # 読めなかったときに既存キャッシュを空で潰さない
+        logger.warning(
+            "[SUMMARY ENRICH][RANKING] uncached read empty -> 既存キャッシュを維持 rows=%s age=%.1fs",
+            len(cached[1]), age if age is not None else -1.0,
+        )
+        return cached[1].copy()
+    return df
+
+
+# _build_ranking_enrich_df と build_ranking_aggregate が探す列候補。
+# ここに挙がっていない列は enrich に使われないので引かない。
+_RANKING_WANTED_COLUMNS = (
+    # symbol
+    "symbol", "code", "stock_code", "Symbol",
+    # ranking type
+    "rank_type", "ranking_type", "type", "category", "ranking_name",
+    # rank
+    "rank_position", "ranking_position", "rank", "position", "順位", "No",
+    # change rate
+    "change_rate", "chg", "change_percentage", "change_pct", "騰落率", "rate",
+    # turnover
+    "turnover", "trading_value", "売買代金", "value", "Value",
+    # volume
+    "trading_volume", "volume", "売買高", "出来高", "TradingVolume",
+    # market
+    "market", "market_type", "exchange", "Exchange", "exchange_name",
+    # time
+    "datetime", "snapshot_time", "time", "created_at", "updated_at",
+)
+
+
+def _ranking_project_enabled() -> bool:
+    return _enrich_env_bool("SUMMARY_ENRICH_RANKING_PROJECT_COLUMNS", True)
+
+
+def _ranking_select_columns(cols: list) -> str:
+    """引く列の SELECT 句を作る。1 つも当たらなければ '*' に落とす。"""
+    if not _ranking_project_enabled():
+        return "*"
+    have = [c for c in _RANKING_WANTED_COLUMNS if c in cols]
+    if not have:
+        logger.warning(
+            "[SUMMARY ENRICH][RANKING] 必要列が 1 つも見つからないため SELECT * に落とす cols=%d",
+            len(cols),
+        )
+        return "*"
+    seen = []
+    for c in have:
+        if c not in seen:
+            seen.append(c)
+    return ", ".join('"%s"' % c for c in seen)
+
+
+def _ranking_budget_guard(conn, sec: float) -> bool:
+    """SQLite クエリに実時間の上限を掛ける。
+
+    progress handler が 1 を返すと SQLite はクエリを中断し
+    OperationalError('interrupted') を投げる。
+    NAS が詰まったときに 67 秒 / 217 秒待たされないための保険。
+    """
+    deadline = time.perf_counter() + max(0.05, float(sec))
+
+    def _h() -> int:
+        return 1 if time.perf_counter() > deadline else 0
+
+    try:
+        conn.set_progress_handler(_h, 2000)
+        return True
+    except Exception:
+        logger.debug("[SUMMARY ENRICH][RANKING] progress handler unavailable", exc_info=True)
+        return False
+
+
+def _read_ranking_df_from_db_uncached(limit: int = 20000) -> pd.DataFrame:
     try:
         from ats.ats_ranking.db_path import get_usable_ranking_db_path
 
@@ -187,7 +414,12 @@ def _read_ranking_df_from_db(limit: int = 20000) -> pd.DataFrame:
         if not path or not Path(path).exists():
             return pd.DataFrame()
 
-        with sqlite3.connect(str(path), timeout=2.0) as conn:
+        # ranking DB は NAS 上にあり ranking_collector が毎分書き込む。
+        # ここは純粋な読み取りなので read-only で開いて書き込みロックを取らない。
+        # `with sqlite3.connect(...)` は close しないため使わず finally で閉じる。
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
             conn.execute("PRAGMA busy_timeout=2000;")
             table = "ranking_snapshot_1min"
             if not _table_exists(conn, table):
@@ -203,20 +435,47 @@ def _read_ranking_df_from_db(limit: int = 20000) -> pd.DataFrame:
                     time_col = c
                     break
 
+            # P0-2: SELECT * をやめる。108 列のうち enrich が使うのは 8 列だけで、
+            # 20,000 行 x 108 列を SMB 越しに引くのが 67.8s / 217.4s の正体だった。
+            sel = _ranking_select_columns(cols)
             if time_col:
-                sql = f'SELECT * FROM "{table}" ORDER BY "{time_col}" DESC LIMIT ?'
+                sql = f'SELECT {sel} FROM "{table}" ORDER BY "{time_col}" DESC LIMIT ?'
             else:
-                sql = f'SELECT * FROM "{table}" ORDER BY rowid DESC LIMIT ?'
+                sql = f'SELECT {sel} FROM "{table}" ORDER BY rowid DESC LIMIT ?'
 
-            df = pd.read_sql_query(sql, conn, params=(int(limit),))
-            logger.info(
-                "[SUMMARY ENRICH][RANKING] db source path=%s table=%s rows=%s time_col=%s",
-                path,
-                table,
-                len(df),
-                time_col,
+            t0 = time.perf_counter()
+            budget = _ranking_db_budget_sec()
+            guarded = _ranking_budget_guard(conn, budget)
+            try:
+                df = pd.read_sql_query(sql, conn, params=(int(limit),))
+            except Exception as e:
+                # 握り潰さない。どこで何秒使って落ちたかを出す。
+                logger.warning(
+                    "[SUMMARY ENRICH][RANKING] db read aborted path=%s table=%s "
+                    "elapsed=%.3fs budget=%.1fs err=%r",
+                    path, table, time.perf_counter() - t0, budget, e,
+                )
+                return pd.DataFrame()
+            finally:
+                if guarded:
+                    try:
+                        conn.set_progress_handler(None, 0)
+                    except Exception:
+                        pass
+
+            logger.warning(
+                "[SUMMARY ENRICH][RANKING] db source path=%s table=%s rows=%s cols=%s "
+                "time_col=%s projected=%s elapsed=%.3fs",
+                path, table, len(df), len(df.columns), time_col, sel != "*",
+                time.perf_counter() - t0,
             )
             return df
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    logger.debug("[SUMMARY ENRICH][RANKING] db close failed", exc_info=True)
 
     except Exception:
         logger.exception("[SUMMARY ENRICH][RANKING] db read failed")
@@ -332,12 +591,29 @@ def attach_ranking_for_display(df: pd.DataFrame, *, interval: int, context: str)
 
     try:
         out["symbol"] = _symbol_series(out["symbol"])
+        # P0-2: source load / aggregate / merge を分けて計測する。
+        _t0 = time.perf_counter()
         ranking_df = _get_ranking_source_df()
+        _el_src = time.perf_counter() - _t0
+
+        _t0 = time.perf_counter()
         enrich = _build_ranking_enrich_df(ranking_df)
+        _el_agg = time.perf_counter() - _t0
+
+        _log = logger.warning if (_el_src + _el_agg) >= 1.0 else logger.info
+        _log(
+            "[SUMMARY ENRICH STAGE][RANKING] context=%s interval=%s "
+            "source_load=%.3fs source_rows=%s aggregate=%.3fs enrich_rows=%s",
+            context, interval, _el_src,
+            len(ranking_df) if isinstance(ranking_df, pd.DataFrame) else -1,
+            _el_agg, len(enrich) if isinstance(enrich, pd.DataFrame) else -1,
+        )
+
         if enrich.empty:
             logger.warning("[SUMMARY ENRICH][RANKING] skipped interval=%s context=%s reason=no_enrich", interval, context)
             return out
 
+        _t_merge = time.perf_counter()
         before_cols = set(out.columns)
         before_score_nonzero = int((_num(out.get("ranking_score", pd.Series(index=out.index))) != 0).sum()) if "ranking_score" in out.columns else 0
 
@@ -376,6 +652,10 @@ def attach_ranking_for_display(df: pd.DataFrame, *, interval: int, context: str)
             before_score_nonzero,
             after_score_nonzero,
         )
+        logger.info(
+            "[SUMMARY ENRICH STAGE][RANKING] context=%s interval=%s merge=%.3fs rows=%s hit=%s",
+            context, interval, time.perf_counter() - _t_merge, len(merged), hit,
+        )
         return merged
 
     except Exception:
@@ -392,8 +672,23 @@ def enrich_summary_latest(df: pd.DataFrame, *, interval: int, context: str = "la
     if out.empty:
         return out
 
+    # P0-2: どの段で待っているのかを必ず出す。
+    t_all = time.perf_counter()
+    t0 = time.perf_counter()
     out = attach_daily_mtf_for_display(out, interval=interval, context=context)
+    el_mtf = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
     out = attach_ranking_for_display(out, interval=interval, context=context)
+    el_rank = time.perf_counter() - t0
+
+    total = time.perf_counter() - t_all
+    log = logger.warning if total >= 1.0 else logger.info
+    log(
+        "[SUMMARY ENRICH STAGE] context=%s interval=%s rows=%s "
+        "daily_mtf=%.3fs ranking=%.3fs total=%.3fs",
+        context, interval, len(out), el_mtf, el_rank, total,
+    )
     return out
 
 

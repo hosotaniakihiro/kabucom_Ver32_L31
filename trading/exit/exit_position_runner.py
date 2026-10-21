@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import sys
 from typing import Any, Dict, Optional, Tuple
 
 from core.global_context.context import global_context as GC
@@ -34,6 +35,7 @@ from trading.exit.exit_state_machine import manage_exit
 from trading.exit.exit_utils import safe_float
 from trading.exit.partial_profit_executor import execute_partial_profit
 from trading.exit.tonosama_exit_runner import apply_tonosama_exit_if_needed
+from trading.exit.mtf_trend_exit import judge_mtf_trend_exit, time_rules_enabled as _mtf_time_rules_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +254,7 @@ def _mark_fired(symbol: str, ctx: Any, pos: Dict[str, Any], attr: str, set_name:
         pass
 
 
-def _judge_absolute_entry_stop_loss(*, symbol: str, side: str, entry_price: float, current_price: float) -> Tuple[bool, str, Dict[str, Any]]:
+def _judge_absolute_entry_stop_loss_core(*, symbol: str, side: str, entry_price: float, current_price: float) -> Tuple[bool, str, Dict[str, Any]]:
     try:
         if entry_price <= 0 or current_price <= 0 or side not in {"BUY", "SELL"}:
             return False, "", {}
@@ -281,7 +283,7 @@ def _judge_absolute_entry_stop_loss(*, symbol: str, side: str, entry_price: floa
         return False, "", {}
 
 
-def _judge_partial_profit_take(*, symbol: str, pos: Dict[str, Any], side: str, entry_price: float, current_price: float, ctx: Any) -> Tuple[bool, str, Dict[str, Any]]:
+def _judge_partial_profit_take_core(*, symbol: str, pos: Dict[str, Any], side: str, entry_price: float, current_price: float, ctx: Any) -> Tuple[bool, str, Dict[str, Any]]:
     """+0.20%到達で半分だけ利確。すでに一部利確済みなら何もしない。"""
     try:
         if not PARTIAL_PROFIT_ENABLED:
@@ -302,7 +304,7 @@ def _judge_partial_profit_take(*, symbol: str, pos: Dict[str, Any], side: str, e
         return False, "", {}
 
 
-def _judge_entry_trail_retrace_exit(*, symbol: str, pos: Dict[str, Any], side: str, entry_price: float, current_price: float, ctx: Any) -> Tuple[bool, str, Dict[str, Any]]:
+def _judge_entry_trail_retrace_exit_core(*, symbol: str, pos: Dict[str, Any], side: str, entry_price: float, current_price: float, ctx: Any) -> Tuple[bool, str, Dict[str, Any]]:
     try:
         if _already_marked(symbol, ctx, pos, _TRAIL_RETRACE_MARK_ATTR, "entry_trail_retrace_exit_fired_symbols"):
             return False, "", {}
@@ -435,6 +437,18 @@ def run_exit_for_position(*, symbol: str, pos: Dict[str, Any], now: dt.datetime,
 
         logger.warning("[ABSOLUTE_ENTRY_STOP_LOSS] check symbol=%s side=%s entry=%.4f price=%.4f pnl=%.4f current_profit=%.4f%% threshold=%.4f%% pos_source=%s", symbol, side, entry_price, price, pnl, _calc_current_profit_pct(side=side, entry_price=entry_price, current_price=price), ABSOLUTE_ENTRY_STOP_LOSS_PCT, _pos_get(pos, "_position_source", default=""))
 
+        # 2026-10-21: ストップ高で売る。1 ティック手前で勢いが無ければそこで売る (ユーザー判断)。
+        try:
+            from trading.exit.limit_up_exit import judge_limit_up_exit
+            _lu_exit, _lu_reason, _lu_detail = judge_limit_up_exit(symbol=symbol, side=side, current_price=price, now=now)
+        except Exception:
+            logger.exception("[LIMIT UP EXIT] judge failed symbol=%s", symbol)
+            _lu_exit, _lu_reason, _lu_detail = False, "", {}
+        if _lu_exit:
+            logger.warning("[LIMIT UP EXIT] EXIT symbol=%s detail=%s reason=%s", symbol, _lu_detail, _lu_reason)
+            finalize_exit(symbol=symbol, price=price, reason=_lu_reason, cluster_id=0, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=None)
+            return True
+
         ctx = _resolve_exit_ctx(symbol, pos, side=side, entry_price=entry_price, now=now)
         if not ctx:
             logger.warning("[EXIT] skip ctx unavailable symbol=%s side=%s entry=%.4f", symbol, side, entry_price)
@@ -451,6 +465,25 @@ def run_exit_for_position(*, symbol: str, pos: Dict[str, Any], now: dt.datetime,
             cluster_id = GC.positions.get_cluster(symbol) or 0
         except Exception:
             cluster_id = 0
+
+        # 2026-09-15: 3 分足のトレンドで手仕舞う (エントリーを 3m/5m の指標で
+        #   判定するよう変えたのに合わせた)。損切りの後、利確判定の前。
+        #   エントリー時刻は約定時に作った ExitContext を優先する
+        #   (ブローカー由来の pos は entry_time が読み取り時刻になるため)。
+        try:
+            _mtf_entry_time = getattr(ctx, "entry_time", None)
+            if not isinstance(_mtf_entry_time, dt.datetime):
+                _mtf_entry_time = _fallback_entry_time(pos, now)
+            if getattr(_mtf_entry_time, "tzinfo", None) is not None:
+                _mtf_entry_time = _mtf_entry_time.replace(tzinfo=None)
+            _mtf_exit, _mtf_reason, _mtf_detail = judge_mtf_trend_exit(symbol=symbol, side=side, entry_time=_mtf_entry_time, now=now)
+        except Exception:
+            logger.exception("[MTF TREND EXIT] judge failed symbol=%s", symbol)
+            _mtf_exit, _mtf_reason, _mtf_detail = False, "", {}
+        if _mtf_exit:
+            logger.warning("[MTF TREND EXIT] EXIT symbol=%s detail=%s reason=%s", symbol, _mtf_detail, _mtf_reason)
+            finalize_exit(symbol=symbol, price=price, reason=_mtf_reason, cluster_id=cluster_id, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=ctx)
+            return True
 
         partial_exit, partial_reason, partial_detail = _judge_partial_profit_take(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=price, ctx=ctx)
         if partial_exit:
@@ -469,7 +502,10 @@ def run_exit_for_position(*, symbol: str, pos: Dict[str, Any], now: dt.datetime,
             finalize_exit(symbol=symbol, price=price, reason=trail_reason, cluster_id=cluster_id, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=ctx)
             return True
 
-        three_min_exit, three_min_reason, three_min_detail, mark_attr, mark_set_name = _judge_three_min_exit_rules(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=price, ctx=ctx, now=now)
+        # 2026-09-15: 時間基準のルール (3 分ルール / 進展なし / 停滞) は
+        #   MTF trend exit が有効な間は評価しない (EXIT_TIME_RULES_ENABLED=1 で併用)。
+        _time_rules = _mtf_time_rules_enabled()
+        three_min_exit, three_min_reason, three_min_detail, mark_attr, mark_set_name = (False, "", {}, "", "") if not _time_rules else _judge_three_min_exit_rules(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=price, ctx=ctx, now=now)
         if three_min_exit:
             logger.warning("[THREE_MIN_EXIT_RULE] EXIT symbol=%s detail=%s reason=%s", symbol, three_min_detail, three_min_reason)
             if mark_attr and mark_set_name:
@@ -477,7 +513,7 @@ def run_exit_for_position(*, symbol: str, pos: Dict[str, Any], now: dt.datetime,
             finalize_exit(symbol=symbol, price=price, reason=three_min_reason, cluster_id=cluster_id, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=ctx)
             return True
 
-        early_exit, early_reason = judge_early_profit_guard(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=price, ctx=ctx, now=now, bar5s=bar5s)
+        early_exit, early_reason = (False, "") if not _time_rules else judge_early_profit_guard(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=price, ctx=ctx, now=now, bar5s=bar5s)
         if early_exit:
             finalize_exit(symbol=symbol, price=price, reason=early_reason, cluster_id=cluster_id, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=ctx)
             return True
@@ -510,3 +546,380 @@ def run_exit_for_position(*, symbol: str, pos: Dict[str, Any], now: dt.datetime,
 
 
 __all__ = ["run_exit_for_position", "evaluate_collapse", "evaluate_rl"]
+
+
+# ============================================================
+# EXIT TRAIL 0.2 COST (旧 core/startup/exit_trail_03_runtime_patch.py)
+# ------------------------------------------------------------
+# 旧パッチは _judge_absolute_entry_stop_loss / _judge_entry_trail_retrace_exit /
+# _judge_partial_profit_take を「約定コスト(信用金利+成行スリッページ)込み」の
+# 判定へ**完全置換**していた (元関数は partial の例外時 fallback でのみ使用)。
+#
+# 旧パッチは fast_startup_runtime_patch から install されており、
+# fast_startup 自体は main.py の patches からしか呼ばれない。
+# よって適用スコープは main.py プロセスのみ。_et3_scope_enabled() が
+# それを再現し、スコープ外では従来どおり *_core を呼ぶ。
+#
+# 定数と env の上書き (ABSOLUTE_ENTRY_STOP_LOSS_PCT /
+# ENTRY_TRAIL_RETRACE_EXIT_PCT / EXIT_PROFIT_TRAIL_DRAWDOWN_PCT) は
+# _et3_apply_defaults() が import 時に同スコープで行う。
+# 旧 install() と同じく exit_tuning_defaults / user env を尊重し、0.3 へは戻さない。
+# ============================================================
+
+_ET3_SCOPE: Optional[bool] = None
+_ET3_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+
+def _et3_scope_enabled() -> bool:
+    """旧パッチが install されていたプロセス (main.py) かどうか。"""
+    global _ET3_SCOPE
+    if _ET3_SCOPE is not None:
+        return _ET3_SCOPE
+    enabled = False
+    try:
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if not any(n in argv for n in _ET3_DB_PROCESS_NAMES):
+            enabled = "main.py" in argv
+    except Exception:
+        enabled = False
+    _ET3_SCOPE = enabled
+    return enabled
+
+
+def _et3_f(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        x = float(v)
+        if x != x:
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def _et3_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _et3_sym(v: Any) -> str:
+    try:
+        s = str(v or "").strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _et3_state(symbol: str) -> Dict[str, Any]:
+    try:
+        from global_state import global_data
+        root = getattr(global_data, "exit_trail_02_state", None)
+        if not isinstance(root, dict):
+            root = {}
+            setattr(global_data, "exit_trail_02_state", root)
+        s = _et3_sym(symbol)
+        d = root.get(s)
+        if not isinstance(d, dict):
+            d = {}
+            root[s] = d
+        return d
+    except Exception:
+        return {}
+
+
+def _et3_pos_get(pos: Any, *keys: str) -> Any:
+    try:
+        if isinstance(pos, dict):
+            for k in keys:
+                v = pos.get(k)
+                if v not in (None, ""):
+                    return v
+        for k in keys:
+            v = getattr(pos, k, None)
+            if v not in (None, ""):
+                return v
+    except Exception:
+        pass
+    return None
+
+
+def _et3_trail_pct() -> float:
+    # percent表記。0.20 = 0.20%。
+    return max(_et3_env_float("EXIT_PROFIT_TRAIL_DRAWDOWN_PCT", _et3_env_float("ENTRY_TRAIL_RETRACE_EXIT_PCT", 0.20)), 0.01)
+
+
+def _et3_abs_stop_pct(current_default: float = 0.35) -> float:
+    return max(_et3_env_float("ABSOLUTE_ENTRY_STOP_LOSS_PCT", current_default), 0.01)
+
+
+# ------------------------------------------------------------
+# 2026-10-02 昼: 損切り幅を日足 ATR に合わせる (ユーザー判断)。
+#   負けた決済 36 件の保有時間は中央値 1.2 分、72% が決済後 15 分以内に建値へ戻っていた
+#   (一律 -0.3% はノイズで切られる)。日足 ATR x 0.15 を 0.5〜1.5% に収める。日足が取れなければ 0.8%。
+#   EXIT_STOP_DAILY_ATR_ENABLED=0 で従来の一律に戻る。
+# ------------------------------------------------------------
+_DAILY_ATR_CACHE: Dict[str, Any] = {}
+
+
+def _daily_atr_pct(symbol: str) -> Optional[float]:
+    import datetime as _dt
+    key = f"{symbol}:{_dt.date.today()}"
+    if key in _DAILY_ATR_CACHE:
+        return _DAILY_ATR_CACHE[key]
+    val = None
+    try:
+        import sqlite3
+        from trading.daily.daily_signal_loader import _resolve_daily_db_path
+        con = sqlite3.connect(f"file:{_resolve_daily_db_path()}?mode=ro", uri=True, timeout=2.0)
+        try:
+            rows = con.execute(
+                "select high, low, close from stock_analysis_history where stock_code=? order by date desc limit 20",
+                (str(symbol),),
+            ).fetchall()
+        finally:
+            con.close()
+        rows = [r for r in rows[::-1] if r[0] and r[1] and r[2] and r[2] > 0]
+        trs = []
+        for (h, l, c), (_ph, _pl, pc) in zip(rows[1:], rows[:-1]):
+            tr = max(h - l, abs(h - pc), abs(l - pc))
+            if tr / c <= 0.4:   # 壊れた足 (株式分割など) を除く
+                trs.append(tr / c * 100.0)
+        if len(trs) >= 8:
+            v = sum(trs[-14:]) / len(trs[-14:])
+            if 0 < v <= 20:
+                val = v
+    except Exception:
+        logger.debug("[EXIT DAILY ATR] failed symbol=%s", symbol, exc_info=True)
+    _DAILY_ATR_CACHE[key] = val
+    return val
+
+
+def _et3_stop_pct_for(symbol: str, fallback: float) -> tuple[float, str]:
+    if str(os.getenv("EXIT_STOP_DAILY_ATR_ENABLED", "1")).strip().lower() in ("0", "false", "no", "off"):
+        return fallback, "fixed"
+    mult = _et3_env_float("EXIT_STOP_DAILY_ATR_MULT", 0.15)
+    lo, hi = _et3_env_float("EXIT_STOP_MIN_PCT", 0.5), _et3_env_float("EXIT_STOP_MAX_PCT", 1.5)
+    datr = _daily_atr_pct(symbol)
+    if datr is None:
+        return _et3_env_float("EXIT_STOP_NO_DAILY_ATR_PCT", 0.8), "no_daily_atr"
+    return min(max(datr * mult, lo), hi), f"daily_atr={datr:.2f}"
+
+
+def _et3_tick_size(price: float) -> float:
+    # 簡易版。細かい呼値単位は銘柄区分で変わるため、まずは1円を標準にする。
+    # 必要なら環境変数 EXIT_MARKET_SLIPPAGE_TICK_SIZE_YEN で上書きする。
+    return max(_et3_env_float("EXIT_MARKET_SLIPPAGE_TICK_SIZE_YEN", 1.0), 0.0)
+
+
+def _et3_cost_params(current: float) -> tuple[float, float, float]:
+    interest_pct = max(_et3_env_float("EXIT_CREDIT_INTEREST_PCT", 0.01), 0.0)
+    ticks = max(_et3_env_float("EXIT_MARKET_SLIPPAGE_TICKS", 1.0), 0.0)
+    tick_yen = _et3_tick_size(current)
+    return interest_pct, ticks, tick_yen
+
+
+def _et3_effective_exit_price(side: str, current: float) -> float:
+    _interest_pct, ticks, tick_yen = _et3_cost_params(current)
+    slip = ticks * tick_yen
+    if side == "BUY":
+        # BUY建玉の返済は売り。成行だと1ティック安く約定しやすい前提。
+        return max(current - slip, 0.0)
+    # SELL建玉の返済は買い。成行だと1ティック高く約定しやすい前提。
+    return current + slip
+
+
+def _et3_profit_pct(side: str, entry: float, current: float) -> float:
+    if entry <= 0 or current <= 0:
+        return 0.0
+    if side == "BUY":
+        return (current - entry) / entry * 100.0
+    return (entry - current) / entry * 100.0
+
+
+def _et3_cost_detail(side: str, entry: float, current: float) -> Dict[str, Any]:
+    interest_pct, ticks, tick_yen = _et3_cost_params(current)
+    effective_price = _et3_effective_exit_price(side, current)
+    raw_profit_pct = _et3_profit_pct(side, entry, current)
+    effective_profit_pct = _et3_profit_pct(side, entry, effective_price) - interest_pct
+    return {
+        "interest_pct": interest_pct,
+        "slippage_ticks": ticks,
+        "tick_yen": tick_yen,
+        "current_price": current,
+        "effective_exit_price": effective_price,
+        "raw_profit_pct": raw_profit_pct,
+        "effective_profit_pct": effective_profit_pct,
+    }
+
+
+def _judge_absolute_entry_stop_loss(*, symbol: str, side: str, entry_price: float, current_price: float):
+    if not _et3_scope_enabled():
+        return _judge_absolute_entry_stop_loss_core(symbol=symbol, side=side, entry_price=entry_price, current_price=current_price)
+    side_u = str(side or "").upper()
+    entry = _et3_f(entry_price)
+    cur = _et3_f(current_price)
+    pct, pct_src = _et3_stop_pct_for(symbol, _et3_abs_stop_pct(ABSOLUTE_ENTRY_STOP_LOSS_PCT))
+    if entry <= 0 or cur <= 0 or side_u not in {"BUY", "SELL"}:
+        return False, "", {}
+    cost = _et3_cost_detail(side_u, entry, cur)
+    cost["stop_pct_source"] = pct_src
+    effective_price = cost["effective_exit_price"]
+    if side_u == "BUY":
+        line = entry * (1.0 - pct / 100.0)
+        adverse = (entry - effective_price) / entry * 100.0
+        detail = {"side": side_u, "entry_price": entry, "line": line, "adverse_pct": adverse, "threshold_pct": pct, **cost}
+        if effective_price <= line:
+            return True, f"ENTRY_PRICE_STOP_EXIT_BUY_COST pct={pct:.2f} entry={entry:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
+        return False, "", detail
+    line = entry * (1.0 + pct / 100.0)
+    adverse = (effective_price - entry) / entry * 100.0
+    detail = {"side": side_u, "entry_price": entry, "line": line, "adverse_pct": adverse, "threshold_pct": pct, **cost}
+    if effective_price >= line:
+        return True, f"ENTRY_PRICE_STOP_EXIT_SELL_COST pct={pct:.2f} entry={entry:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
+    return False, "", detail
+
+
+def _judge_entry_trail_retrace_exit(*, symbol: str, pos: Dict[str, Any], side: str, entry_price: float, current_price: float, ctx: Any):
+    if not _et3_scope_enabled():
+        return _judge_entry_trail_retrace_exit_core(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=current_price, ctx=ctx)
+    side_u = str(side or "").upper()
+    entry = _et3_f(entry_price)
+    cur = _et3_f(current_price)
+    pct = _et3_trail_pct()
+    if entry <= 0 or cur <= 0 or side_u not in {"BUY", "SELL"}:
+        return False, "", {}
+
+    st = _et3_state(symbol)
+    # 2026-10-19: 高値/安値は銘柄単位で持っていたため、同じ銘柄に入り直すと前のポジションの
+    #   高値が残り、建値より上の line で約定直後に決済していた (593A: 建値 2084 / 前回高値 2098)。
+    #   side・建値・hold_id が変わったら新しいポジションとして捨てる。ctx も銘柄単位で
+    #   使い回されるので、切り替わった回は ctx/pos の高値も使わない。
+    hold = str(_et3_pos_get(pos, "hold_id", "HoldID", "execution_id", "ExecutionID") or "")
+    key = (side_u, round(entry, 4))
+    old_hold = str(st.get("hold") or "")
+    fresh = st.get("key") != key or (hold and old_hold and hold != old_hold)
+    if fresh:
+        if st.get("key") is not None:
+            logger.info("[ENTRY_TRAIL_RETRACE_EXIT] reset state symbol=%s old_key=%s old_hold=%s new_key=%s new_hold=%s old_high=%s old_low=%s", symbol, st.get("key"), old_hold, key, hold, st.get("highest"), st.get("lowest"))
+        st.clear()
+        st["key"] = key
+    if hold:
+        st["hold"] = hold
+    old_high = _et3_f(st.get("highest"))
+    old_low = _et3_f(st.get("lowest"))
+    pos_high = 0.0 if fresh else _et3_f(_et3_pos_get(pos, "highest_since_entry", "highest", "high_since_entry"))
+    pos_low = 0.0 if fresh else _et3_f(_et3_pos_get(pos, "lowest_since_entry", "lowest", "low_since_entry"))
+    ctx_high = _et3_f(getattr(ctx, "highest", 0.0)) if ctx is not None and not fresh else 0.0
+    ctx_low = _et3_f(getattr(ctx, "lowest", 0.0)) if ctx is not None and not fresh else 0.0
+
+    high = max(x for x in [entry, cur, old_high, pos_high, ctx_high] if x > 0)
+    low = min(x for x in [entry, cur, old_low, pos_low, ctx_low] if x > 0)
+
+    st["highest"] = high
+    st["lowest"] = low
+    st["last_price"] = cur
+    try:
+        if isinstance(pos, dict):
+            pos["highest_since_entry"] = high
+            pos["lowest_since_entry"] = low
+    except Exception:
+        pass
+    try:
+        if ctx is not None:
+            setattr(ctx, "highest", high)
+            setattr(ctx, "lowest", low)
+            setattr(ctx, "last_price", cur)
+    except Exception:
+        pass
+
+    cost = _et3_cost_detail(side_u, entry, cur)
+    effective_price = cost["effective_exit_price"]
+
+    if side_u == "BUY":
+        line = high * (1.0 - pct / 100.0)
+        retrace = (high - effective_price) / high * 100.0 if high > 0 else 0.0
+        detail = {"side": side_u, "entry_price": entry, "highest": high, "line": line, "retrace_pct": retrace, "threshold_pct": pct, **cost}
+        # 2026-10-02 昼: 決済位置が建値以上の時だけ発動 (建値を少し超えた直後の押しで建値割れ決済しない)。
+        #   EXIT_TRAIL_REQUIRE_BREAKEVEN=0 で従来どおり。
+        be_ok = line >= entry or str(os.getenv("EXIT_TRAIL_REQUIRE_BREAKEVEN", "1")).strip().lower() in ("0", "false", "no", "off")
+        if high > entry and be_ok and effective_price <= line:
+            return True, f"HIGH_0P2_TRAIL_EXIT_BUY_COST high={high:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
+        return False, "", detail
+
+    line = low * (1.0 + pct / 100.0)
+    retrace = (effective_price - low) / low * 100.0 if low > 0 else 0.0
+    detail = {"side": side_u, "entry_price": entry, "lowest": low, "line": line, "retrace_pct": retrace, "threshold_pct": pct, **cost}
+    be_ok = line <= entry or str(os.getenv("EXIT_TRAIL_REQUIRE_BREAKEVEN", "1")).strip().lower() in ("0", "false", "no", "off")
+    if low < entry and be_ok and effective_price >= line:
+        return True, f"LOW_0P2_TRAIL_EXIT_SELL_COST low={low:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
+    return False, "", detail
+
+
+def _judge_partial_profit_take(*, symbol: str, pos: Dict[str, Any], side: str, entry_price: float, current_price: float, ctx: Any):
+    if not _et3_scope_enabled():
+        return _judge_partial_profit_take_core(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=current_price, ctx=ctx)
+    side_u = str(side or "").upper()
+    entry = _et3_f(entry_price)
+    cur = _et3_f(current_price)
+    if entry <= 0 or cur <= 0 or side_u not in {"BUY", "SELL"}:
+        return False, "", {}
+    try:
+        enabled = bool(PARTIAL_PROFIT_ENABLED)
+        trigger = _et3_f(PARTIAL_PROFIT_TRIGGER_PCT, 0.40)
+        min_qty = int(_et3_f(PARTIAL_PROFIT_MIN_QTY, 200))
+        ratio = _et3_f(PARTIAL_PROFIT_RATIO, 0.50)
+        qty = int(_et3_f(_et3_pos_get(pos, "qty", "quantity"), 0))
+        cost = _et3_cost_detail(side_u, entry, cur)
+        detail = {"side": side_u, "entry_price": entry, "qty": qty, "trigger_pct": trigger, "ratio": ratio, "min_qty": min_qty, **cost}
+        if not enabled:
+            return False, "", detail
+        if qty < min_qty:
+            return False, "", detail
+        if cost["effective_profit_pct"] >= trigger:
+            return True, f"PARTIAL_PROFIT_TAKE_COST_AWARE effective_profit={cost['effective_profit_pct']:.3f}%>=trigger={trigger:.3f}% raw={cost['raw_profit_pct']:.3f}%", detail
+        return False, "", detail
+    except Exception:
+        logger.exception("[PARTIAL PROFIT COST] failed symbol=%s", symbol)
+        return _judge_partial_profit_take_core(symbol=symbol, pos=pos, side=side, entry_price=entry_price, current_price=current_price, ctx=ctx)
+
+
+def _et3_apply_defaults() -> None:
+    """旧 install() の定数/env 上書きを再現する (main.py スコープのみ)。"""
+    global ABSOLUTE_ENTRY_STOP_LOSS_PCT, ENTRY_TRAIL_RETRACE_EXIT_PCT
+    if not _et3_scope_enabled():
+        return
+    try:
+        abs_pct = _et3_abs_stop_pct(_et3_f(ABSOLUTE_ENTRY_STOP_LOSS_PCT, 0.35))
+        trail_pct = _et3_trail_pct()
+        ABSOLUTE_ENTRY_STOP_LOSS_PCT = abs_pct
+        ENTRY_TRAIL_RETRACE_EXIT_PCT = trail_pct
+        os.environ["ENTRY_TRAIL_RETRACE_EXIT_PCT"] = f"{trail_pct:.2f}"
+        os.environ["EXIT_PROFIT_TRAIL_DRAWDOWN_PCT"] = f"{trail_pct:.2f}"
+        logger.warning(
+            "[EXIT TRAIL 0.2 COST] installed abs_line=%.2f trail_line=%.2f interest_pct=%.4f slippage_ticks=%.2f tick_yen=%.4f",
+            _et3_abs_stop_pct(abs_pct),
+            _et3_trail_pct(),
+            _et3_env_float("EXIT_CREDIT_INTEREST_PCT", 0.01),
+            _et3_env_float("EXIT_MARKET_SLIPPAGE_TICKS", 1.0),
+            _et3_env_float("EXIT_MARKET_SLIPPAGE_TICK_SIZE_YEN", 1.0),
+        )
+    except Exception:
+        logger.exception("[EXIT TRAIL 0.2 COST] apply defaults failed")
+
+
+_et3_apply_defaults()

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
@@ -149,7 +150,13 @@ def _safe_df(df: Any) -> pd.DataFrame:
             pass
 
         try:
-            out.replace([np.inf, -np.inf], np.nan, inplace=True)
+            # object 列を含む DataFrame へ一括 replace すると
+            #   FutureWarning: Downcasting behavior in `replace` is deprecated
+            # になる。inf は数値列にしか存在しないので数値列だけを対象にする
+            # (結果は従来と同じ)。
+            num_cols = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
+            if num_cols:
+                out[num_cols] = out[num_cols].replace([np.inf, -np.inf], np.nan)
         except Exception:
             pass
 
@@ -198,6 +205,37 @@ def _normalize_flag_key(key: str) -> str:
     if not k.startswith("flag_"):
         k = f"flag_{k}"
     return k
+
+
+def _use_table_breakdown() -> bool:
+    """SCORE_TABLE 方式の値を実際に採用するか。
+
+    flag 列が繋がると used_flags は 71 になるが、table 方式は
+    trend/mom の負値をほぼ 0 にするため、ranking_pipeline の
+    direction_penalty が効かなくなり ENTRY 条件が緩む
+    (2026-08-26 実測: mom の負値 104/300 -> 0/300)。
+    値の切り替えは明示スイッチにする。既定は従来どおり fallback。
+    """
+    try:
+        v = os.getenv("SCORE_BREAKDOWN_USE_TABLE")
+        if v is None or str(v).strip() == "":
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return False
+
+
+def _min_flags_for_table() -> int:
+    """SCORE_TABLE 方式を採用するのに必要な最低一致数。
+
+    0 個のときだけ fallback という判定だと、たまたま 1〜2 個だけ一致したときに
+    「180 flag のうち 2 個だけで内訳を作る」という fallback より悪い状態へ
+    黙って切り替わる。既定は 10 個。
+    """
+    try:
+        return int(float(os.getenv("SCORE_BREAKDOWN_MIN_FLAGS", "10")))
+    except Exception:
+        return 10
 
 
 def _classify_flag(flag_name: str, weight: float) -> str:
@@ -274,6 +312,43 @@ def _load_score_table() -> Dict[str, float]:
 # ============================================================
 # fallback breakdown
 # ============================================================
+
+def _nz(s) -> int:
+    try:
+        return int((pd.to_numeric(s, errors="coerce").fillna(0.0) != 0).sum())
+    except Exception:
+        return -1
+
+
+def _neg(s) -> int:
+    try:
+        return int((pd.to_numeric(s, errors="coerce").fillna(0.0) < 0).sum())
+    except Exception:
+        return -1
+
+
+def _log_table_vs_fallback(out, *, table_flags: int, used_flags: int, table_values, adopted: bool = True) -> None:
+    """flag が十分そろったとき、table 値と fallback 値の差を 1 行で残す。"""
+    try:
+        fb = _fallback_breakdown(out)
+        names = ("base", "trend", "mom", "vel", "pen")
+        parts = []
+        for i, nm in enumerate(names):
+            parts.append(
+                "%s[table nz=%d neg=%d / fallback nz=%d neg=%d]"
+                % (nm, _nz(table_values[i]), _neg(table_values[i]), _nz(fb[i]), _neg(fb[i]))
+            )
+        logger.warning(
+            "[SCORE BREAKDOWN] flag coverage OK rows=%s table_flags=%s used_flags=%s "
+            "adopted=%s (SCORE_BREAKDOWN_USE_TABLE=%s) | %s",
+            len(out), table_flags, used_flags,
+            "SCORE_TABLE" if adopted else "fallback(既定: ENTRY条件を変えないため)",
+            os.getenv("SCORE_BREAKDOWN_USE_TABLE") or "unset",
+            " ".join(parts),
+        )
+    except Exception:
+        logger.exception("[SCORE BREAKDOWN] table/fallback 比較ログに失敗")
+
 
 def _fallback_breakdown(out: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
     """
@@ -367,6 +442,9 @@ def attach_score_breakdown(
     if out.empty:
         return out
 
+    # 呼び出し側が table を明示指定した場合は、その意図どおり table 方式を使う。
+    # (本番経路は score_table=None なので env ゲートの判断に従う)
+    explicit_table = score_table is not None
     if score_table is None:
         score_table = _load_score_table()
 
@@ -385,11 +463,21 @@ def attach_score_breakdown(
 
     used_flags = 0
 
+    # score_config.ini のキーは _normalize_flag_key で必ず "flag_" 付きに揃えられるが、
+    # DataFrame 側 (flag_builder_buy/sell や conditions_long 由来) の列名は
+    # "bullish_engulfing" のように接頭辞なしで作られる。
+    # 接頭辞つきの名前だけで突き合わせていたため、列が存在していても
+    # used_flags=0 になっていた。両方の綴りを見る。
     for flag_col, weight in table.items():
-        if flag_col not in out.columns:
-            continue
+        col = flag_col
+        if col not in out.columns:
+            bare = flag_col[5:] if flag_col.startswith("flag_") else flag_col
+            if bare and bare in out.columns:
+                col = bare
+            else:
+                continue
 
-        flag_value = _num_series(out, flag_col, default=0.0)
+        flag_value = _num_series(out, col, default=0.0)
         contrib = flag_value * float(weight)
 
         category = _classify_flag(flag_col, weight)
@@ -407,15 +495,39 @@ def attach_score_breakdown(
 
         used_flags += 1
 
-    if used_flags == 0:
+    # 一部しか一致しない状態で table 方式に切り替えると、
+    # 180 flag 中 2 個だけで内訳を組み立てることになり fallback より劣化する。
+    # 実運用では flag_builder_buy/sell が pipeline から呼ばれておらず
+    # summary DF には ma5_above_ma25 / ma5_below_ma25 の 2 個しか存在しない
+    # (builder を通せば 71 個そろう)。十分な数がそろうまでは fallback を使う。
+    min_flags = max(1, _min_flags_for_table())
+    if used_flags < min_flags:
         score_base, score_trend, score_momentum, score_velocity, score_penalty = _fallback_breakdown(out)
         if debug:
             logger.warning(
-                "[SCORE BREAKDOWN] no matched flag columns; fallback used rows=%s table_flags=%s df_cols=%s",
+                "[SCORE BREAKDOWN] flag coverage too low; fallback used "
+                "rows=%s table_flags=%s matched_flags=%s min_flags=%s df_cols=%s "
+                "hint=flag_builder_buy/sell が pipeline 未接続の可能性",
                 len(out),
                 len(table),
+                used_flags,
+                min_flags,
                 len(out.columns),
             )
+    else:
+        # flag は十分そろっている。table 値と fallback 値の差を必ず残す。
+        if debug:
+            _log_table_vs_fallback(
+                out,
+                table_flags=len(table),
+                used_flags=used_flags,
+                table_values=(score_base, score_trend, score_momentum, score_velocity, score_penalty),
+                adopted=bool(explicit_table or _use_table_breakdown()),
+            )
+        if not (explicit_table or _use_table_breakdown()):
+            # ENTRY 条件を勝手に緩めないため、値は従来どおり fallback を使う。
+            # SCORE_BREAKDOWN_USE_TABLE=1 で設計どおりの table 方式になる。
+            score_base, score_trend, score_momentum, score_velocity, score_penalty = _fallback_breakdown(out)
 
     out["score_base"] = pd.to_numeric(score_base, errors="coerce").fillna(0.0).round(round_digits)
     out["score_trend"] = pd.to_numeric(score_trend, errors="coerce").fillna(0.0).round(round_digits)

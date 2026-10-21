@@ -54,6 +54,7 @@ from .sql_helpers import (
     quote_ident,
 )
 from .timezone import to_tz_naive_timestamp
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,7 @@ def load_push_df_for_dates(
             continue
 
         try:
-            with sqlite3.connect(path) as conn:
+            with committing_connect(path) as conn:
                 table_name = detect_push_table_name(conn)
                 if not table_name:
                     logger.warning(

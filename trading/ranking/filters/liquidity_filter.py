@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -50,10 +50,32 @@ PRICE_COLUMNS = (
     "last_price",
 )
 
-VOLUME_COLUMNS = (
-    "volume",
+# ------------------------------------------------------------
+# 流動性スクリーニングに使う出来高列 (2026-09-01 修正)
+# ------------------------------------------------------------
+# LIQUIDITY_MIN_VOLUME=10000 / MIN_TURNOVER=1,000,000 は
+# 「その銘柄が日中どれだけ商いがあるか」を見る *日次流動性* の閾値。
+# ところが従来は列の優先順位が "volume" 先頭だったため、
+# ranking_pipeline が渡す *1本の足の出来高* (3分足 max 5500) と
+# 日次流動性の閾値を突き合わせ、50 銘柄中 48 銘柄を落として
+# "empty after volume filter" になっていた (実測 13:46/13:48/13:50)。
+#
+# kabu Station PUSH の TradingVolume は当日累計出来高で、
+# 本システムでは trading_volume 列がそれにあたる
+# (memory_latest_1m は集計時に "last" を取っている = 累計の最新値)。
+# 流動性判定では累計側を優先する。閾値は変更しない。
+CUMULATIVE_VOLUME_COLUMNS = (
     "trading_volume",
+    "day_volume",
+    "cum_volume",
+    "volume_cum",
 )
+
+PER_BAR_VOLUME_COLUMNS = (
+    "volume",
+)
+
+VOLUME_COLUMNS = CUMULATIVE_VOLUME_COLUMNS + PER_BAR_VOLUME_COLUMNS
 
 TURNOVER_COLUMNS = (
     "turnover",
@@ -130,25 +152,38 @@ def _ensure_standard_columns(df: pd.DataFrame) -> pd.DataFrame:
     volume_col = _first_existing_col(out, VOLUME_COLUMNS)
     turnover_col = _first_existing_col(out, TURNOVER_COLUMNS)
 
+    # 1列ずつ代入すると 160 列超のフレームに最大 8 回 frame.insert が走り、
+    # pandas が PerformanceWarning (DataFrame is highly fragmented) を出す。
+    # 値は変えずに、まとめて 1 回で足す。
+    pending: dict[str, Any] = {}
+
     if price_col:
         price = _to_numeric_col(out, price_col, default=0.0)
         if "close" not in out.columns:
-            out["close"] = price
+            pending["close"] = price
         for alias in ("close_price", "current_price", "price"):
             if alias not in out.columns:
-                out[alias] = price
+                pending[alias] = price
 
     if volume_col:
         volume = _to_numeric_col(out, volume_col, default=0.0)
         if "volume" not in out.columns:
-            out["volume"] = volume
+            pending["volume"] = volume
         if "trading_volume" not in out.columns:
-            out["trading_volume"] = volume
+            pending["trading_volume"] = volume
 
-    if turnover_col and "turnover" not in out.columns:
-        out["turnover"] = _to_numeric_col(out, turnover_col, default=0.0)
-    if turnover_col and "trading_value" not in out.columns:
-        out["trading_value"] = _to_numeric_col(out, turnover_col, default=0.0)
+    if turnover_col:
+        turnover = _to_numeric_col(out, turnover_col, default=0.0)
+        if "turnover" not in out.columns:
+            pending["turnover"] = turnover
+        if "trading_value" not in out.columns:
+            pending["trading_value"] = turnover
+
+    if pending:
+        # assign でも内部的には1列ずつ挿入されるため、上流で既に断片化している
+        # 160列超のフレームでは PerformanceWarning が残る。
+        # pandas が案内するとおり concat で一度に連結する (値は変わらない)。
+        out = pd.concat([out, pd.DataFrame(pending, index=out.index)], axis=1)
 
     return out
 
@@ -175,8 +210,10 @@ def _ensure_turnover(df: pd.DataFrame) -> pd.DataFrame:
         repaired = existing.copy()
         repaired.loc[repair_mask] = computed.loc[repair_mask]
 
-        df["turnover"] = repaired
-        df["trading_value"] = repaired
+        # 2列を別々に代入すると 160 列超のフレームで frame.insert が2回走り
+        # PerformanceWarning (highly fragmented) になる。concat で一度に入れる。
+        new_cols = pd.DataFrame({"turnover": repaired, "trading_value": repaired}, index=df.index)
+        df = pd.concat([df.drop(columns=[c for c in ("turnover", "trading_value") if c in df.columns]), new_cols], axis=1)
 
         repaired_count = int(repair_mask.sum()) if len(df) else 0
         if repaired_count > 0:
@@ -210,8 +247,33 @@ def _volume_filter(df: pd.DataFrame, min_volume: int) -> pd.DataFrame:
 
     before = len(df)
     volume = _to_numeric_col(df, volume_col, default=0.0)
+
+    is_cumulative = volume_col in CUMULATIVE_VOLUME_COLUMNS
+    if not is_cumulative:
+        # 累計列が無く 1 本足の出来高しか無い。
+        # 日次流動性の閾値をそのまま当てると全滅するので、
+        # 「何と何を比べているか」を必ず残す。閾値は動かさない。
+        logger.warning(
+            "[liquidity_filter] 累計出来高列が無いため per-bar 列で判定する col=%s "
+            "min_volume=%s vol_min=%.0f vol_max=%.0f rows=%d "
+            "(閾値は日次流動性向け。全滅する場合は上流が 1 本足を渡している)",
+            volume_col, min_volume,
+            float(volume.min()) if before else 0.0,
+            float(volume.max()) if before else 0.0,
+            before,
+        )
+
     out = df[volume >= float(min_volume)].copy()
     removed = before - len(out)
+
+    if before and len(out) == 0:
+        logger.error(
+            "[liquidity_filter] volume filter が全銘柄を除外した col=%s cumulative=%s "
+            "min_volume=%s vol_min=%.0f vol_max=%.0f rows=%d "
+            "(閾値と列の意味が一致しているか確認する)",
+            volume_col, is_cumulative, min_volume,
+            float(volume.min()), float(volume.max()), before,
+        )
 
     if removed > 0:
         logger.info(
@@ -311,7 +373,7 @@ def _vwap_guard(df: pd.DataFrame) -> pd.DataFrame:
 # main filter
 # ============================================================
 
-def apply_liquidity_filter(
+def apply_liquidity_filter_core(
     df: pd.DataFrame,
     *,
     min_volume: int = MIN_VOLUME,
@@ -382,6 +444,98 @@ def apply_liquidity_filter(
     except Exception:
         logger.exception("[liquidity_filter] failed context=%s", context)
         return pd.DataFrame()
+
+
+# ============================================================
+# 流動性フィルタが全件 0 件になったときの段階緩和
+#   旧 core/startup/liquidity_empty_fallback_patch.py (V1)
+# ------------------------------------------------------------
+# [ranking_pipeline] empty after apply_liquidity_filter で候補が全部消えるのを防ぐ。
+# 代金 (turnover) のみを段階的に緩め、price は落とさない。
+#
+# 旧パッチは ENABLE_LIQ_EMPTY_FALLBACK_PATCH が真のときだけ install される
+# opt-in (既定 OFF) だった。そのスコープを _liq_empty_fallback_enabled() で再現する。
+# ============================================================
+def _liq_empty_fallback_enabled() -> bool:
+    """旧 sitecustomize._install_liq_empty_fallback_only_if_enabled() の判定を再現する。"""
+    try:
+        if str(os.environ.get("DISABLE_LIQ_EMPTY_FALLBACK_PATCH", "")).strip() == "1":
+            return False
+        v = os.environ.get("ENABLE_LIQ_EMPTY_FALLBACK_PATCH")
+        if v is None or str(v).strip() == "":
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return False
+
+
+def apply_liquidity_filter(
+    df: pd.DataFrame,
+    *,
+    min_volume: int = None,
+    min_turnover: int = None,
+    min_price: float = None,
+    max_price: float = None,
+    require_price: bool = None,
+    context: str = "",
+) -> pd.DataFrame:
+    # 既定値はモジュール定数を「呼び出し時に」読む。
+    # (旧パッチが getattr(lf, "MIN_VOLUME", ...) で解決していた挙動に合わせる)
+    if min_volume is None:
+        min_volume = int(MIN_VOLUME)
+    if min_turnover is None:
+        min_turnover = int(MIN_TURNOVER)
+    if min_price is None:
+        min_price = float(MIN_PRICE)
+    if max_price is None:
+        max_price = float(MAX_PRICE)
+    if require_price is None:
+        require_price = bool(REQUIRE_PRICE_COLUMN)
+
+    before = 0 if df is None else len(df)
+    out = apply_liquidity_filter_core(
+        df,
+        min_volume=min_volume,
+        min_turnover=min_turnover,
+        min_price=min_price,
+        max_price=max_price,
+        require_price=require_price,
+        context=context,
+    )
+    if not _liq_empty_fallback_enabled():
+        return out
+    if out is not None and not out.empty:
+        return out
+    if df is None or getattr(df, "empty", True):
+        return pd.DataFrame()
+
+    for label, turnover, volume in (
+        ("turnover_1m", 1_000_000, min_volume),
+        ("price_volume_only", 0, min_volume),
+        ("price_only", 0, 0),
+    ):
+        try:
+            cand = apply_liquidity_filter_core(
+                df,
+                min_volume=volume,
+                min_turnover=turnover,
+                min_price=min_price,
+                max_price=max_price,
+                require_price=require_price,
+                context=f"{context}|fallback:{label}" if context else f"fallback:{label}",
+            )
+        except Exception:
+            logger.debug("[LIQ EMPTY FALLBACK] ranking relax failed step=%s", label, exc_info=True)
+            continue
+        if cand is not None and not cand.empty:
+            logger.warning(
+                "[LIQ EMPTY FALLBACK] ranking liquidity relaxed step=%s context=%s before=%d after=%d original_min_turnover=%s min_price=%.1f min_volume=%s",
+                label, context, before, len(cand), min_turnover, float(min_price), volume,
+            )
+            return cand
+
+    logger.warning("[LIQ EMPTY FALLBACK] ranking liquidity still empty context=%s before=%d", context, before)
+    return out
 
 
 # ============================================================

@@ -1,0 +1,351 @@
+# ============================================================
+# trading/filters/mtf_ma_gate.py
+# ------------------------------------------------------------
+# 3 分足 / 5 分足の 5MA・25MA を使ったエントリーゲート (全経路共通)。
+#
+# 2026-09-15 ユーザー指示:
+#   「3分足5分足の 5MA 25MA を使っていない。使うように変更して。
+#     それまでエントリーしないようにして」
+#
+# 背景:
+#   ランキング経路には f864193 (9/15 00:54) で MTF_MA ゲートが入ったが、
+#   前日のエントリー (7013 / 8001 / 9984) は SUMMARY 経路で、そちらは
+#   3m/5m から score_3m / score_5m しか付けておらず MA を見ていなかった。
+#   経路ごとに入れると漏れるので、entry_controller の共通パイプライン
+#   (atr / range_5m の直後、AI ゲートの前) に 1 箇所で入れる。
+#
+# 判定 (V1.1, 2026-09-15 08:5x のユーザー指示
+#        「テクニカル指標は 3 分足・5 分足の 5MA・25MA を使い、これをもとにエントリー」):
+#   BUY  : 終値 > 5MA > 25MA   (終値が両 MA の上、かつ 5MA が 25MA の上)
+#   SELL : 終値 < 5MA < 25MA
+#   3 分足 または 5 分足 で成立 (ANY。9/15 夕に ALL から緩めた)。1 分足は見ない。
+#   env: MTF_MA_GATE_CONFIRM_MODE=ANY / MTF_MA_GATE_REQUIRE_ORDER=0 / MTF_MA_GATE_BASE_TF=1m
+#
+# データ:
+#   GC.get_summary_history(tf, source="push") の各銘柄の最新足。
+#   summary_incremental_engine が ma5/ma25/ma75 を rolling(min_periods=1)
+#   で付けているので、足が 1 本でもあれば値は入る (寄り直後は短い窓の平均)。
+#
+# データ無しの扱い (ランキング側と違う点):
+#   ユーザー要件は「MA を見るまでエントリーしない」なので、確認足 (3m/5m)
+#   のデータが両方無ければ **fail-closed** (却下)。
+#   env MTF_MA_GATE_ALLOW_NO_DATA=1 でランキング側と同じ fail-open に戻せる。
+#
+# 一発 OFF: env MTF_MA_GATE_ENABLED=0
+# ============================================================
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import os
+import threading
+from typing import Any, Dict, Optional, Tuple
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+VERSION = "V1.5-MTF-GATE-RSI-MACD-ONLY"
+
+_TF_MAP = {1: "1m", 3: "3m", 5: "5m"}
+_CACHE_TTL_SEC = 5.0
+
+_cache_lock = threading.Lock()
+_cache: Dict[int, Tuple[float, pd.DataFrame]] = {}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return str(v).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _f(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        x = float(v)
+        if x != x:  # NaN
+            return default
+        return x
+    except Exception:
+        return default
+
+
+def _env_f(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        return float(v) if v not in (None, "") else float(default)
+    except Exception:
+        return float(default)
+
+
+def _norm_symbol(v: Any) -> str:
+    s = str(v or "").strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
+def _cfg() -> Dict[str, Any]:
+    try:
+        from config.ranking_entry_config import RANKING_ENTRY_CONFIG
+        return dict(RANKING_ENTRY_CONFIG.get("MTF_MA", {}) or {})
+    except Exception:
+        return {}
+
+
+def gate_enabled() -> bool:
+    return _env_bool("MTF_MA_GATE_ENABLED", True)
+
+
+def _latest_rows(tf: int) -> pd.DataFrame:
+    """tf 分足の銘柄ごと最新行 (symbol, close, ma5, ma25, ma75, datetime)。5 秒キャッシュ。"""
+    now = dt.datetime.now().timestamp()
+    with _cache_lock:
+        hit = _cache.get(tf)
+        if hit and now - hit[0] <= _CACHE_TTL_SEC:
+            return hit[1]
+    df = pd.DataFrame()
+    try:
+        from core.global_context.context import global_context as GC
+        try:
+            src = GC.get_summary_history(tf, source="push")
+        except TypeError:
+            src = GC.get_summary_history(tf)
+        if isinstance(src, pd.DataFrame) and not src.empty and "symbol" in src.columns:
+            cols = [c for c in ("symbol", "datetime", "close", "current_price", "ma5", "ma25", "ma75", "rsi", "macd", "signal", "hist") if c in src.columns]
+            work = src[cols].copy()
+            work["symbol"] = work["symbol"].map(_norm_symbol)
+            if "datetime" in work.columns:
+                work["datetime"] = pd.to_datetime(work["datetime"], errors="coerce")
+                work = work.sort_values(["symbol", "datetime"], kind="stable")
+            df = work.groupby("symbol", as_index=False).tail(1).set_index("symbol", drop=False)
+    except Exception:
+        logger.debug("[MTF MA GATE] history fetch failed tf=%s", tf, exc_info=True)
+        df = pd.DataFrame()
+    with _cache_lock:
+        _cache[tf] = (now, df)
+    return df
+
+
+def _tf_values(symbol: str, tf: int, entry_row: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """指定足の close / ma5 / ma25 / ma75 を返す。無い値は 0.0。"""
+    out: Dict[str, float] = {}
+    tf_s = _TF_MAP[tf]
+    # entry_row にサフィックス付きで既に載っていればそれを優先 (ランキング経路)
+    if isinstance(entry_row, dict):
+        c = _f(entry_row.get(f"close_{tf_s}"))
+        if c > 0:
+            out["close"] = c
+            for ma in ("ma5", "ma25", "ma75", "rsi", "macd", "signal", "hist"):
+                out[ma] = _f(entry_row.get(f"{ma}_{tf_s}"), float("nan"))
+            return out
+    # 2026-09-15: main.py の in-memory 3m/5m 履歴は指標が無く古い (午前 119 件全却下)。
+    #   ローカル push DB から作った足 (trading/summary/mtf_local_bars) を正とし、
+    #   無いときだけ GC 履歴へ落ちる。
+    if tf in (3, 5) and _env_bool("MTF_GATE_LOCAL_BARS", True):
+        try:
+            from trading.summary.mtf_local_bars import get_bars, is_stale, latest_bar
+            bars = get_bars(symbol, tf)
+            if isinstance(bars, pd.DataFrame) and not bars.empty and is_stale(bars, tf):
+                # PUSH 登録から外れて足が止まっている (朝の足しか無い) → データ無し扱いで却下
+                out["_src"] = "local_stale"
+                return out
+            r = latest_bar(symbol, tf)
+        except Exception:
+            logger.debug("[MTF MA GATE] local bars failed symbol=%s tf=%s", symbol, tf, exc_info=True)
+            r = None
+        if r is not None:
+            out["close"] = _f(r.get("close"))
+            for ma in ("ma5", "ma25", "ma75"):
+                out[ma] = _f(r.get(ma))
+            for k in ("rsi", "macd", "signal", "hist"):
+                out[k] = _f(r.get(k), float("nan"))
+            out["_src"] = "local"
+            return out
+    df = _latest_rows(tf)
+    if isinstance(df, pd.DataFrame) and not df.empty and symbol in df.index:
+        r = df.loc[symbol]
+        c = _f(r.get("close"))
+        if c <= 0:
+            c = _f(r.get("current_price"))
+        out["close"] = c
+        for ma in ("ma5", "ma25", "ma75"):
+            out[ma] = _f(r.get(ma))
+        for k in ("rsi", "macd", "signal", "hist"):
+            out[k] = _f(r.get(k), float("nan"))
+        return out
+    # 1 分足だけは entry_row 自身の値でも代用できる
+    if tf == 1 and isinstance(entry_row, dict):
+        c = _f(entry_row.get("close") or entry_row.get("current_price") or entry_row.get("price"))
+        if c > 0:
+            out["close"] = c
+            for ma in ("ma5", "ma25", "ma75"):
+                out[ma] = _f(entry_row.get(ma))
+    return out
+
+
+def _side_ok(vals: Dict[str, float], side: str, mas, tf_s: str, *, require_order: bool = True) -> Tuple[Optional[bool], str]:
+    """(True/False/None, detail)。None = データ不足。
+
+    BUY : close > 5MA かつ close > 25MA、さらに require_order なら 5MA > 25MA
+          (上昇の並び: 終値 > 5MA > 25MA)
+    SELL: close < 5MA かつ close < 25MA、さらに require_order なら 5MA < 25MA
+    MA が 1 本も無ければ None。require_order の判定は ma5/ma25 が両方ある時だけ。
+    """
+    close = _f(vals.get("close"))
+    if close <= 0:
+        return None, f"{tf_s}:no_close"
+    # 2026-09-17 ユーザー指示「終値 > 5MA > 25MA はあまり気にしないでほしい」:
+    #   MA の判定 (終値 vs 各 MA、5MA/25MA の並び) は既定で見ない。RSI と MACD だけで判定する。
+    #   朝は 25MA が数本分しか無く、並びが揃う銘柄が少なくて候補が出なかった
+    #   (9/17 09:44 の走査で 160 件中 148 件が ma_gate_ng)。戻すときは env で 1。
+    ma_check = _env_bool("MTF_MA_GATE_MA_CHECK_ENABLED", False)
+    checked = 0
+    for ma in (mas if ma_check else ()):
+        mav = _f(vals.get(ma))
+        if mav <= 0:
+            continue
+        checked += 1
+        if side == "BUY" and close <= mav:
+            return False, f"{tf_s}:{ma} c={close:.1f}<={mav:.1f}"
+        if side == "SELL" and close >= mav:
+            return False, f"{tf_s}:{ma} c={close:.1f}>={mav:.1f}"
+    if ma_check and checked == 0:
+        return None, f"{tf_s}:no_ma"
+    if ma_check and require_order and "ma5" in mas and "ma25" in mas:
+        m5, m25 = _f(vals.get("ma5")), _f(vals.get("ma25"))
+        if m5 > 0 and m25 > 0:
+            if side == "BUY" and m5 <= m25:
+                return False, f"{tf_s}:order ma5={m5:.1f}<=ma25={m25:.1f}"
+            if side == "SELL" and m5 >= m25:
+                return False, f"{tf_s}:order ma5={m5:.1f}>=ma25={m25:.1f}"
+    # ---- RSI / MACD (2026-09-15 09:0x のユーザー指示: RSI・MACD も 3m/5m で計算して根拠にする)
+    #   BUY : RSI が [RSI_BUY_MIN, RSI_BUY_MAX] (既定 50〜75: 上向きだが買われ過ぎでない)
+    #         MACD > signal (ヒストグラム > 0)。MACD_REQUIRE_POSITIVE=1 なら MACD > 0 も要求
+    #   SELL: RSI が [RSI_SELL_MIN, RSI_SELL_MAX] (既定 25〜50)、MACD < signal
+    #   値が NaN (未計算) なら fail-closed で却下。env で個別に OFF にできる。
+    if _env_bool("MTF_GATE_RSI_ENABLED", True):
+        rsi = _f(vals.get("rsi"), float("nan"))
+        if rsi != rsi:
+            return False, f"{tf_s}:rsi_nan"
+        # 2026-09-18: indicator_short_history が足の足りない行の RSI を 50.0 で
+        #   埋める (rsi_light.fillna(50.0))。BUY の下限がちょうど 50 なので、
+        #   「計算できていない」行が下限すれすれで通過していた (9/18 の通過
+        #   11 件中 5 件)。ma5 == ma25 は rolling(min_periods=1) が同値 =
+        #   足が 1〜2 本しかない証拠。これは rsi_nan と同じく fail-closed。
+        if _env_bool("MTF_GATE_REJECT_NEUTRAL_RSI", True) and abs(rsi - 50.0) <= 1e-9:
+            _m5n, _m25n = _f(vals.get("ma5")), _f(vals.get("ma25"))
+            if _m5n > 0 and _m25n > 0 and abs(_m5n - _m25n) <= 1e-9:
+                return False, f"{tf_s}:rsi_neutral_fill ma5==ma25={_m5n:.1f}"
+        if side == "BUY":
+            lo, hi = _env_f("MTF_GATE_RSI_BUY_MIN", 50.0), _env_f("MTF_GATE_RSI_BUY_MAX", 80.0)  # 2026-09-15 夕: 75→80
+        else:
+            lo, hi = _env_f("MTF_GATE_RSI_SELL_MIN", 20.0), _env_f("MTF_GATE_RSI_SELL_MAX", 50.0)  # 2026-09-15 夕: 25→20
+        # 2026-10-07 (ユーザー判断): 売りは「買われ過ぎ (RSI 70 以上) からの反落」も通す。MACD は見ない
+        #   (検証した母集団が RSI で止めた候補そのものなので、同じ条件にする)。
+        #   9/15〜10/7 の 14 日、RSI で止めた売り候補の 15 分後 (実気配・コスト込み):
+        #   RSI 50〜60 は -0.3〜-0.6% / 60〜70 は ±0 前後 / 70〜80 は +0.84% 勝率 70% / 80 超は +1.69% 勝率 70%
+        #   (10/7 を除いても 70 超は約 +1%、8〜9 日に分散)。
+        ob = _env_f("MTF_GATE_RSI_SELL_OVERBOUGHT", 70.0)
+        if side == "SELL" and ob > 0 and rsi >= ob:
+            return True, (f"{tf_s}:ok_overbought rsi={rsi:.1f}>={ob:.0f} c={close:.1f}"
+                          f" macd={_f(vals.get('macd'), float('nan')):.2f}/{_f(vals.get('signal'), float('nan')):.2f}")
+        if not (lo <= rsi <= hi):
+            return False, f"{tf_s}:rsi {rsi:.1f} not in [{lo:.0f},{hi:.0f}]"
+    if _env_bool("MTF_GATE_MACD_ENABLED", True):
+        macd, sig = _f(vals.get("macd"), float("nan")), _f(vals.get("signal"), float("nan"))
+        if macd != macd or sig != sig:
+            return False, f"{tf_s}:macd_nan"
+        if side == "BUY" and macd <= sig:
+            return False, f"{tf_s}:macd {macd:.2f}<=signal {sig:.2f}"
+        if side == "SELL" and macd >= sig:
+            return False, f"{tf_s}:macd {macd:.2f}>=signal {sig:.2f}"
+        if _env_bool("MTF_GATE_MACD_REQUIRE_SIGN", False):
+            if side == "BUY" and macd <= 0:
+                return False, f"{tf_s}:macd {macd:.2f}<=0"
+            if side == "SELL" and macd >= 0:
+                return False, f"{tf_s}:macd {macd:.2f}>=0"
+    # MA 判定 OFF のときも「並びが崩れている」ことは detail に残す (注意してエントリーする材料)
+    caution = ""
+    if not ma_check:
+        m5, m25 = _f(vals.get("ma5")), _f(vals.get("ma25"))
+        if m5 > 0 and m25 > 0:
+            aligned = (close > m5 > m25) if side == "BUY" else (close < m5 < m25)
+            if not aligned:
+                caution = " ma_caution"
+    return True, (
+        f"{tf_s}:ok{caution} c={close:.1f} ma5={_f(vals.get('ma5')):.1f} ma25={_f(vals.get('ma25')):.1f}"
+        f" rsi={_f(vals.get('rsi'), float('nan')):.1f} macd={_f(vals.get('macd'), float('nan')):.2f}/{_f(vals.get('signal'), float('nan')):.2f}"
+    )
+
+
+def mtf_ma_gate(symbol: Any, side: Any, entry_row: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+    """全経路共通の MTF MA ゲート。戻り値: (許可, 理由)。"""
+    if not gate_enabled():
+        return True, "MTF_MA_GATE_DISABLED"
+    sym = _norm_symbol(symbol)
+    side_u = str(side or "").strip().upper()
+    if side_u in ("LONG", "2"):
+        side_u = "BUY"
+    elif side_u in ("SHORT", "1"):
+        side_u = "SELL"
+    if side_u not in ("BUY", "SELL"):
+        return True, "MTF_MA_GATE_SIDE_NONE"
+
+    # ユーザー要件 (2026-09-15 08:5x):
+    #   「テクニカル指標は 3 分足・5 分足の 5MA・25MA を使い、これをもとにエントリーする」
+    #   -> 判定は 3 分足と 5 分足の両方 (ALL)。1 分足は見ない。
+    #      各足で 終値 > 5MA > 25MA (BUY) / 終値 < 5MA < 25MA (SELL)。
+    #   env で緩められる: MTF_MA_GATE_CONFIRM_MODE=ANY / MTF_MA_GATE_REQUIRE_ORDER=0 /
+    #   MTF_MA_GATE_BASE_TF=1m (1 分足も要求する)。
+    mas = tuple(x.strip() for x in os.getenv("MTF_MA_GATE_MAS", "ma5,ma25").split(",") if x.strip())
+    base_tf_s = os.getenv("MTF_MA_GATE_BASE_TF", "").strip()
+    base_tf = int(base_tf_s.rstrip("m")) if base_tf_s else 0
+    confirm_tfs = tuple(int(str(x).rstrip("m")) for x in os.getenv("MTF_MA_GATE_CONFIRM_TFS", "3m,5m").split(",") if x.strip())
+    confirm_mode = os.getenv("MTF_MA_GATE_CONFIRM_MODE", "ANY").strip().upper()  # 2026-09-15 夕: ALL→ANY (9/15 は 3m と 5m の両方成立が 261 件中 14 件)
+    require_order = _env_bool("MTF_MA_GATE_REQUIRE_ORDER", True)
+    allow_no_data = _env_bool("MTF_MA_GATE_ALLOW_NO_DATA", False)
+
+    base_detail = "base:none"
+    if base_tf in _TF_MAP:
+        base_ok, base_detail = _side_ok(_tf_values(sym, base_tf, entry_row), side_u, mas, _TF_MAP[base_tf], require_order=require_order)
+        if base_ok is False:
+            return False, f"MTF_MA_BASE_NG {base_detail}"
+        if base_ok is None and not allow_no_data:
+            return False, f"MTF_MA_BASE_NODATA {base_detail}"
+
+    results = []
+    details = []
+    # 2026-10-09: ANY だと 3m が通れば 5m が買われ過ぎでも買っていた。
+    #   実気配 16 日の検証で「5m RSI>=80 でゲート通過」の買いは 15 分後 -0.81% (n=88、勝率 23%)。
+    #   買いだけ、5m の RSI がこの値以上なら止める (検証したのは 5m だけ)。0 で無効。
+    buy_veto_rsi = _env_f("MTF_GATE_BUY_VETO_RSI", 80.0)
+    veto = ""
+    for tf in confirm_tfs:
+        vals = _tf_values(sym, tf, entry_row)
+        ok, det = _side_ok(vals, side_u, mas, _TF_MAP[tf], require_order=require_order)
+        results.append(ok)
+        details.append(det)
+        if side_u == "BUY" and tf == 5 and buy_veto_rsi > 0:
+            r = _f(vals.get("rsi"), float("nan"))
+            if r == r and r >= buy_veto_rsi:
+                veto = f"{_TF_MAP[tf]}:rsi {r:.1f}>={buy_veto_rsi:.0f}"
+    detail_s = ";".join(details)
+    if veto:
+        return False, f"MTF_MA_BUY_OVERBOUGHT_VETO {veto} {detail_s}"
+
+    if not any(r is not None for r in results):
+        if allow_no_data:
+            return True, f"MTF_MA_OK_CONFIRM_NODATA base={base_detail}"
+        return False, f"MTF_MA_CONFIRM_NODATA {detail_s}"
+
+    if confirm_mode == "ALL":
+        if any(r is False for r in results) or any(r is None for r in results):
+            return False, f"MTF_MA_CONFIRM_ALL_NG {detail_s}"
+        return True, f"MTF_MA_OK_ALL base={base_detail} {detail_s}"
+    if any(r is True for r in results):
+        return True, f"MTF_MA_OK_ANY base={base_detail} {detail_s}"
+    return False, f"MTF_MA_CONFIRM_ANY_NG {detail_s}"

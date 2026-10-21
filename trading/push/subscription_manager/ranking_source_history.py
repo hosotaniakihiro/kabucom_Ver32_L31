@@ -45,6 +45,7 @@ import logging
 import datetime as dt
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ============================================================
 
-DEFAULT_NAS_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_NAS_ROOT = nas_root()
 
 DEFAULT_TABLE_NAME = "subscription_symbols_history"
 DEFAULT_META_TABLE_NAME = "subscription_symbols_history_meta"

@@ -15,6 +15,7 @@ import datetime as dt
 
 from database.session import BASE_PATH
 from utils.business_day_utils import get_recent_business_days
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ def _load_summary_db(target_date: dt.date):
         return {"1min": pd.DataFrame(), "3min": pd.DataFrame(), "5min": pd.DataFrame()}
 
     try:
-        with sqlite3.connect(db_path) as conn:
+        with committing_connect(db_path) as conn:
             df1 = pd.read_sql("SELECT * FROM stock_summary_1min", conn)
             df3 = pd.read_sql("SELECT * FROM stock_summary_3min", conn)
             df5 = pd.read_sql("SELECT * FROM stock_summary_5min", conn)

@@ -175,13 +175,24 @@ def _range_rescue_ok(features: dict, *, side: str, min_surge: float, effective_s
     lower_wick = safe_float(features.get("lower_wick_pct"), 0.0)
 
     min_range = _env_float("TONOSAMA_AI_FALLBACK_MIN_RANGE_PCT", 3.0)
-    min_volume = _env_float("TONOSAMA_AI_FALLBACK_MIN_LATEST_VOLUME", 50000.0)
+    # 既定値は config.MIN_LATEST_VOLUME を使う (数値の持ち主は config.py だけ)。
+    min_volume = _env_float(
+        "TONOSAMA_AI_FALLBACK_MIN_LATEST_VOLUME",
+        float(_cfg("MIN_LATEST_VOLUME", 10000.0)),
+    )
     min_dir_change = _env_float_floor("TONOSAMA_AI_FALLBACK_RANGE_RESCUE_MIN_DIR_CHANGE", 0.10, 0.05)
     min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01)), 0.0)
     reject_zero_5s = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", False)
     reject_same_climax = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_SAME_SIDE_CLIMAX", True)
 
-    base_ok = max_surge >= min_surge and rng >= min_range and vol >= min_volume
+    # 2026-10-03: 出来高は株数でなく売買代金で見る (config.latest_value_ok)。株数に戻す: TONOSAMA_LATEST_VOLUME_SHARE_GUARD=1
+    try:
+        from .config import latest_value_ok as _lv_ok, LATEST_VOLUME_SHARE_GUARD as _share
+        _px = safe_float(features.get("close"), 0.0) or safe_float(features.get("price"), 0.0) or safe_float(features.get("close_price"), 0.0)
+        vol_ok = (vol >= min_volume) if _share else _lv_ok(vol, _px)
+    except Exception:
+        vol_ok = vol >= min_volume
+    base_ok = max_surge >= min_surge and rng >= min_range and vol_ok
     if not base_ok:
         return False, f"range_rescue_base_ng surge={max_surge:.2f} range={rng:.3f} vol={vol:.0f}"
 
@@ -274,6 +285,27 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
 
 
 def ai_check_tonosama_entry(row: pd.Series) -> tuple[bool, float, str]:
+    """殿様エントリーのAI判定。
+
+    旧 core/startup/tonosama_fast_score_prefilter_patch V5.2 が
+    この関数をラップして行っていた
+      - スコア足切りによる AI 短絡 (final_score_low_pre_ai)
+      - SELL の高値掴みブロック
+      - AI NG の soft rescue
+    を本文へ取り込んだ。
+    """
+    from . import fast_score_prefilter as _fast_score
+    from . import runner as _runner
+
+    short = _fast_score.ai_short_circuit_reason(row, _runner)
+    if short is not None:
+        return short
+
+    ok, prob, reason = _ai_check_tonosama_entry_core(row)
+    return _fast_score.post_ai_adjust(row, ok, prob, reason)
+
+
+def _ai_check_tonosama_entry_core(row: pd.Series) -> tuple[bool, float, str]:
     features = build_ai_features(row)
     for module_name, func_name in [
         ("trading.entry.tonosama_ai", "judge_tonosama_entry"),

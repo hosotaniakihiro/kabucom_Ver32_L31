@@ -39,7 +39,7 @@ RANKING_ENTRY_CONFIG = {
     },
 
     "PRICE": {
-        "MIN": 300,
+        "MIN": int(__import__("os").getenv("RANKING_ENTRY_PRICE_MIN", "150")),  # 2026-10-20: 300 -> 150 (ユーザー判断)
         "MAX": 7_000,
     },
 
@@ -73,6 +73,30 @@ RANKING_ENTRY_CONFIG = {
         "SCORE_NORMALIZE": "minmax",
         "WEIGHT_SNAPSHOT": 1.0,
         "WEIGHT_TECHNICAL": 0.0,
+    },
+
+    # ------------------------------------------------------------
+    # マルチタイムフレーム移動平均フィルタ (5MA / 25MA / 75MA)
+    #   BUY : 終値が各MAより「上」  /  SELL : 終値が各MAより「下」
+    #   成立条件 : 1分足で成立 かつ (3分足 または 5分足) で成立
+    #   - 各足の MA が NaN/未計算のものは「そのMAだけスキップ」して判定
+    #     (寄り直後に ma75 が未成熟でも取引が止まらないようにするため)
+    #   - CONFIRM 足がすべてデータ無しの時は ALLOW_WHEN_NO_DATA に従う
+    #     (True=1分足のみで許可 / 取引全停止を避ける安全側)
+    #   このフィルタの却下理由は "MTF_MA_" 接頭辞。救済ロジック
+    #   (_ranking_filter_rescue_*) の対象外＝ハードゲートとして働く。
+    #
+    #   ★一発でOFFに戻す:  ENABLED=False
+    #     もしくは 環境変数  RANKING_ENTRY_MTF_MA_ENABLED=0
+    # ------------------------------------------------------------
+    "MTF_MA": {
+        "ENABLED": True,
+        "MAS": ["ma5", "ma25", "ma75"],
+        "BASE_TF": "1m",
+        "CONFIRM_TFS": ["3m", "5m"],
+        "CONFIRM_MODE": "ANY",          # ANY = 3m または 5m / ALL = 両方
+        "ALLOW_WHEN_NO_DATA": True,
+        "APPLY_SIDES": ["BUY", "SELL"],
     },
 }
 

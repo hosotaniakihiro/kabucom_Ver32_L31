@@ -149,7 +149,36 @@ def build_registerable_symbol_pool(
     return registerable[:target_size]
 
 
+def _ats_registration_allowed() -> bool:
+    """PUSH WebSocket を所有していないプロセスでは ATS 登録ループを回さない。
+
+    ATS も unregister/all -> register を撃つので、
+    push_receiver_runner.py が持っている購読を消してしまう。
+    """
+    import os as _os
+
+    if str(_os.getenv("ATS_REGISTER_REQUIRE_WS_OWNER", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        return True
+    try:
+        from trading.push.push_stream.ws_owner import registration_allowed
+
+        allowed, holder = registration_allowed("ats_register_loop")
+    except Exception:
+        logger.debug("[ATS] ws owner check failed -> allow", exc_info=True)
+        return True
+    if not allowed:
+        logger.error(
+            "[ATS][MULTI_WS_DETECTED] ats_register_loop skipped: "
+            "このプロセスは PUSH WebSocket の所有者ではない pid=%s holder=%s",
+            _os.getpid(), holder,
+        )
+    return bool(allowed)
+
+
 def ats_register_loop(*args, **kwargs):
+    if not _ats_registration_allowed():
+        return
+
     if getattr(global_data, "_ats_register_running", False):
         logger.warning("ATS register loop already running -> skip")
         return

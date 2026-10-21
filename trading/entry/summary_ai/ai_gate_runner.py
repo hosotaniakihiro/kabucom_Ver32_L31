@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import sys
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,6 +30,8 @@ import pandas as pd
 
 from .row_adapter import convert_summary_row_to_ai_gate_row
 from .utils import get_ai_final_entry_check, is_market_open, safe_df, safe_float, safe_str
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +194,7 @@ def _price_allowed_for_direct_entry(symbol: str, price: float) -> tuple[bool, st
 
 
 def _summary_db_path() -> str:
-    base = os.getenv("SUMMARY_DB_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary")
+    base = os.getenv("SUMMARY_DB_DIR", nas_path(r"raw_data\kabu_station\summary"))
     today = dt.datetime.now().strftime("%Y%m%d")
     return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{today}.db"))
 
@@ -213,7 +216,7 @@ def _recent_volume_values(symbol: str, *, bars: int) -> dict[str, Any]:
     if not symbol or not Path(path).exists():
         return {"ok_read": False, "reason": "summary_db_missing", "summary_db": path, "table": table}
     try:
-        with sqlite3.connect(path, timeout=1.0) as conn:
+        with committing_connect(path, timeout=1.0) as conn:
             conn.execute("PRAGMA busy_timeout=1000")
             sym = _col(conn, table, ["symbol", "code", "stock_code"])
             tm = _col(conn, table, ["datetime", "dt", "timestamp", "time"])
@@ -354,7 +357,124 @@ def _print_summary_ai_top20_console(results: list[dict[str, Any]], *, interval: 
         logger.exception("[SUMMARY AI TOP20 RESULT] console print failed interval=%s source=%s", interval, source)
 
 
-def run_ai_gate_for_candidates(candidates_df: pd.DataFrame, *, interval: int | str = 1, source: str = "SUMMARY", min_ai_confidence: float = DEFAULT_MIN_AI_CONFIDENCE, default_dominant_ratio: float = 1.0, side: str = "BUY", use_daily_cache: bool = True, daily_filter_buy: bool = False, daily_hard_block_exit_warn: bool = False, daily_min_score: Optional[float] = None) -> List[Dict[str, Any]]:
+def _entry_ready_audit(df: pd.DataFrame, *, interval, source: str, side: str) -> dict:
+    """AI へ渡す直前の enrich 完了状況を 1 行で残す。
+
+    途中状態 (score_mtf=0 のまま / technical 未計算 / ranking 未マージ) の
+    DataFrame が AI に渡っていないかを、次回ログでそのまま検証できるようにする。
+    """
+    def _num(col: str):
+        try:
+            return pd.to_numeric(df[col], errors="coerce") if col in df.columns else None
+        except Exception:
+            return None
+
+    def _nonzero(col: str) -> int:
+        s = _num(col)
+        if s is None:
+            return 0
+        try:
+            return int((s.fillna(0) != 0).sum())
+        except Exception:
+            return 0
+
+    def _bool_true(col: str) -> int:
+        if col not in df.columns:
+            return 0
+        try:
+            return int(pd.Series(df[col]).fillna(False).astype(bool).sum())
+        except Exception:
+            return 0
+
+    rows = len(df)
+    technical_ready = _bool_true("technical_ready")
+    mtf_ready = max(_nonzero("score_mtf"), _nonzero("mtf"))
+    ranking_ready = max(_nonzero("ranking_score"), _nonzero("rank"))
+    # score_3m_present / score_5m_present は mtf_attach が立てる
+    # 「その足を実際に繋げたか」の旗。0.00 と欠損を区別する唯一の手段なので
+    # 最優先で見る (旧実装は存在しない列ばかり見て常に 0 を出していた)。
+    ready_3m = _bool_true("score_3m_present") or _nonzero("score_mtf_3m") or _nonzero("mtf_3m") or _nonzero("confirm_3m")
+    ready_5m = _bool_true("score_5m_present") or _nonzero("score_mtf_5m") or _nonzero("mtf_5m") or _nonzero("confirm_5m")
+
+    try:
+        src_counts = df["technical_source"].astype(str).value_counts().to_dict() if "technical_source" in df.columns else {}
+    except Exception:
+        src_counts = {}
+
+    audit = {
+        "rows": rows,
+        "technical_ready": technical_ready,
+        "3m_ready": int(ready_3m),
+        "5m_ready": int(ready_5m),
+        "mtf_ready": mtf_ready,
+        "ranking_ready": ranking_ready,
+        "technical_source": src_counts,
+    }
+
+    incomplete = rows > 0 and (technical_ready < rows or mtf_ready == 0)
+    log = logger.warning if incomplete else logger.info
+    log(
+        "[SUMMARY AI GATE][ENTRY READY AUDIT] interval=%s source=%s side=%s rows=%s "
+        "technical_ready=%s 3m_ready=%s 5m_ready=%s mtf_ready=%s ranking_ready=%s technical_source=%s%s",
+        interval, source, side, rows,
+        technical_ready, int(ready_3m), int(ready_5m), mtf_ready, ranking_ready, src_counts,
+        " (enrich 未完のまま AI へ渡している可能性がある)" if incomplete else "",
+    )
+    return audit
+
+
+def _ensure_mtf_attached_before_ai(df: pd.DataFrame, *, interval, source: str) -> pd.DataFrame:
+    """score_mtf/mtf が全て 0 のときだけ日足 MTF を attach する。
+
+    enrich 済みの DataFrame には触らない (二重計算しない)。
+    attach できなければ元の DataFrame をそのまま返し、
+    ENTRY READY AUDIT 側で mtf_ready=0 として可視化する。
+    """
+    if os.getenv("AI_GATE_ENSURE_MTF", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return df
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    def _nonzero(col: str) -> int:
+        if col not in df.columns:
+            return 0
+        try:
+            return int((pd.to_numeric(df[col], errors="coerce").fillna(0) != 0).sum())
+        except Exception:
+            return 0
+
+    before = max(_nonzero("score_mtf"), _nonzero("mtf"))
+    if before > 0:
+        return df
+
+    try:
+        from trading.summary.mtf.daily_runtime import merge_daily_mtf_for_ai
+
+        out = merge_daily_mtf_for_ai(df, source=f"AI_GATE_PRE_{source}")
+    except Exception:
+        logger.exception("[SUMMARY AI GATE] pre-AI daily MTF attach failed interval=%s", interval)
+        return df
+
+    if not isinstance(out, pd.DataFrame) or out.empty:
+        return df
+
+    try:
+        after = max(
+            int((pd.to_numeric(out.get("score_mtf", 0), errors="coerce").fillna(0) != 0).sum()),
+            int((pd.to_numeric(out.get("mtf", 0), errors="coerce").fillna(0) != 0).sum()),
+        )
+    except Exception:
+        after = 0
+
+    logger.warning(
+        "[SUMMARY AI GATE][PRE-AI MTF ATTACH] interval=%s source=%s rows=%s score_mtf_nonzero %s -> %s "
+        "(途中状態の score_mtf=0 を AI へ渡さないための最終 enrich)",
+        interval, source, len(out), before, after,
+    )
+    return out
+
+
+def _run_ai_gate_for_candidates_core(candidates_df: pd.DataFrame, *, interval: int | str = 1, source: str = "SUMMARY", min_ai_confidence: float = DEFAULT_MIN_AI_CONFIDENCE, default_dominant_ratio: float = 1.0, side: str = "BUY", use_daily_cache: bool = True, daily_filter_buy: bool = False, daily_hard_block_exit_warn: bool = False, daily_min_score: Optional[float] = None) -> List[Dict[str, Any]]:
     df = safe_df(candidates_df)
     if df.empty:
         logger.warning("[SUMMARY AI GATE] skipped empty candidates interval=%s source=%s side=%s", interval, source, side)
@@ -368,6 +488,26 @@ def run_ai_gate_for_candidates(candidates_df: pd.DataFrame, *, interval: int | s
         side_counts = df.get("ai_side", df.get("side", pd.Series([default_side] * len(df)))).astype(str).str.upper().value_counts().to_dict()
     except Exception:
         side_counts = {default_side: len(df)}
+    # AI へ渡す直前に enrich を 1 回だけ確定させる。
+    # 途中状態 (score_mtf=0 のまま) の DataFrame が AI に渡ると、
+    # mtf_low を理由にした fallback 判定になってしまうため。
+    df = _ensure_mtf_attached_before_ai(df, interval=interval, source=source)
+
+    # 3 分足 / 5 分足を候補へ繋ぐ。
+    # これが無いと entry_gate が score_3m/score_5m を読めず、
+    # AI_OK になった行が直後の weak filter で全件 NG になる
+    # (2026-09-01: BUY 7 件 -> data_not_ready_attach_missing 7 件)。
+    try:
+        from .mtf_attach import attach_mtf_scores
+
+        df = attach_mtf_scores(df, interval=interval, source=source)
+    except Exception:
+        logger.exception("[SUMMARY AI GATE] 3m/5m attach failed interval=%s", interval)
+
+    try:
+        _entry_ready_audit(df, interval=interval, source=source, side=default_side)
+    except Exception:
+        logger.debug("[SUMMARY AI GATE] entry ready audit failed", exc_info=True)
     logger.warning("[SUMMARY AI GATE] SEND_TO_AI start default_side=%s rows=%s side_counts=%s interval=%s source=%s min_conf=%.2f symbols=%s", default_side, len(df), side_counts, interval, source, float(min_ai_confidence), list(df["symbol"].astype(str).head(40)) if "symbol" in df.columns else [])
     results: List[Dict[str, Any]] = []
     for _, row in df.iterrows():
@@ -460,6 +600,15 @@ def run_push_summary_ai_entry(summary_df: Optional[pd.DataFrame] = None, *, df: 
         return {"candidates": [], "ai_results": [], "ai_ok": [], "approved_rows": [], "execution": {"executed": False, "orders": [], "skip_reason": "empty_df"}}
     candidates_df = base_df.head(top_n).copy()
     ai_results = run_ai_gate_for_candidates(candidates_df, interval=interval, source=source, min_ai_confidence=float(min_ai_confidence), default_dominant_ratio=default_dominant_ratio, side=side_s)
+    # 旧 summary_ai_emp_prob_gate_patch。実測した合成順どおり
+    # emp_prob が内側、df_truth weak filter が外側。
+    try:
+        from .emp_prob_gate import apply_emp_prob_gate as _apply_emp_prob_gate
+
+        ai_results = _apply_emp_prob_gate(ai_results)
+    except Exception:
+        logger.exception("[SUMMARY AI EMP/HIGHLOW/EXT] gate failed; keep original results")
+    ai_results = _wk_apply_weak_summary_ai_filter(ai_results)
     ai_ok = [r for r in ai_results if bool(r.get("allow"))]
     if side_s != "BUY":
         logger.warning("[SUMMARY AI ENTRY] side=%s evaluated only; real BUY entry skipped ai_ok=%s", side_s, len(ai_ok))
@@ -542,3 +691,214 @@ __all__ = [
     "run",
     "start",
 ]
+
+
+# ============================================================
+# SUMMARY AI WEAK FILTER
+# (旧 core/startup/summary_ai_entry_hook_dataframe_truth_patch.py の
+#  _install_summary_ai_weak_filter を本文化)
+# ------------------------------------------------------------
+# AI_OK でも 3m/5m の裏付けが弱い候補を AI_NG へ倒す層。
+#
+# **呼び出し位置が重要**: 旧パッチはモジュール属性
+# ai_gate_runner.run_ai_gate_for_candidates を差し替えていたが、
+# 実運用の呼び出し経路は 2 つに分かれている。
+#
+#   trading/entry/summary_ai/runner.py:1066
+#     -> runner.py:43 の from-import 束縛を使う。
+#        entry_fire_rescue_runtime_patch が install 時に runner 側の束縛を
+#        自分のラッパーで上書きするため、この経路には
+#        entry_fire_rescue しか載っていない (実測: 2 層)。
+#   ai_gate_runner.py の内部呼び出し (下の 1 箇所)
+#     -> モジュール属性を見るので 4 層すべてが載る
+#        (実測: df_truth weak <- emp_prob <- entry_fire_rescue <- native)
+#
+# したがって関数本体に組み込むと runner 経路にも効いてしまい、
+# 今まで弾かれていなかった候補が弾かれるようになる。
+# 挙動を変えないため、モジュール属性ではなく
+# **内部呼び出しの直後**に噛ませている。順序も旧構成と同じ
+# (emp_prob / entry_fire_rescue の結果に対して最後に適用)。
+# ============================================================
+
+def _wk_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _wk_env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _wk_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _wk_append_reason(base: Any, extra: str) -> str:
+    b = str(base or "").strip()
+    return f"{b}|{extra}" if b else str(extra)
+
+
+def _wk_weak_summary_ai_ng(item: dict[str, Any]) -> tuple[bool, str]:
+    if not _wk_env_bool("SUMMARY_AI_WEAK_SIGNAL_FILTER_ENABLED", True):
+        return False, "disabled"
+    try:
+        source = str(item.get("source") or item.get("source_name") or "").upper()
+        reason = str(item.get("reason") or "")
+        ai_row = item.get("ai_row") if isinstance(item.get("ai_row"), dict) else {}
+        source_row = item.get("source_row") if isinstance(item.get("source_row"), dict) else {}
+        src_from_reason = "src=SUMMARY" in reason or "src=PUSH" in reason
+        is_summary_like = src_from_reason or source in {"SUMMARY", "PUSH", "PUSH_SUMMARY", "SUMMARY_AI"}
+        if not is_summary_like:
+            return False, "not_summary_like"
+        rank_score = _wk_safe_float(ai_row.get("rankScore", ai_row.get("rank_score", source_row.get("rankScore", source_row.get("rank_score", 0.0)))), 0.0)
+        score_mtf = max(
+            abs(_wk_safe_float(ai_row.get("score_mtf", source_row.get("score_mtf", 0.0)), 0.0)),
+            abs(_wk_safe_float(ai_row.get("mtf_score", source_row.get("mtf_score", 0.0)), 0.0)),
+            abs(_wk_safe_float(ai_row.get("mtf", source_row.get("mtf", 0.0)), 0.0)),
+        )
+        reason_has_zero_3m5m = ("3m=0.00" in reason or "3m=0" in reason) and ("5m=0.00" in reason or "5m=0" in reason)
+        if reason_has_zero_3m5m and abs(rank_score) <= 1e-9:
+            return True, "weak_summary_ai_zero_rank_and_zero_3m5m"
+        v3 = max(abs(_wk_safe_float(ai_row.get(k, source_row.get(k, 0.0)), 0.0)) for k in ("score_3m", "score_total_3m", "final_score_3m"))
+        v5 = max(abs(_wk_safe_float(ai_row.get(k, source_row.get(k, 0.0)), 0.0)) for k in ("score_5m", "score_total_5m", "final_score_5m"))
+        if abs(rank_score) <= 1e-9 and score_mtf <= 1e-9 and v3 <= 1e-9 and v5 <= 1e-9:
+            return True, "weak_summary_ai_no_rank_mtf_3m_5m"
+        return False, "ok"
+    except Exception:
+        logger.exception("[SUMMARY AI WEAK FILTER] check failed")
+        return False, "exception_fail_open"
+
+
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_entry_hook_dataframe_truth_patch.py の
+# install スコープ (sitecustomize BACKGROUND_MAIN_PATCHES) の再現。
+# scheduler_jobs/summary/summary_ai_entry_hook_v20._df_truth_scope_enabled と
+# 同じ判定。SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED=1/0 で明示上書きできる。
+# ------------------------------------------------------------
+_DFT_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+
+def _dft_env_on(name: str, default: bool = False) -> bool:
+    """sitecustomize._env_on と同じ解釈。"""
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return bool(default)
+
+
+def _dft_scope_enabled() -> bool:
+    try:
+        raw = os.getenv("SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _dft_env_on("SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED", True)
+        # sitecustomize._install_module の disabled_env は "1" 完全一致で判定していた
+        if str(os.environ.get("DISABLE_SUMMARY_AI_DF_TRUTH_PATCH", "")).strip() == "1":
+            return False
+        argv_parts = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_parts)
+        # sitecustomize は database context を main.py 判定より先に見る
+        if any(name in argv for name in _DFT_DB_PROCESS_NAMES):
+            return False
+        is_main_py = any(a.endswith("/main.py") or a == "main.py" for a in argv_parts)
+        if is_main_py and _dft_env_on("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _dft_env_on("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _wk_apply_weak_summary_ai_filter(results):
+    """AI_OK のうち 3m/5m の裏付けが弱いものを AI_NG へ倒す。"""
+    if not _dft_scope_enabled():
+        return results
+    if not isinstance(results, list):
+        return results
+    blocked = 0
+    for item in results:
+        if not isinstance(item, dict) or not bool(item.get("allow")):
+            continue
+        ng, why = _wk_weak_summary_ai_ng(item)
+        if not ng:
+            continue
+        item["allow"] = False
+        item["reason"] = _wk_append_reason(item.get("reason"), why)
+        blocked += 1
+        logger.warning("[SUMMARY AI WEAK FILTER] AI_OK -> AI_NG symbol=%s side=%s reason=%s", item.get("symbol"), item.get("side") or item.get("ai_side"), why)
+    if blocked:
+        logger.warning("[SUMMARY AI WEAK FILTER] blocked weak AI_OK count=%s", blocked)
+    return results
+
+
+# ============================================================
+# ENTRY FIRE RESCUE (旧 core/startup/entry_fire_rescue_runtime_patch._patch_ai_gate)
+# ------------------------------------------------------------
+# 前段: SELL 信用が組めない候補を AI 前に落とす
+# 後段: AI_NG の score_low のうち実スコアが閾値以上のものを救済する
+#
+# 旧パッチは run_ai_gate_for_candidates を差し替えたうえで runner 側の
+# from-import 束縛も自分のラッパーで上書きしていた。本文化して関数本体に
+# 組み込んだので、runner.py:43 の from-import が最初からこの層を掴む
+# = 旧構成と同じ (旧構成でも runner 経路にはこの層だけが載っていた)。
+#
+# 適用スコープは entry_fire_rescue.scope_enabled() (main.py のみ)。
+# ============================================================
+
+
+def run_ai_gate_for_candidates(*args, **kwargs):
+    try:
+        from .entry_fire_rescue import scope_enabled as _efr_scope, prefilter_sell_credit, rescue_score_low
+    except Exception:
+        logger.exception("[ENTRY FIRE RESCUE] helper import failed; run native gate")
+        return _run_ai_gate_for_candidates_core(*args, **kwargs)
+
+    if not _efr_scope():
+        return _run_ai_gate_for_candidates_core(*args, **kwargs)
+
+    call_args = list(args)
+    call_kwargs = dict(kwargs)
+    candidate_obj = call_args[0] if call_args else call_kwargs.get("candidates_df")
+    try:
+        filtered_obj, skipped = prefilter_sell_credit(candidate_obj)
+        if skipped:
+            if call_args:
+                call_args[0] = filtered_obj
+            else:
+                call_kwargs["candidates_df"] = filtered_obj
+            logger.warning(
+                "[ENTRY FIRE RESCUE] SUMMARY_AI SELL credit pre-AI filter before=%s after=%s skipped=%s",
+                len(candidate_obj) if hasattr(candidate_obj, "__len__") else -1,
+                len(filtered_obj) if hasattr(filtered_obj, "__len__") else -1,
+                skipped[:80],
+            )
+    except Exception:
+        logger.exception("[ENTRY FIRE RESCUE] SELL credit pre-filter failed; keep original candidates")
+
+    results = _run_ai_gate_for_candidates_core(*call_args, **call_kwargs)
+    return rescue_score_low(results)

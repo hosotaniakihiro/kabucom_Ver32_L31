@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -301,7 +302,7 @@ def _candidate_ranking_db_paths(now=None) -> list[Path]:
         pass
 
     try:
-        base = Path(r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking")
+        base = Path(nas_path(r"raw_data\kabu_station\ranking"))
         if now is not None:
             ymd = pd.Timestamp(now).strftime("%Y%m%d")
             paths.append(base / f"ranking{ymd}.db")

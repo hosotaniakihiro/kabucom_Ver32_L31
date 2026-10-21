@@ -13,12 +13,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-try:
-    from .controller_cache_safe_set_patch import install_controller_cache_safe_set_patch
-
-    install_controller_cache_safe_set_patch()
-except Exception:
-    logger.exception("[trading.summary] controller cache safe set patch install failed")
+# controller_cache_safe_set_patch は
+# trading/summary/controller_cache.safe_global_set_merged_summary 本体へ本文化した
+# (実装は trading/summary/controller_cache_safe_set.py)。install は不要。
 
 
 __all__ = []

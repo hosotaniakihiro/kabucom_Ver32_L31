@@ -35,6 +35,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import warnings
 from typing import Callable
 
@@ -46,6 +48,50 @@ MIN_HISTORY_ROWS_RSI = 14
 MIN_HISTORY_ROWS_MACD = 26
 MIN_HISTORY_ROWS_MA75 = 75
 MIN_HISTORY_ROWS_STRONG = 80
+
+
+# ==========================================================
+# soft technical_ready scope
+# (旧 core/startup/summary_controller_soft_technical_ready_patch.py)
+# ----------------------------------------------------------
+# 旧パッチは core/startup/__init__.py の _install_entry_runtime_init_patches()
+# 経由でのみ install されていたため、main.py (ライブ取引プロセス) だけに効き、
+# main_database.py / summary_database_runner.py 等のDB専用子プロセスでは
+# 適用されなかった。本文化後も同じスコープを保つ。
+# ==========================================================
+
+_SOFT_TECHNICAL_READY_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+_TRUTHY_ENV = {"1", "true", "yes", "y", "on", "enable", "enabled"}
+
+
+def _soft_technical_ready_enabled() -> bool:
+    """短履歴向け soft technical_ready 補正を適用するプロセスか判定する。
+
+    - SUMMARY_SOFT_TECHNICAL_READY_ENABLED=1/0 で明示的に上書き可能
+    - CORE_STARTUP_FORCE_FULL_INIT_PATCHES=1 のときは DB プロセスでも適用
+      (core/startup/__init__.py の _core_startup_is_database_context と同じ扱い)
+    """
+    try:
+        override = os.getenv("SUMMARY_SOFT_TECHNICAL_READY_ENABLED")
+        if override is not None and str(override).strip() != "":
+            return str(override).strip().lower() in _TRUTHY_ENV
+
+        if str(os.getenv("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", "")).strip().lower() in _TRUTHY_ENV:
+            return True
+
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv_text for name in _SOFT_TECHNICAL_READY_DB_PROCESS_NAMES)
+    except Exception:
+        return True
 
 
 # ==========================================================
@@ -300,7 +346,7 @@ def _build_display_ready_mask(df: pd.DataFrame) -> pd.Series:
         return pd.Series(False, index=idx)
 
 
-def rebuild_display_ready(df: pd.DataFrame) -> pd.DataFrame:
+def _rebuild_display_ready_core(df: pd.DataFrame) -> pd.DataFrame:
     """
     display_ready を再構築する。
 
@@ -540,7 +586,103 @@ def attach_history_len(
 # technical ready rebuild
 # ==========================================================
 
-def rebuild_technical_ready(df: pd.DataFrame) -> pd.DataFrame:
+def _soft_ready_num(df: pd.DataFrame, col: str) -> pd.Series:
+    try:
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce")
+    except Exception:
+        pass
+    # 欠損カラム用の全NaN列。
+    # pd.Series(pd.NA, dtype="float64") は pandas 2.2.3 で TypeError を送出するため使わない
+    # (これを踏むと _build_soft_technical_ready_mask が例外→全False になり救済が無効化される)。
+    return pd.Series(float("nan"), index=df.index, dtype="float64")
+
+
+def _soft_ready_bool(df: pd.DataFrame, col: str, default: bool = False) -> pd.Series:
+    try:
+        if col in df.columns:
+            s = df[col]
+            if getattr(s, "dtype", None) == bool:
+                return s.fillna(False).astype(bool)
+            return s.fillna(False).astype(str).str.lower().str.strip().isin(["1", "true", "yes", "on"])
+    except Exception:
+        pass
+    return pd.Series(default, index=df.index, dtype="bool")
+
+
+def _build_soft_technical_ready_mask(out: pd.DataFrame) -> pd.Series:
+    """display_ready + close + score + 何らかの指標が揃っている行のマスク。"""
+    idx = out.index
+    try:
+        if "symbol" in out.columns:
+            symbol_ok = out["symbol"].fillna("").astype(str).str.strip().ne("")
+        else:
+            symbol_ok = pd.Series(False, index=idx)
+
+        close_ok = pd.Series(False, index=idx)
+        for c in ("close", "close_price", "price", "current_price"):
+            s = _soft_ready_num(out, c)
+            close_ok = close_ok | (s.notna() & s.fillna(0).ne(0))
+
+        score_ok = pd.Series(False, index=idx)
+        for c in ("score", "score_buy", "score_sell", "buy_score", "sell_score", "score_total", "final_score", "display_score"):
+            s = _soft_ready_num(out, c)
+            score_ok = score_ok | s.notna()
+
+        indicator_ok = pd.Series(False, index=idx)
+        for c in ("rsi", "macd", "signal", "hist", "slope", "slope_atr_scaled", "score_slope", "mtf", "score_mtf", "mtf_score", "ma5", "ma25", "ma75"):
+            s = _soft_ready_num(out, c)
+            indicator_ok = indicator_ok | s.notna()
+
+        display_ok = _soft_ready_bool(out, "display_ready", True)
+        return (symbol_ok & close_ok & score_ok & indicator_ok & display_ok).fillna(False).astype(bool)
+    except Exception:
+        logger.debug("[SUMMARY SOFT TECH READY] soft mask failed", exc_info=True)
+        return pd.Series(False, index=idx, dtype="bool")
+
+
+def _apply_soft_technical_ready(out: pd.DataFrame) -> pd.DataFrame:
+    """厳格判定の結果に short-history 救済 (soft ready) を上乗せする。
+
+    厳格判定そのものは維持したまま、rsi/macd/slope/score が揃っているのに
+    technical_ready=False で落ちてしまう短履歴行を True に引き上げる。
+    display_ready を参照するため rebuild_display_ready の後に呼ぶこと。
+    """
+    if not isinstance(out, pd.DataFrame) or out.empty:
+        return out
+
+    if not _soft_technical_ready_enabled():
+        return out
+
+    try:
+        if "technical_ready" not in out.columns:
+            out["technical_ready"] = False
+        strict = pd.Series(out["technical_ready"]).fillna(False).astype(bool)
+        strict_n = int(strict.sum())
+        soft = _build_soft_technical_ready_mask(out)
+
+        # technical_ready は「ENTRY に必要な実テクニカルが揃っている」の
+        # strict な意味に統一する。soft 判定でこれを True へ引き上げない。
+        # (2026-09-02: rebuild_technical_ready ready=24 の直後に
+        #  SOFT TECH READY が 82/82 へ戻していた)
+        out["technical_ready"] = strict
+        out["soft_technical_ready"] = soft.fillna(False).astype(bool)
+        if "usable_technical_ready" not in out.columns:
+            out["usable_technical_ready"] = soft.fillna(False).astype(bool)
+        else:
+            out["usable_technical_ready"] = (_soft_ready_bool(out, "usable_technical_ready", False) | soft).fillna(False).astype(bool)
+        logger.warning(
+            "[SUMMARY SOFT TECH READY] rows=%s technical_ready(strict)=%s soft_ready=%s "
+            "usable_technical_ready=%s (soft は technical_ready を上書きしない。ENTRY は strict のみ使用)",
+            len(out), strict_n, int(soft.sum()),
+            int(pd.Series(out["usable_technical_ready"]).fillna(False).astype(bool).sum()),
+        )
+    except Exception:
+        logger.exception("[SUMMARY SOFT TECH READY] apply failed")
+    return out
+
+
+def _rebuild_technical_ready_core(df: pd.DataFrame) -> pd.DataFrame:
     """
     technical_ready は厳格に判定する。
 
@@ -631,6 +773,7 @@ def rebuild_technical_ready(df: pd.DataFrame) -> pd.DataFrame:
         logger.exception("[summary_controller] rebuild technical_ready failed")
 
     out = rebuild_display_ready(out)
+    out = _apply_soft_technical_ready(out)
     return out
 
 
@@ -665,7 +808,7 @@ def source_priority_series(df: pd.DataFrame) -> pd.Series:
 # latest projection
 # ==========================================================
 
-def latest_row_per_symbol(
+def _latest_row_per_symbol_core(
     df: pd.DataFrame,
     normalize_fn: Callable[[pd.DataFrame], pd.DataFrame],
 ) -> pd.DataFrame:
@@ -687,7 +830,7 @@ def latest_row_per_symbol(
         return rebuild_display_ready(out)
 
 
-def latest_row_per_symbol_mature_first(
+def _latest_row_per_symbol_mature_first_core(
     df: pd.DataFrame,
     normalize_fn: Callable[[pd.DataFrame], pd.DataFrame],
 ) -> pd.DataFrame:
@@ -823,3 +966,41 @@ __all__ = [
     "latest_row_per_symbol",
     "latest_row_per_symbol_mature_first",
 ]
+
+
+# ============================================================
+# controller 層の 3 段ラッパー
+# (旧 core/startup の summary_controller_neutral_score_guard_patch /
+#  summary_controller_publish_mtf_merged_patch /
+#  summary_controller_ready_mtf_patch を本文化)
+# ------------------------------------------------------------
+# 各パッチの _ORIGINALS を実測した結果、合成は
+#   native <- neutral_score_guard <- publish_mtf_merged <- ready_mtf
+# の 3 層 (5 関数すべて同じ、捨てられている層は無い)。
+# その順序を trading/summary/controller_layers.apply_layers() が再現する。
+# ネイティブは *_core へ改名した。
+# ============================================================
+
+
+def rebuild_display_ready(*args, **kwargs):
+    from trading.summary.controller_layers import apply_layers as _apply_layers
+
+    return _apply_layers(_rebuild_display_ready_core, "rebuild_display_ready", "trading.summary.controller_projection.rebuild_display_ready", args, kwargs)
+
+
+def rebuild_technical_ready(*args, **kwargs):
+    from trading.summary.controller_layers import apply_layers as _apply_layers
+
+    return _apply_layers(_rebuild_technical_ready_core, "rebuild_technical_ready", "trading.summary.controller_projection.rebuild_technical_ready", args, kwargs)
+
+
+def latest_row_per_symbol(*args, **kwargs):
+    from trading.summary.controller_layers import apply_layers as _apply_layers
+
+    return _apply_layers(_latest_row_per_symbol_core, "latest_row_per_symbol", "trading.summary.controller_projection.latest_row_per_symbol", args, kwargs)
+
+
+def latest_row_per_symbol_mature_first(*args, **kwargs):
+    from trading.summary.controller_layers import apply_layers as _apply_layers
+
+    return _apply_layers(_latest_row_per_symbol_mature_first_core, "latest_row_per_symbol_mature_first", "trading.summary.controller_projection.latest_row_per_symbol_mature_first", args, kwargs)

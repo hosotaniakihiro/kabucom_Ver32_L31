@@ -49,7 +49,12 @@ def _safe_df(df) -> pd.DataFrame:
 
         # inf → NaN
         try:
-            df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            # object 列を含むまま一括 replace すると
+            #   FutureWarning: Downcasting behavior in `replace` is deprecated
+            # になる。inf は数値列にしか存在しないので数値列だけを対象にする。
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            if num_cols:
+                df[num_cols] = df[num_cols].replace([np.inf, -np.inf], np.nan)
         except Exception:
             pass
 

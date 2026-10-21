@@ -196,7 +196,10 @@ def _fetch_symbol_flags_allowed_symbols(symbols: List[str]) -> List[str]:
     logger.warning("[ATSFilters] symbol_flags_db=%s", db_path)
 
     try:
-        with sqlite3.connect(db_path) as conn:
+        # P0-1/P0-6: `with sqlite3.connect(...)` は close しない。
+        # reader なので read-only。存在しない DB を作らない。
+        from database.sqlite_util import readonly_connect
+        with readonly_connect(db_path, busy_timeout_ms=5000) as conn:
             if not _sqlite_table_exists(conn, "symbol_flags"):
                 logger.warning("[ATSFilters] symbol_flags table not found in symbol_flags_db")
                 return []

@@ -5,8 +5,64 @@
 
 DEFAULT_WS_URL = "ws://localhost:18080/kabusapi/websocket"
 
-FLUSH_BATCH_SIZE = 100
-FLUSH_INTERVAL_SEC = 2.0
+import os as _os
+
+
+def _env_int(name, default):
+    try:
+        v = _os.getenv(name)
+        return int(str(v).strip()) if v not in (None, "") else int(default)
+    except Exception:
+        return int(default)
+
+
+def _env_float(name, default):
+    try:
+        v = _os.getenv(name)
+        return float(str(v).strip()) if v not in (None, "") else float(default)
+    except Exception:
+        return float(default)
+
+
+# ------------------------------------------------------------
+# 2026-09-03 P0: NAS の commit が遅いので 1 回の commit で多く書く。
+#
+# 本番実測 (push20260903.db, SMB, WAL, synchronous=NORMAL):
+#     executemany 100 行 = 0.063-0.111s
+#     commit             = 6.3 / 8.8 / 11.8 / 12.2 / 16.1 s
+# commit のコストは行数にほとんど依存せず、SMB の fsync 往復で決まる。
+# つまり batch を大きくするのはほぼ無料で、スループットに直結する。
+#
+# batch=100 のままだと 12 秒に 100 行 = 約 500 行/分しか書けず、
+# 後場寄りの 1,300-1,700 msg/分に追いつかない
+# (実測: queue 242 -> 4,482、db_age 29s -> 180s と発散)。
+# ------------------------------------------------------------
+# 2026-09-09: 1000 -> 5000。
+#
+# push_db_writer 側の buffer_size は 2026-09-08 に 5000 へ上げたが、
+# ここが 1000 のままだと 1 周で writer へ渡せるのが 1000 行までなので、
+# writer 側の 5000 は一度も効かない (実測: flush prepare buffer=1000 が並ぶ)。
+#
+# 本番実測 (2026-09-09 14:00 後場):
+#     flush 間隔 25 秒 x 1000 行 = 約 2,400 行/分
+#     到着                        = 約 2,640 行/分
+# わずかに足りず、queue が 0 -> 9,912 へ再び発散した。
+#
+# flush ループが遅くなる理由 (同一プロセスで summary も走るので GIL を
+# 取り合う) は残るが、1 周あたりを増やせばループ速度に関係なく容量が増える。
+# 25 秒 x 5,000 行 = 12,000 行/分 で余裕ができる。
+# DB はローカルなので 5,000 行の executemany+commit でも 0.04 秒程度。
+# 2026-09-09 追記: 5000 でもまだ足りなかった。
+#     14:23:09 / 14:26:12 / 14:28:48  いずれも buffer=5000
+#     ループ間隔が約 3 分まで伸びており 5,000 行 / 3 分 = 1,667 行/分。
+#     到着は約 2,600 行/分 で、まだ 950 行/分ずつ負ける。
+# ループが遅いのは同一プロセスの summary が GIL を握るため (1 世代 198 秒に
+# なることがある)。ループ速度は今日の範囲では直せないので、1 周あたりの
+# 容量で吸収する。必要量は「到着 2,600 行/分 x 最悪ループ 3 分 = 7,800 行」。
+# 大引け前の増加を見込んで 2-3 倍の余裕を取る。
+# ローカル DB なので 20,000 行の executemany+commit でも 0.1 秒程度。
+FLUSH_BATCH_SIZE = max(1, _env_int("PUSH_FLUSH_BATCH_SIZE", 20000))
+FLUSH_INTERVAL_SEC = max(0.2, _env_float("PUSH_FLUSH_INTERVAL_SEC", 2.0))
 MONITOR_INTERVAL_SEC = 5.0
 RECONNECT_WAIT_SEC = 0.5
 AFTER_OPEN_REFRESH_DELAY_SEC = 1.2

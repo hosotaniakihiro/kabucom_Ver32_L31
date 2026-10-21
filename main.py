@@ -20,6 +20,28 @@
 # ✔ 既存の起動処理は維持
 # ============================================================
 
+
+# 2026-09-25: Norton が注入する SSLKEYLOGFILE を外す。
+#   プロセス環境に SSLKEYLOGFILE=\\.\nllMonFltProxy\... が入っており
+#   (Machine/User の環境変数には無い。Norton が各プロセスへ注入する)、
+#   urllib3 は HTTPS 接続ごとにこれを読んで ssl context の
+#   keylog_filename に設定する。その setter が Norton の名前付きパイプを
+#   open() しようとして応答待ちになり、スレッドが永久に止まる。
+#   socket より手前なので timeout= は効かない。
+#   9/25 は ranking_summary_bg が Discord 通知の中でこれに掛かり、
+#   generation=1 のまま 20 分以上完走しなかった。
+#   env AUTOSTOCK_KEEP_SSLKEYLOGFILE=1 で従来どおり残す。
+import os as _autostock_os
+
+if _autostock_os.environ.get("SSLKEYLOGFILE") and str(
+    _autostock_os.environ.get("AUTOSTOCK_KEEP_SSLKEYLOGFILE", "0")
+).strip().lower() not in ("1", "true", "yes", "on"):
+    _autostock_keylog = _autostock_os.environ.pop("SSLKEYLOGFILE", None)
+    print(
+        "[TLS ENV GUARD] SSLKEYLOGFILE を外した (Norton の TLS 監視が"
+        " HTTPS 接続を固めるため): %s" % (_autostock_keylog,)
+    )
+
 import os
 import sys
 import logging
@@ -107,7 +129,7 @@ websocket.enableTrace(False)
 logging.getLogger("websocket").setLevel(logging.CRITICAL)
 
 import trading.push.push_stream as push_stream
-from core.startup.push_storage_bootstrap import start_push_storage
+from core.startup.push.storage_bootstrap import start_push_storage
 from optional.batch.optional_main import optional_main
 from core.bootstrap.load_symbol_map import build_symbol_name_map
 from global_state import global_data
@@ -116,7 +138,6 @@ from trading.summary.realtime_engine import init_realtime_engine, process_realti
 from trading.handlers.exit_handler import build_5s_bar_fast, run_exit_pipeline
 from force_cancel_loop import start_force_cancel_loop
 from test_script.test_force_exit import run_force_exit_test
-from trading.positions.position_sync import PositionSyncManager
 from ats.ats_register import ats_register_loop, show_should_register_symbols
 from utils.business_day_utils import is_market_open
 from core.runtime.stream_orchestrator import StreamOrchestrator
@@ -192,43 +213,253 @@ def _factory_position_state():
 
 
 def _install_main_runtime_patches():
+    try:
+        from trading.handlers.entry_controller import cleanup_stale_100368_sell_reject_cache
+
+        cleanup_stale_100368_sell_reject_cache()
+    except Exception:
+        logger.exception("[MAIN RUNTIME PATCH] stale 100368 sell reject cache cleanup failed")
+
+    def _apply_summary_ai_threshold_env() -> None:
+        """旧 entry_qty_min_lot_runtime_patch._install_summary_ai_threshold_env()。
+
+        しきい値 env の既定値。旧パッチの install() 冒頭で毎回実行されていたので、
+        patches リストの処理直前という同じ位置で適用する。
+        """
+        # ============================================================
+        # P0-3 settings owner 一本化
+        # ------------------------------------------------------------
+        # ここは以前、閾値の「緩い」既定値を setdefault していた:
+        #   SUMMARY_AI_MIN_BUY=1.00 / MIN_CONF=0.55 / MIN_COMPOSITE_SCORE_BUY=0.50
+        # その後 strict_entry_defaults.STRICT_ENV が
+        #   3.00 / 0.60 / 3.00
+        # へ上書きするため、起動ログ上は
+        #   1.0/0.55 -> 3.0/0.60
+        # と閾値が動いて見えていた (2026-08-28 15:23 起動でも再現)。
+        #
+        # core/startup/startup.py の SETTINGS SOURCE OF TRUTH 表でも
+        # これらの owner は strict_entry_defaults.STRICT_ENV と宣言されている。
+        # つまりここは **二重の owner** であり、
+        # 起動順によっては緩い値が読まれうる (fail-open 側)。
+        #
+        # 閾値の owner は strict_entry_defaults 1 か所にする。
+        # ここでは閾値系 env を一切設定しない。
+        # 閾値そのものは変更していない (最終値は従来どおり STRICT の値)。
+        #
+        # どうしても旧挙動へ戻す場合だけ
+        #   SUMMARY_AI_THRESHOLD_LEGACY_SEED=1
+        # を指定する。
+        # ============================================================
+        legacy = str(
+            os.environ.get("SUMMARY_AI_THRESHOLD_LEGACY_SEED", "") or ""
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if not legacy:
+            logger.warning(
+                "[SUMMARY AI THRESHOLD ENV PATCH] skipped: 閾値 env は "
+                "strict_entry_defaults.STRICT_ENV が唯一の owner。"
+                "ここでは設定しない (起動順で閾値が変わらないようにするため)。"
+                "旧挙動は SUMMARY_AI_THRESHOLD_LEGACY_SEED=1"
+            )
+            return
+
+        defaults = {
+            "SUMMARY_AI_MIN_BUY": "1.00",
+            "SUMMARY_AI_MIN_SELL": "1.00",
+            "SUMMARY_AI_MIN_CONF": "0.55",
+            "MIN_ENTRY_SCORE_BUY_SUMMARY": "1.00",
+            "MIN_ENTRY_SCORE_SELL_SUMMARY": "1.00",
+            "MIN_SUMMARY_SCORE_BUY": "1.00",
+            "MIN_SUMMARY_SCORE_SELL": "1.00",
+            "MIN_COMPOSITE_SCORE_BUY": "0.50",
+            "MIN_COMPOSITE_SCORE_SELL": "0.80",
+            "SUMMARY_AI_TOP_N": "20",
+        }
+        for k, v in defaults.items():
+            os.environ.setdefault(k, v)
+        logger.warning(
+            "[SUMMARY AI THRESHOLD ENV PATCH] installed (LEGACY SEED) %s", defaults
+        )
+
+    _apply_summary_ai_threshold_env()
+
+    def _fast_startup_background_heavy() -> None:
+        """旧 fast_startup_runtime_patch._background_heavy()。
+
+        重い install を別スレッドへ逃がす。symbol_flags のキャッシュ構築のあと、
+        direct_push_1m を再適用して job_summary を包み直す
+        (他パッチが後から job_summary をラップしても直販路を残すため)。
+        旧 jobs リストのうち summary_mtf_push_raw_fallback_patch は
+        モジュールごと本文化済みで存在しないため落とした。
+        """
+        try:
+            from core.startup.bootstrap.symbol_flags import install_symbol_flags_cache
+
+            ok = bool(install_symbol_flags_cache(force=True))
+            logger.warning("[FAST STARTUP] symbol_flags_bootstrap installed=%s", ok)
+        except Exception:
+            logger.exception("[FAST STARTUP] symbol_flags_bootstrap install failed")
+
+        for label in ("bg", "bg-final"):
+            try:
+                from scheduler_jobs.summary import direct_push_1m
+
+                logger.warning("[FAST STARTUP] direct_push_1m:%s installed=%s", label, bool(direct_push_1m.install()))
+            except Exception:
+                logger.exception("[FAST STARTUP] direct_push_1m:%s install failed", label)
+        logger.warning("[FAST STARTUP] background heavy installs done")
+
+    def _start_fast_startup_background_heavy() -> bool:
+        """FAST_STARTUP_ASYNC_HEAVY_PATCHES=0 のときだけ同期実行する。"""
+        raw = os.getenv("FAST_STARTUP_ASYNC_HEAVY_PATCHES")
+        async_heavy = True
+        if raw is not None and str(raw).strip() != "":
+            async_heavy = str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        if async_heavy:
+            Thread(
+                target=_fast_startup_background_heavy,
+                name="fast-startup-heavy-installs",
+                daemon=True,
+            ).start()
+            logger.warning("[FAST STARTUP] heavy installs scheduled background")
+        else:
+            _fast_startup_background_heavy()
+        return True
+
     patches = [
-        ("core.startup.summary_scheduler_shutdown_guard_patch", "install"),
-        ("core.startup.nas_sqlite_io_guard_patch", "install"),
-        ("core.startup.entry_controller_runtime_reject_patch", "install"),
-        ("core.startup.fast_startup_runtime_patch", "install"),
-        ("core.startup.summary_main_memory_latest_1m_patch", "install"),
-        ("core.startup.summary_mtf_diff_from_1m_patch", "install"),
-        ("core.startup.entry_qty_min_lot_runtime_patch", "install"),
-        ("core.startup.low_movement_entry_guard_patch", "install"),
-        ("core.startup.entry_final_filter_failopen_patch", "install"),
-        ("core.startup.oneshot_limit_700k_patch", "install"),
-        ("core.startup.entry_limit_passive_runtime_patch", "install"),
-        ("core.startup.final_entry_safety_guard_patch", "install"),
+        # fast_startup_runtime_patch は本文化して解体済み。
+        # 旧 install() の並びをそのままこの位置に展開してある。
+        #   - _patch_summary_schema_bootstrap
+        #       -> database/session.apply_fast_startup_schema_skip()
+        #   - _patch_entry_max_approved
+        #       -> trading/handlers/entry_controller.apply_fast_startup_entry_limits()
+        #   - _patch_ranking_bootstrap
+        #       -> core/startup/scheduler/bootstrap.apply_fast_startup_ranking_defaults()
+        #         (併せて掛かっていた _run_ranking_summary_all_job_safe の
+        #          「戻り値を捨てる」ラッパーは同関数本体へ畳み込み済み)
+        #   - _background_heavy
+        #       -> 直下の _start_fast_startup_background_heavy()
+        # 旧 install が呼んでいた summary_parallel_intervals_runtime_patch /
+        # entry_limit_passive_runtime_patch / summary_mtf_push_raw_fallback_patch は
+        # いずれも本文化でモジュールごと消えており、import 失敗で毎回 NG に
+        # なるだけの死に呼び出しだったため復元していない。
+        # summary_parallel_main_scope.install() は _INSTALLED で冪等なので、
+        # 旧 pre/post の 2 回呼びは 1 回へ畳んだ。
+        ("core.startup.summary_parallel_main_scope", "install"),
+        ("scheduler_jobs.summary.light_tick_1m", "install"),
+        ("database.session", "apply_fast_startup_schema_skip"),
+        ("trading.handlers.entry_controller", "apply_fast_startup_entry_limits"),
+        ("core.startup.scheduler.bootstrap", "apply_fast_startup_ranking_defaults"),
+        ("scheduler_jobs.summary.direct_push_1m", "install"),
+        _start_fast_startup_background_heavy,
+        # 最後にもう一度同期で direct_push_1m を再適用する。
+        # 上の install 群が job_summary を包み直している可能性があるため
+        # (旧 install() 末尾の "direct_push_1m:final" と同じ意図)。
+        ("scheduler_jobs.summary.direct_push_1m", "install"),
+        # summary_scheduler_shutdown_guard_patch は
+        # scheduler_jobs/summary/scheduler.py へ本文化済みのため削除
+        # (_run_with_timeout/_invoke_job/_run_push_summary_tick/_run_ranking_summary_tick/
+        # _run_summary_tick/_run_push_fallback_when_unified_blocked/_push_fallback_worker/
+        # run_summary_tick_once の8関数を shutdown/executor-recovery guard 込みで公開名に維持)。
+        # nas_sqlite_io_guard_patch は各ホストへ本文化済み:
+        #   utils/nas_sqlite_io_guard.py (共有ネガティブキャッシュ+スコープ判定) を
+        #   ranking_selector._load_ranking_df /
+        #   ranking_source_selector.read_ranking_df_from_db /
+        #   filters.read_symbol_flags_target_sets / read_symbol_flags_keep_set /
+        #   ats.ats_ranking.db_path._db_has_usable_ranking_tables
+        #   の各公開関数が直接使う。
+        # entry_controller_runtime_reject_patch は trading/handlers/entry_controller.py の
+        # cleanup_stale_100368_sell_reject_cache() へ native化済み (直接呼び出しは下記)。
+        ("scheduler_jobs.summary.memory_latest_1m", "install"),
+        ("trading.summary.mtf_diff_from_1m", "install"),
+        # entry_qty_min_lot_runtime_patch は3責務に分割して本文化済み:
+        #   - 発注数量の最小単元フォールバック -> trading/handlers/entry_controller.py
+        #   - PIPE SUMMARY 表示整形            -> core/global_context/context.py
+        #   - SUMMARY AI しきい値の env 既定値 -> 直下の _apply_summary_ai_threshold_env()
+        ("trading.entry.low_movement_guard", "install"),
+        # entry_final_filter_failopen_patch は本文化済み:
+        #   env 既定値 53 件 + entry_order_builder の 4 定数 + 連鎖 install 2 件
+        #     -> trading/handlers/entry_order_builder.apply_entry_final_filter_defaults()
+        #   range_5m_filter の fail-open ラップ
+        #     -> trading/handlers/entry_controller.range_5m_filter (low_movement の外側)
+        #   atr_1m_filter のラップ
+        #     -> tonosama rescue に巻き戻されて到達しない死にラッパーだったので撤去
+        # 位置は旧 install と同じ (定数を書き戻す watcher との順序があるため)。
+        ("trading.handlers.entry_order_builder", "apply_entry_final_filter_defaults"),
+        # oneshot_limit_700k_patch は本文化済み:
+        #   env 既定値 45 件 + MAX_ONESHOT=700000 + entry_controller の
+        #   スコアしきい値 4 定数 + 生きている連鎖 install 3 件
+        #     -> kabu_api.buy_sell_entry.apply_oneshot_limit_defaults()
+        #   他 15 個のサブ install は本文化済みの空スタブか env のみだった。
+        # 位置は旧 install と同じ (しきい値を書き戻す watcher との順序があるため)。
+        ("kabu_api.buy_sell_entry", "apply_oneshot_limit_defaults"),
+        # entry_limit_passive_runtime_patch は
+        # trading/handlers/entry_order_builder.py へ本文化済み (_elp_*)。
+        # 定数の上書きと _aggressive_limit_price の差し替えは
+        # 同ファイルの _elp_apply_constants() が import 時に行う。
         # discord_summary_display_compact_patch / discord_summary_kwarg_safety_patch は
         # scheduler_jobs/summary/display.py 本体へインライン化済みのため削除。
         # entry_ma5_third_bar_slope_guard_patch は entry_controller._build_scored_candidates
         # 本体へインライン化済みのため削除。
-        ("core.startup.final_entry_liquidity_movement_hard_guard_patch", "install"),
-        ("core.startup.summary_ai_more_candidates_patch", "install"),
-        ("core.startup.summary_ai_async_entry_patch", "install"),
+        # summary_ai_more_candidates_patch は trading/entry/summary_ai/more_candidates.py へ移設した
+        # (runner の候補数拡張 + スコア clamp と low move pool refill だけが残っている。
+        #  final gate relax 定数 -> entry_controller.apply_final_gate_relax_constants()、
+        #  range_pct 補修 / SELL short_ok 事前フィルタ -> candidates.py 本体へ本文化済み)。
+        ("trading.entry.summary_ai.more_candidates", "install"),
+        ("trading.entry.summary_ai.direct_snapshot", "apply_async_entry_defaults"),
         # async entry が executor を差し替えた後で、V5 direct dispatch を必ず重ねる。
-        ("core.startup.summary_ai_async_direct_dispatch_patch", "install"),
-        ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
-        ("core.startup.summary_ai_entry_controller_bridge_patch", "install"),
-        ("core.startup.ranking_entry_flat_price_guard_patch", "install"),
-        ("core.startup.board_retry_patch", "install"),
-        ("core.startup.board_missing_failopen_runtime_patch", "install"),
-        ("core.startup.tonosama_5sec_stopped_relax_patch", "install"),
-        ("core.startup.volatility_filter_tonosama_entryrow_rescue_patch", "install"),
-        ("core.startup.board_wall_stall_exit_patch", "install"),
-        ("core.startup.ranking_entry_filter_rescue_patch", "install"),
-        ("core.startup.entry_log_skip_reason_collision_patch", "install"),
+        # summary_ai_async_direct_dispatch_patch は本文化済み:
+        #   _positive_result の strict 化 -> trading/entry/summary_ai/executor.py
+        #   (_strict_result_executed / _strict_positive_enabled)。
+        #   price floor 2500 の上書きは 2026-08-11 のユーザー判断
+        #   「エントリー最低価格は200円」により移植せず破棄した。
+        # entry_order_mtf_slope_fill_patch は
+        # trading/handlers/entry_order_builder.py へ本文化済み (_mtf_*)。
+        # 旧 install が連鎖していた 2 件をここへ移した
+        # (summary_no_overlap は本文化済みで空スタブ)。
+        # entry_order_short_mtf_neutral_rescue_patch は
+        # trading/handlers/entry_order_builder.py へ本文化済み (_smr_*)。
+        # build_entry_order のラッパーは本文に組み込んだが、guard の
+        # 追いラップだけは旧 install と同じこの位置で掛ける必要がある
+        # (entry_ma5_breakout_count_patch より後 = 外側でないと
+        #  ma5 の NG を解除できなくなるため)。
+        ("trading.handlers.entry_order_builder", "apply_short_mtf_guard_wraps"),
+        # summary_ai_entry_controller_bridge_patch は本文化済みなので削除した。
+        #   ai_final_entry_check ラッパー -> trading/handlers/entry_controller.py (_bri_*)
+        #   _result_executed 厳格判定   -> trading/summary/pipeline/entry_pipeline.py
+        #                                  trading/summary/summary_entry.py
+        ("kabu_api.board_retry", "apply_env_defaults"),
+        ("core.startup.board_safety_defaults", "install"),
+        # tonosama_5sec_stopped_relax_patch は
+        # trading/entry/tonosama/pending_writer.py へ本文化済み
+        # (_five_sec_relax_stage)。main.py 専用スコープは
+        # pending_writer._five_sec_relax_scope_enabled() が再現している。
+        # volatility_filter_tonosama_entryrow_rescue_patch は
+        # trading/filters/volatility_filter.py の atr_1m_filter へ本文化済み (_tvr_*)。
+        # 実 install 順の測定で、この層が atr_1m_filter を包む 6 パッチの中で
+        # 最後に入り native の上へ載せ直す = 実質の最内層だと確認したうえで畳んだ。
+        # entry_controller.py:121 の from-import が最初からこの実装を掴む。
+        # board_wall_stall_exit_patch は trading/handlers/exit_handler.py へ本文化済み
+        # (_bfe_* / run_exit_pipeline / check_normal_exit / check_tonosama_exit)。
+        # entry board imbalance guard は元から no-op だったので移していない。
+        # ranking_entry_filter_rescue_patch は trading/ranking/entry_from_ranking.py
+        # (_passes_ranking_only_filters の再帰救済ラップ) と
+        # trading/summary/engine/summary_incremental_engine.py._build_bars /
+        # trading/ranking/ranking_technical_store.py._calculate_technicals
+        # (期間出来高補正) へ本文化済みのため削除。
     ]
-    for mod_name, fn_name in patches:
+    for item in patches:
+        # 要素は ("module", "function") のほか、main.py 内で完結する処理を
+        # 並び順どおりに挟むための素の callable も許す。
+        if callable(item):
+            mod_name, fn_name = "main", getattr(item, "__name__", "<callable>")
+        else:
+            mod_name, fn_name = item
         try:
-            mod = importlib.import_module(mod_name)
-            fn = getattr(mod, fn_name, None)
+            if callable(item):
+                fn = item
+            else:
+                mod = importlib.import_module(mod_name)
+                fn = getattr(mod, fn_name, None)
             ok = fn() if callable(fn) else False
             logger.warning("[MAIN RUNTIME PATCH] %s.%s installed=%s", mod_name, fn_name, ok)
             heartbeat("main_runtime_patch", status="OK" if ok else "NG", detail={"module": mod_name, "fn": fn_name})
@@ -284,6 +515,42 @@ def _install_summary_entry_runtime_context():
         logger.exception("summary/entry runtime context install failed")
 
 
+_SCHEDULE_DRIVE_STATE = {"allowed": None, "logged": False}
+
+
+def _may_drive_schedule() -> bool:
+    """main loop が schedule.run_pending() を呼んでよいか。
+
+    core.startup.bootstrap.schedule_loop の dispatcher thread が
+    schedule を回しているなら、ここでは回さない (二重 dispatch 防止)。
+    判定は毎周ではなく、状態が変わったときだけログへ出す。
+    """
+    try:
+        from core.startup.bootstrap.schedule_loop import (
+            is_schedule_run_pending_loop_running,
+            may_run_pending_here,
+        )
+    except Exception:
+        # dispatcher が居ないビルドでは従来どおり main loop が回す。
+        return True
+
+    allowed = bool(may_run_pending_here("main_loop"))
+    if allowed != _SCHEDULE_DRIVE_STATE["allowed"]:
+        _SCHEDULE_DRIVE_STATE["allowed"] = allowed
+        if allowed:
+            logger.warning(
+                "[EXIT SCHEDULER] main loop が schedule を駆動する "
+                "(dispatcher thread running=%s)",
+                is_schedule_run_pending_loop_running(),
+            )
+        else:
+            logger.warning(
+                "[EXIT SCHEDULER] main loop は schedule.run_pending を呼ばない "
+                "(owner=schedule_loop dispatcher。同じ job の二重起動を防ぐ)",
+            )
+    return allowed
+
+
 def _register_exit_scheduler():
     try:
         if not callable(run_exit_pipeline):
@@ -299,14 +566,70 @@ def _register_exit_scheduler():
                     return True
             except Exception:
                 pass
+        # P0-8: Exit の owner は一系統にする。
+        # exit_bootstrap の exit_loop_5s (5 秒ごと) が実働しており
+        # (実測 424 回正常完走)、ここで run_exit_pipeline を 1 秒ごとに
+        # 登録すると **2 系統が同時に返済注文を出す**ことになる。
+        # 既定では登録しない。切り替えたい場合だけ env で明示する。
+        _owner = (os.getenv("EXIT_PIPELINE_OWNER") or "exit_loop_5s").strip().lower()
+        if _owner != "run_exit_pipeline":
+            logger.warning(
+                "[EXIT SCHEDULER] run_exit_pipeline は登録しない owner=%s "
+                "(exit_bootstrap の exit_loop_5s が Exit owner。"
+                "二重に返済注文を出さないため。"
+                "EXIT_PIPELINE_OWNER=run_exit_pipeline で切り替え可能だが "
+                "その場合は exit_loop_5s 側を止めること)",
+                _owner,
+            )
+            heartbeat("exit_scheduler", status="OK",
+                      detail={"registered": False, "owner": _owner})
+            _audit_exit_owners(_owner)
+            return True
+
         schedule.every(1).seconds.do(run_exit_pipeline)
-        logger.warning("[EXIT SCHEDULER] run_exit_pipeline registered every 1s")
-        heartbeat("exit_scheduler", status="OK", detail={"registered_every_sec": 1})
+        logger.warning("[EXIT SCHEDULER] run_exit_pipeline registered every 1s owner=%s", _owner)
+        heartbeat("exit_scheduler", status="OK", detail={"registered_every_sec": 1, "owner": _owner})
+        _audit_exit_owners(_owner)
         return True
     except Exception:
         heartbeat("exit_scheduler", status="ERROR")
         logger.exception("[EXIT SCHEDULER] register failed")
         return False
+
+
+def _audit_exit_owners(owner: str) -> int:
+    """P0-13: EXIT を駆動しているジョブを列挙し、owner が 1 系統か確認する。
+
+    positions DB 障害時に 2 系統が同じ DB へ重複 SELECT を投げないよう、
+    Exit の scheduler owner は必ず 1 本にする。
+    次回ログでそのまま検証できるように、実際の登録内容を出す。
+    """
+    try:
+        exit_jobs = []
+        for job in list(schedule.jobs):
+            try:
+                fn = getattr(job, "job_func", None)
+                fname = getattr(getattr(fn, "func", fn), "__name__", str(fn))
+                tags = sorted(str(t) for t in (getattr(job, "tags", None) or set()))
+                if "exit" in tags or "exit" in fname.lower():
+                    exit_jobs.append({"func": fname, "tags": tags, "interval": str(job)})
+            except Exception:
+                logger.debug("[EXIT SCHEDULER] job audit skip", exc_info=True)
+
+        n = len(exit_jobs)
+        log = logger.warning if n == 1 else logger.error
+        log(
+            "[EXIT OWNER AUDIT] exit_scheduler_owner_count=%d owner=%s jobs=%s "
+            "(完成条件5: Exit scheduler owner = 1)",
+            n, owner, exit_jobs,
+        )
+        heartbeat("exit_owner_audit",
+                  status="OK" if n == 1 else "NG",
+                  detail={"count": n, "owner": owner})
+        return n
+    except Exception:
+        logger.exception("[EXIT OWNER AUDIT] failed")
+        return -1
 
 
 def _resolve_push_refresh_callable():
@@ -415,6 +738,19 @@ def main():
     logger.warning("[MAIN] start")
     mark_component_start("main")
     try:
+        # P0-6: 資源スナップショットを最初に立ち上げる。
+        # 2026-08-27 の disk I/O error は positions.db 固有の問題ではなく、
+        # プロセス全体のハンドル枯渇の症状だった
+        # (15:21:44 に push DB と positions.db が同時に CANTOPEN、
+        #  15:30:37 にローカルパスで Errno 24 Too many open files)。
+        # 次からは推測せずに handles / open_files / pool / thread で特定する。
+        try:
+            from core.diagnostics.resource_monitor import start_resource_monitor
+
+            start_resource_monitor()
+        except Exception:
+            logger.exception("resource monitor start failed")
+
         _install_main_runtime_patches()
         _install_summary_entry_runtime_context()
         system_startup()
@@ -435,10 +771,12 @@ def main():
             init_realtime_engine()
         except Exception:
             logger.exception("init_realtime_engine failed")
-        try:
-            PositionSyncManager().start()
-        except Exception:
-            logger.exception("PositionSyncManager start failed")
+        # PositionSyncManager は start() を持たない未完成クラスで、毎起動
+        # AttributeError を出していただけだった (maybe_sync/on_ws_reconnect も
+        # 呼び出し元なし)。建玉の broker 再同期は
+        # trading/position/open_position_sync.py の
+        # broker_credit_authoritative 経路が source of truth なので、
+        # 二重の position ポーラを復活させず呼び出しを削除する。
         try:
             Thread(target=ats_register_loop, daemon=True).start()
         except Exception:
@@ -451,12 +789,27 @@ def main():
             _register_exit_scheduler()
         except Exception:
             logger.exception("register exit scheduler failed")
+        # 2026-09-16 (B6): 3 分足・5 分足の並びから直接候補を出す走査
+        #   (trading/entry/mtf_candidate_source.py、MTF_CANDIDATE_SOURCE_ENABLED=0 で停止)
+        try:
+            from trading.entry.mtf_candidate_source import start_background_scanner as _start_mtf_cand
+            _start_mtf_cand()
+        except Exception:
+            logger.exception("mtf candidate source start failed")
         _run_initial_summary_tick_once()
         _run_initial_ranking_tick_once()
         heartbeat("main", status="RUNNING")
         while True:
             try:
-                schedule.run_pending()
+                # schedule の default scheduler はプロセスで 1 つ。
+                # core.startup.bootstrap.schedule_loop の dispatcher thread が
+                # 動いているときにここでも run_pending() を回すと、
+                # **同じ job (exit_loop_5s など) が 2 本同時に走る**。
+                # 2026-09-01 12:53 のログでは 244ms ずれた exit_loop_5s が
+                # 常時 2 本走り、/positions への GET も 2 倍になっていた。
+                # 駆動の所有者は 1 つに限定する。
+                if _may_drive_schedule():
+                    schedule.run_pending()
                 process_realtime()
                 time.sleep(0.2)
             except KeyboardInterrupt:

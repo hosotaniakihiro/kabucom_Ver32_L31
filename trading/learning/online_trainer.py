@@ -13,13 +13,14 @@ from __future__ import annotations
 import pandas as pd
 import sqlite3
 import logging
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
 
 def fetch_training_data(db_path="reward.db") -> pd.DataFrame:
     try:
-        with sqlite3.connect(db_path) as conn:
+        with committing_connect(db_path) as conn:
             df = pd.read_sql("SELECT * FROM reward_log", conn)
         return df
     except Exception:

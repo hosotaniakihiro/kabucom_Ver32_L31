@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from nas_root import nas_path, nas_root
 
 VERSION = "PRODUCTION-STABLE-REV3.0-PUSH-SYMBOL-BRIDGE-SPLIT-CANDIDATE100-REGISTER50-NAMELOG"
 
@@ -13,11 +14,11 @@ DEFAULT_MAX_SYMBOLS = 100
 DEFAULT_REGISTER_LIMIT = 50
 
 DEFAULT_SYMBOL_FLAGS_DB = Path(
-    r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db"
+    nas_path(r"Basic\symbol_flags.db")
 )
 
 DEFAULT_OPTIONAL_DB = Path(
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabutan\optional_data.db"
+    nas_path(r"raw_data\kabutan\optional_data.db")
 )
 
 __all__ = [

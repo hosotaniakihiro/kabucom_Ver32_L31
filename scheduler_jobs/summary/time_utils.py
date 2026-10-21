@@ -28,6 +28,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
+import sys
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -396,7 +398,7 @@ def is_time_locked_target(now: dt.datetime, interval: int) -> bool:
         return False
 
 
-def resolve_target_intervals(now: Optional[dt.datetime] = None) -> list[int]:
+def resolve_target_intervals_core(now: Optional[dt.datetime] = None) -> list[int]:
     """
     定時計算対象 intervals を返す。
     仕様:
@@ -415,6 +417,113 @@ def resolve_target_intervals(now: Optional[dt.datetime] = None) -> list[int]:
             targets.append(interval)
 
     return targets
+
+
+# --- summary_db_realtime_priority_patch (native化, 元 core/startup/summary_db_realtime_priority_patch.py) ---
+# main_database.py/summary_database_runner等のDB/data collectorプロセスでは、1m/3m/5m/ranking
+# summaryを同一tickで待つと1m summaryのlatest_dtが5-8分遅れ、main.py側でSUMMARY_AI candidateが
+# staleとしてスキップされる問題への対処。DB側プロセスかつ場中は、対象intervalsを1分足のみに
+# 絞り3m/5mはmain.py側のMTF fallback/後続処理に任せる。
+_SUMMARY_DB_REALTIME_PRIORITY_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_SUMMARY_DB_REALTIME_PRIORITY_FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
+_SUMMARY_DB_REALTIME_PRIORITY_ENV_DEFAULTS_APPLIED = False
+
+
+def _summary_db_realtime_priority_env_bool(name: str, default: bool) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None:
+            return bool(default)
+        s = str(raw).strip().lower()
+        if s in _SUMMARY_DB_REALTIME_PRIORITY_TRUE:
+            return True
+        if s in _SUMMARY_DB_REALTIME_PRIORITY_FALSE:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _summary_db_realtime_priority_is_db_process() -> bool:
+    try:
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if any(
+            x in argv
+            for x in (
+                "main_database.py",
+                "data_collectors_runner.py",
+                "summary_database_runner.py",
+                "push_receiver_runner.py",
+                "ranking_collector_runner.py",
+                "yahoo_complement_runner.py",
+                "db_prepare_runner.py",
+            )
+        ):
+            return True
+        return any(
+            _summary_db_realtime_priority_env_bool(k, False)
+            for k in (
+                "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+                "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+                "AUTOSTOCK_SUMMARY_DB_WRITER",
+                "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+            )
+        )
+    except Exception:
+        return False
+
+
+def _summary_db_realtime_priority_enabled() -> bool:
+    if str(os.environ.get("DISABLE_SUMMARY_DB_REALTIME_PRIORITY_PATCH", "")).strip() == "1":
+        return False
+    return (
+        _summary_db_realtime_priority_env_bool("SUMMARY_DB_REALTIME_PRIORITY_ENABLED", True)
+        and _summary_db_realtime_priority_is_db_process()
+    )
+
+
+def _summary_db_realtime_priority_force_env_defaults() -> None:
+    """DB側では1m保存を詰まらせる設定を既定で抑える (プロセス内で1回だけ適用)。"""
+    global _SUMMARY_DB_REALTIME_PRIORITY_ENV_DEFAULTS_APPLIED
+    if _SUMMARY_DB_REALTIME_PRIORITY_ENV_DEFAULTS_APPLIED:
+        return
+    defaults = {
+        "SUMMARY_PARALLEL_RANKING_ENABLED": "0",
+        "SUMMARY_PARALLEL_FORCE_1_3_5": "0",
+        "SUMMARY_PUSH_DISPLAY_ALL_INTERVALS": "0",
+        "SUMMARY_PUSH_BG_ALL_INTERVALS": "0",
+        "SUMMARY_PUSH_BG_LONG_INTERVALS": "0",
+        "SUMMARY_PARALLEL_INTERVAL_WORKERS": "1",
+        "SUMMARY_PUSH_BG_INTERVAL_WORKERS": "1",
+        "SUMMARY_PARALLEL_TIMEOUT_MIN_SEC": "15",
+        "SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC": "25",
+        "SUMMARY_DB_REALTIME_1M_ONLY_IN_SESSION": "1",
+    }
+    for k, v in defaults.items():
+        try:
+            old = os.getenv(k)
+            if old is None or str(old).strip() == "":
+                os.environ[k] = v
+        except Exception:
+            pass
+    _SUMMARY_DB_REALTIME_PRIORITY_ENV_DEFAULTS_APPLIED = True
+
+
+def resolve_target_intervals(now: Optional[dt.datetime] = None) -> list[int]:
+    if _summary_db_realtime_priority_enabled():
+        try:
+            if _summary_db_realtime_priority_env_bool("SUMMARY_DB_REALTIME_1M_ONLY_IN_SESSION", True) and is_market_session(now):
+                return [1]
+        except Exception:
+            pass
+    return resolve_target_intervals_core(now)
+
+
+# 旧パッチの install() はモジュールimport連鎖の早い段階 (core/startup/runtime_env/installer.py
+# 経由) で1回だけ呼ばれ、DBプロセスならその場でenvデフォルトを強制していた。native化後も
+# 同じタイミング (このモジュールが最初にimportされた時点) で1回だけ適用する。
+if _summary_db_realtime_priority_enabled():
+    _summary_db_realtime_priority_force_env_defaults()
 
 
 # ============================================================

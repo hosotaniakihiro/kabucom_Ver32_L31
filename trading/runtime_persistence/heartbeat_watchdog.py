@@ -16,10 +16,11 @@ import os
 import sqlite3
 from datetime import datetime
 from typing import Any
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = r'\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\runtime_state'
+BASE_DIR = nas_path(r'raw_data\kabu_station\runtime_state')
 STALE_SECONDS_DEFAULT = 90
 
 

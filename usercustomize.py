@@ -118,9 +118,28 @@ def _install_summary_ai_fast_order_builder() -> bool:
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_SEC", "0.8")
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", "0.2")
 
-        from core.startup.summary_ai_fast_order_builder_patch import install as _install_fast_order
+        # summary_ai_fast_order_builder_patch は
+        # trading/handlers/entry_order_builder.py へ本文化済み (_fob_*)。
+        # env / 定数の適用は同ファイルの _fob_apply_env_and_constants() が
+        # import 時に行うので、ここでは import して走らせるだけでよい。
+        # 旧 install が連鎖していた 2 つはここから直接呼ぶ。
+        import trading.handlers.entry_order_builder as _eob  # noqa: F401
 
-        ok = bool(_install_fast_order())
+        # summary_ai_strict_board_rest_patch は eob へ本文化済み
+        # (_sbr_* / get_latest_bid_ask / _get_board_with_retry)。
+        # 板 wrapper の設置は不要になったので、残る env・定数の強制
+        # (と連鎖していた board missing defer の import) だけを呼ぶ。
+        # breakout_support_resistance_guard_patch も本文化済み:
+        #   trading/handlers/entry_order_builder.build_entry_order (_bsr_*)
+        #   trading/entry/summary_ai/executor の
+        #     _base_filter_blocked_ai_ok_items / _sort_key
+        ok = True
+        try:
+            _r = bool(_eob.apply_strict_board_rest_policy())
+            logger.warning("[USERCUSTOMIZE] strict board policy chain installed=%s", _r)
+        except Exception:
+            ok = False
+            logger.exception("[USERCUSTOMIZE] strict board policy chain install failed")
         logger.warning(
             "[USERCUSTOMIZE] summary AI fast order builder ok=%s retry_sec=%s retry_interval=%s",
             ok,
@@ -133,40 +152,52 @@ def _install_summary_ai_fast_order_builder() -> bool:
         return False
 
 
-def _install_summary_ai_ranking_prefilter_signal() -> bool:
-    try:
-        from core.startup.summary_ai_ranking_prefilter_signal_patch import install as _install_prefilter
+def _install_exit_no_progress_monitor() -> bool:
+    """建玉が5分で利確/損切の70%水準に届かない場合の返済監視を起動する。
 
-        ok = bool(_install_prefilter())
-        logger.warning("[USERCUSTOMIZE] summary AI ranking prefilter signal ok=%s", ok)
+    旧 core/startup/summary_ai_ranking_prefilter_signal_patch.install() が
+    連鎖起動していたもの。prefilter 本体は
+    trading/entry/summary_ai/runner.py へ本文化済みのため、ここでは
+    監視スレッドの起動だけを行う。
+    (呼び出し元の _uc_delayed_watchlist_patch_loop が毎秒呼び直すため、
+     旧パッチの watcher スレッドと同じリトライ性を保つ)
+    """
+    try:
+        from trading.exit.no_progress_monitor import install as _install_exit_monitor
+
+        ok = bool(_install_exit_monitor())
+        logger.warning("[USERCUSTOMIZE] exit no-progress monitor ok=%s", ok)
         return ok
     except Exception:
-        logger.exception("[USERCUSTOMIZE] summary AI ranking prefilter signal failed")
-        return False
-
-
-def _install_summary_ai_no_ranking_rescue_scan() -> bool:
-    try:
-        from core.startup.summary_ai_no_ranking_rescue_scan_patch import install as _install_no_scan
-
-        ok = bool(_install_no_scan())
-        logger.warning("[USERCUSTOMIZE] summary AI no ranking rescue scan ok=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[USERCUSTOMIZE] summary AI no ranking rescue scan failed")
+        logger.exception("[USERCUSTOMIZE] exit no-progress monitor failed")
         return False
 
 
 def _install_summary_ai_board_rest_cooldown() -> bool:
-    try:
-        from core.startup.summary_ai_board_rest_cooldown_patch import install as _install_cooldown
+    """Summary-AI 経路の REST 板クールダウン回避と、連鎖する戦略オーバレイ。
 
-        ok = bool(_install_cooldown())
-        logger.warning("[USERCUSTOMIZE] summary AI board REST cooldown bypass ok=%s", ok)
-        return ok
+    クールダウン回避本体は kabu_api/board_retry.py の
+    _fetch_board_rest へ統合済み。ここでは旧パッチが併せて行っていた
+    3つの戦略 install を、同じ位置・同じ順序で実行する。
+    """
+    results = {}
+    # strategy_mode は trading/entry/summary_ai/executor.py へ本文化済み
+    # (_sm_* / _sort_key / _passes_strict_candidate_quality)。
+    # fibonacci_ev / nve_projection のオーバーレイもその _sm_classify /
+    # _sm_strategy_enabled に取り込まれている (合成順も同じ)。
+    # 有効/無効は SUMMARY_AI_FIB_EV_STRATEGY_ENABLED /
+    # SUMMARY_AI_NVE_STRATEGY_ENABLED を各層が見る。
+    # install は不要になったので、モジュールが読めることだけ確認する。
+    try:
+        import trading.entry.summary_ai.executor as _ex  # noqa: F401
+
+        results["strategy_mode"] = True
     except Exception:
-        logger.exception("[USERCUSTOMIZE] summary AI board REST cooldown bypass failed")
-        return False
+        results["strategy_mode"] = False
+        logger.exception("[USERCUSTOMIZE] chained strategy_mode import failed")
+    ok = any(results.values())
+    logger.warning("[USERCUSTOMIZE] summary AI board REST cooldown bypass ok=%s chained=%s", ok, results)
+    return ok
 
 
 def _install_summary_ai_emp_prob_gate() -> bool:
@@ -184,9 +215,14 @@ def _install_summary_ai_emp_prob_gate() -> bool:
     実測ベースの確率で AI_OK を最終確認する。
     """
     try:
-        from core.startup.summary_ai_emp_prob_gate_patch import install as _install_emp_prob_gate
+        # summary_ai_emp_prob_gate_patch は
+        # trading/entry/summary_ai/emp_prob_gate.py へ移設し、
+        # ai_gate_runner.py の内部呼び出し直後で apply_emp_prob_gate() を
+        # 呼ぶ形へ本文化した。env 既定値は同モジュールが import 時に入れる。
+        from trading.entry.summary_ai import emp_prob_gate as _emp_prob_gate
 
-        ok = bool(_install_emp_prob_gate())
+        _emp_prob_gate.apply_env_defaults()
+        ok = True
         logger.warning(
             "[USERCUSTOMIZE] summary AI empirical probability gate ok=%s enabled=%s min_p=%s max_risk=%s samples=%s",
             ok,
@@ -203,7 +239,7 @@ def _install_summary_ai_emp_prob_gate() -> bool:
 
 def _install_runtime_defaults() -> bool:
     try:
-        from core.startup.runtime_env_defaults_patch import install as _install_defaults
+        from core.startup.runtime_env.installer import install as _install_defaults
 
         ok = bool(_install_defaults())
         logger.warning("[USERCUSTOMIZE] centralized runtime defaults ok=%s", ok)
@@ -213,35 +249,124 @@ def _install_runtime_defaults() -> bool:
         return False
 
 
-def _install_summary_pending_age_relax() -> bool:
+def _pending_age_relax_safe_float(v, default: float) -> float:
     try:
-        from core.startup.summary_entry_pending_age_relax_patch import install as _install_age_relax
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
 
-        ok = bool(_install_age_relax())
-        logger.warning("[USERCUSTOMIZE] summary pending age relax ok=%s max_age=%s", ok, os.getenv("SUMMARY_ENTRY_PENDING_MAX_AGE_SEC"))
-        return ok
+
+def _pending_age_relax_raise_min_env(name: str, minimum: float):
+    old = os.environ.get(name)
+    cur = _pending_age_relax_safe_float(old, minimum)
+    if old is None or cur < minimum:
+        os.environ[name] = str(int(minimum) if float(minimum).is_integer() else minimum)
+    return old, os.environ.get(name, "")
+
+
+def _install_summary_pending_age_relax() -> bool:
+    # core/startup/summary_entry_pending_age_relax_patch.py (V1-SUMMARY-PENDING-AGE-900S) を native化。
+    # SUMMARY_AI 承認行が pending 登録に届いても、既定の age limit (180s) が厳しすぎて
+    # no_pending_registered として弾かれていた問題への対処。pending 登録の stale 判定 window
+    # のみを緩和し (下限900s)、stale 保護自体は無効化しない。
+    try:
+        minimum = _pending_age_relax_safe_float(os.environ.get("SUMMARY_ENTRY_PENDING_RELAX_MIN_AGE_SEC"), 900.0)
+        changed = {}
+        for name in (
+            "SUMMARY_ENTRY_PENDING_MAX_AGE_SEC",
+            "SUMMARY_AI_PENDING_MAX_AGE_SEC",
+            "SUMMARY_AI_MAX_CANDIDATE_AGE_SEC",
+            "ENTRY_CANDIDATE_MAX_AGE_SEC",
+        ):
+            old, new = _pending_age_relax_raise_min_env(name, minimum)
+            changed[name] = {"old": old, "new": new}
+
+        # summary_entry_pending_existing_fix_patch は
+        # trading/summary/summary_entry.register_pending_entries へ本文化済み。
+        # env 値は都度動的に読むので、ここでの再install は不要になった。
+
+        logger.warning(
+            "[USERCUSTOMIZE] summary pending age relax ok=True max_age=%s (min_age=%s changed=%s)",
+            os.getenv("SUMMARY_ENTRY_PENDING_MAX_AGE_SEC"), minimum, changed,
+        )
+        return True
     except Exception:
         logger.exception("[USERCUSTOMIZE] summary pending age relax failed")
         return False
 
 
-def _install_summary_mtf_duplicate_datetime_guard() -> bool:
+def _summary_mtf_guard_is_db_collector_context() -> bool:
+    """旧 summary_mtf_duplicate_datetime_guard_patch._is_database_collector_context。"""
     try:
-        from core.startup.summary_mtf_duplicate_datetime_guard_patch import install as _install_guard
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if any(
+            x in argv
+            for x in (
+                "main_database.py",
+                "db_prepare_runner.py",
+                "ranking_collector_runner.py",
+                "push_receiver_runner.py",
+                "yahoo_complement_runner.py",
+                "summary_database_runner.py",
+                "data_collectors_runner.py",
+            )
+        ):
+            return True
+        return any(
+            os.getenv(k) == "1"
+            for k in (
+                "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+                "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+                "AUTOSTOCK_SUMMARY_DB_WRITER",
+                "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+            )
+        )
+    except Exception:
+        return False
 
-        ok = bool(_install_guard())
-        logger.warning("[USERCUSTOMIZE] summary MTF duplicate datetime guard ok=%s", ok)
+
+def _install_summary_mtf_duplicate_datetime_guard() -> bool:
+    """旧 core/startup/summary_mtf_duplicate_datetime_guard_patch を削除して直呼びにした。
+
+    旧 install() の 3 つのサブ処理のうち、生きていたのは 3 だけだった:
+
+      1. summary_mtf_diff_from_1m_patch._repair_mtf_from_1m のラップ
+         -> 同モジュールはこのヘルパを既に持っていない (571行のコメント参照)。
+            getattr が None を返し「target repair missing」を出して False。
+            付随する install フック (_install_target_install_hook) も、
+            フック先で同じ _patch_target_repair を再試行するだけなので
+            ログ以外の効果が無かった。
+      2. summary_ai_candidate_refill_patch._push_writer_state のラップ
+         -> 同モジュールにこの属性は存在しない。「target missing」で False。
+      3. main_entry_operator (旧 main_entry_runtime_operator_fix_patch) の
+         中継 install (main.py のみ)
+         -> **これだけが実効**。しかもこのパッチを install しているのは
+            リポジトリ全体でここ 1 箇所だけなので、そのまま残す。
+
+    1 と 2 の対象属性はリポジトリ全体を検索しても定義箇所が無い
+    (動的 setattr も含めて 0 件) ため、復活する余地も無い。
+    """
+    if not ("main.py" in " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+            and not _summary_mtf_guard_is_db_collector_context()):
+        return False
+    try:
+        from core.startup import main_entry_operator as p
+
+        fn = getattr(p, "install", None)
+        ok = bool(fn()) if callable(fn) else False
+        logger.warning("[USERCUSTOMIZE] main entry runtime fix installed=%s", ok)
         return ok
     except Exception:
-        logger.exception("[USERCUSTOMIZE] summary MTF duplicate datetime guard failed")
+        logger.exception("[USERCUSTOMIZE] main entry runtime fix failed")
         return False
 
 
 _install_runtime_defaults()
 _patch_entry_order_builder_logger()
 _install_summary_ai_fast_order_builder()
-_install_summary_ai_ranking_prefilter_signal()
-_install_summary_ai_no_ranking_rescue_scan()
+_install_exit_no_progress_monitor()
 _install_summary_ai_board_rest_cooldown()
 _install_summary_ai_emp_prob_gate()
 _install_summary_pending_age_relax()
@@ -473,98 +598,18 @@ def _uc_is_push_rotation_context(context: str) -> bool:
 
 
 def _uc_patch_watchlist_recent_liq_rotation_failopen() -> bool:
-    if not _is_main_py():
-        return False
+    """watchlist_recent_liquidity の 3 層は本文化済み。
 
-    try:
-        try:
-            from core.startup.watchlist_recent_liquidity_bulk_patch import install as _bulk_install
-
-            _bulk_install()
-        except Exception:
-            logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] bulk install before wrap failed")
-
-        import core.startup.watchlist_recent_liquidity_guard_patch as base
-
-        orig_filter = getattr(base, "_filter_symbols", None)
-        if not callable(orig_filter):
-            logger.warning("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] base _filter_symbols missing")
-            return False
-
-        if getattr(orig_filter, "_uc_push_rotation_failopen_v1", False):
-            return True
-
-        def _patched_filter_symbols(symbols: Iterable[Any], *, context: str) -> list[str]:
-            items = _uc_dedupe_symbols(symbols)
-            out = orig_filter(items, context=context)
-            out_items = _uc_dedupe_symbols(out)
-
-            if _uc_is_push_rotation_context(context) and items:
-                min_keep = max(1, min(len(items), _env_int("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", 50)))
-                if len(out_items) < min_keep:
-                    logger.warning(
-                        "[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] context=%s before=%s after=%s min_keep=%s -> keep original targets",
-                        context,
-                        len(items),
-                        len(out_items),
-                        min_keep,
-                    )
-                    return items
-
-            return out_items
-
-        _patched_filter_symbols._uc_push_rotation_failopen_v1 = True  # type: ignore[attr-defined]
-        _patched_filter_symbols._original = orig_filter  # type: ignore[attr-defined]
-        base._filter_symbols = _patched_filter_symbols
-
-        try:
-            import trading.push.push_stream.rotation_symbols as rot_sym
-
-            old_apply = getattr(rot_sym, "apply_register_liquidity_guard", None)
-
-            if callable(old_apply) and not getattr(old_apply, "_uc_push_rotation_apply_failopen_v1", False):
-
-                def _patched_apply_register_liquidity_guard(targets):
-                    items = _uc_dedupe_symbols(targets)
-                    out = old_apply(targets)
-                    out_items = _uc_dedupe_symbols(out)
-
-                    if items:
-                        min_keep = max(1, min(len(items), _env_int("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", 50)))
-                        if len(out_items) < min_keep:
-                            logger.warning(
-                                "[USERCUSTOMIZE][PUSH ROTATION APPLY FAILOPEN] before=%s after=%s min_keep=%s -> keep original targets",
-                                len(items),
-                                len(out_items),
-                                min_keep,
-                            )
-                            return items
-
-                    return out_items
-
-                _patched_apply_register_liquidity_guard._uc_push_rotation_apply_failopen_v1 = True  # type: ignore[attr-defined]
-                _patched_apply_register_liquidity_guard._original = old_apply  # type: ignore[attr-defined]
-                rot_sym.apply_register_liquidity_guard = _patched_apply_register_liquidity_guard
-
-                try:
-                    import trading.push.push_stream.rotation as rot
-
-                    rot._apply_register_liquidity_guard = _patched_apply_register_liquidity_guard
-                except Exception:
-                    pass
-
-        except Exception:
-            logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] rotation apply wrap failed")
-
-        logger.warning(
-            "[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] installed min_keep=%s",
-            os.getenv("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", "50"),
-        )
-        return True
-
-    except Exception:
-        logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] install failed")
-        return False
+    guard の per-symbol 実装 / bulk の完全置換 / ここにあった min_keep
+    fail-open ラッパーは、まとめて
+    trading/ranking/active_symbols/recent_liquidity.py の
+    filter_symbols() / apply_failopen_min_keep() に入れた。
+    呼び出し側は
+      trading/ranking/active_symbols/manager.py の 8 関数
+      trading/push/push_stream/rotation_symbols.apply_register_liquidity_guard
+    が本文で直接呼ぶ (互換ラッパーと rotation.py は from-import で追従)。
+    """
+    return True
 
 
 def _uc_delayed_watchlist_patch_loop() -> None:
@@ -573,8 +618,7 @@ def _uc_delayed_watchlist_patch_loop() -> None:
             _uc_patch_watchlist_recent_liq_rotation_failopen()
             _patch_entry_order_builder_logger()
             _install_summary_ai_fast_order_builder()
-            _install_summary_ai_ranking_prefilter_signal()
-            _install_summary_ai_no_ranking_rescue_scan()
+            _install_exit_no_progress_monitor()
             _install_summary_ai_board_rest_cooldown()
             _install_summary_ai_emp_prob_gate()
         except Exception:
@@ -586,8 +630,7 @@ def _uc_delayed_watchlist_patch_loop() -> None:
 if _is_main_py():
     _patch_entry_order_builder_logger()
     _install_summary_ai_fast_order_builder()
-    _install_summary_ai_ranking_prefilter_signal()
-    _install_summary_ai_no_ranking_rescue_scan()
+    _install_exit_no_progress_monitor()
     _install_summary_ai_board_rest_cooldown()
     _install_summary_ai_emp_prob_gate()
     _uc_patch_tonosama_recent_volume_display()

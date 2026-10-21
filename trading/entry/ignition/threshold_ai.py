@@ -1,4 +1,11 @@
-threshold_ai.pyzimport pandas as pd
+# ============================================================
+# trading/entry/ignition/threshold_ai.py
+# TONOSAMA ai_confidence 閾値の銘柄別チューニング
+# ------------------------------------------------------------
+# ・学習データから銘柄ごとに勝率が最大になる ai_conf 閾値を選ぶ
+# ・結果を AI/model/tonosama_thresholds.pkl へ保存する
+# ============================================================
+import pandas as pd
 from pathlib import Path
 import joblib
 

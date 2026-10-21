@@ -19,6 +19,7 @@ import logging
 import threading
 
 from global_state import global_data
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ SUMMARY_TABLE_BY_TF = {
     5: "stock_summary_5min",
 }
 
-DEFAULT_SUMMARY_DIR = r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary"
+DEFAULT_SUMMARY_DIR = nas_path(r"raw_data\kabu_station\summary")
 
 SUMMARY_BOOTSTRAP_THREAD: threading.Thread | None = None
 

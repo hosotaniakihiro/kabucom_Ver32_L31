@@ -14,10 +14,11 @@ from pathlib import Path
 from typing import Any, Dict
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-SYMBOL_FLAGS_DB = r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db"
+SYMBOL_FLAGS_DB = nas_path(r"Basic\symbol_flags.db")
 
 # ============================================================
 # global_data 互換解決

@@ -38,7 +38,17 @@ try:
 except Exception:  # pragma: no cover - runtime fallback
     get_usable_ranking_db_path = None
 
-RANKING_DB_DIR = get_path("raw_ranking")
+def _ranking_db_dir():
+    """2026-09-07: ranking DB をローカルへ移したので、そちらを見る。"""
+    try:
+        from trading.ranking import ranking_db_location
+
+        return ranking_db_location.ranking_db_dir()
+    except Exception:
+        return get_path("raw_ranking")
+
+
+RANKING_DB_DIR = _ranking_db_dir()
 SNAPSHOT_TABLE = "ranking_snapshot_1min"
 RAW_FALLBACK_TABLES = (
     "ranking_raw_1min",
@@ -495,7 +505,7 @@ def _ranking_pending_count() -> int:
         return 0
 
 
-def precheck_ranking_entry() -> Dict[str, Any]:
+def _precheck_ranking_entry_core() -> Dict[str, Any]:
     result = _check_ranking_ready()
     if not result["is_ready"]:
         # 旧 core/startup/ranking_entry_controller_timeout_patch.py (V1.9) の
@@ -534,3 +544,180 @@ def log_precheck_result(result: Dict[str, Any]):
 
 
 __all__ = ["precheck_ranking_entry", "log_precheck_result"]
+
+
+# ============================================================
+# pending がある場合の RANKING precheck (strict)
+# ------------------------------------------------------------
+# 旧 core/startup/ranking_precheck_pending_failopen_patch.py を本文化。
+# pending が存在しても ranking snapshot precheck が失敗していれば
+# **fail-closed** にする (既定)。明示的に
+# RANKING_PRECHECK_PENDING_FAILOPEN_ENABLED=1 のときだけ fail-open。
+#
+# 旧パッチは entry_precheck_ranking と entry_controller の両モジュール属性を
+# 差し替えていた (entry_controller:115 が from-import で束縛するため)。
+# ここで公開名として定義すれば、その from-import が最初から本実装を掴むので
+# 二重の差し替えは不要になる。
+#
+# 適用スコープは旧 install 導線
+# (summary_ai_entry_hook_dataframe_truth_patch <- sitecustomize) を
+# _rpp_scope_enabled() で再現する。
+# ============================================================
+
+os.environ.setdefault("RANKING_PRECHECK_PENDING_FAILOPEN_ENABLED", "0")
+
+def _rpp_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _rpp_norm(v: Any) -> str:
+    try:
+        return str(v or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _rpp_ranking_pending_snapshot() -> tuple[int, dict[str, int]]:
+    try:
+        from global_state import global_data
+
+        root = getattr(global_data, "pending_entries", None)
+        if not isinstance(root, dict):
+            return 0, {}
+
+        counts: dict[str, int] = {}
+        total = 0
+        for sym, bucket in list(root.items()):
+            if not isinstance(bucket, (list, tuple)):
+                continue
+            c = 0
+            for e in bucket:
+                if not isinstance(e, dict):
+                    continue
+                src = _rpp_norm(e.get("source"))
+                et = _rpp_norm(e.get("entry_type"))
+                if src == "RANKING" or et == "RANKING":
+                    c += 1
+            if c > 0:
+                counts[str(sym)] = c
+                total += c
+        return total, counts
+    except Exception:
+        logger.debug("[RANKING PRECHECK PENDING STRICT] pending snapshot failed", exc_info=True)
+        return 0, {}
+
+
+def _rpp_pending_ready_result(total: int, counts: dict[str, int]) -> dict[str, Any]:
+    return {
+        "is_ready": True,
+        "explicit_ready": False,
+        "derived_ready": True,
+        "has_snapshot": False,
+        "snapshot_count": total,
+        "ranking_type": "RANKING_PENDING",
+        "source": "pending_failopen_explicit",
+        "reason": "ranking_pending_exists_explicit_failopen",
+        "pending_count": total,
+        "pending_symbols": counts,
+    }
+
+
+def _rpp_not_ready_result(reason: str, total: int, counts: dict[str, int], original: Any = None) -> dict[str, Any]:
+    return {
+        "is_ready": False,
+        "explicit_ready": False,
+        "derived_ready": False,
+        "has_snapshot": False,
+        "snapshot_count": 0,
+        "ranking_type": None,
+        "source": "pending_strict_patch",
+        "reason": reason,
+        "pending_count": total,
+        "pending_symbols": counts,
+        "original": original if isinstance(original, dict) else None,
+    }
+
+
+def _rpp_precheck_strict() -> dict[str, Any]:
+    total, counts = _rpp_ranking_pending_snapshot()
+
+    # Default: pending does NOT bypass the real ranking snapshot precheck.
+    if callable(_precheck_ranking_entry_core):
+        ret = _precheck_ranking_entry_core()
+        try:
+            ok = bool(ret.get("is_ready") if isinstance(ret, dict) else ret)
+        except Exception:
+            ok = False
+        if ok:
+            if total > 0:
+                logger.info(
+                    "[RANKING PRECHECK PENDING STRICT] original precheck OK with pending_count=%s symbols=%s",
+                    total,
+                    counts,
+                )
+            return ret
+
+        if total > 0:
+            if _rpp_env_bool("RANKING_PRECHECK_PENDING_FAILOPEN_ENABLED", False):
+                logger.warning(
+                    "[RANKING PRECHECK PENDING STRICT] explicit fail-open enabled pending_count=%s symbols=%s original=%s",
+                    total,
+                    counts,
+                    ret,
+                )
+                return _rpp_pending_ready_result(total, counts)
+            logger.warning(
+                "[RANKING PRECHECK PENDING STRICT] NG pending exists but snapshot precheck failed -> fail closed pending_count=%s symbols=%s original=%s",
+                total,
+                counts,
+                ret,
+            )
+            return _rpp_not_ready_result("ranking_snapshot_precheck_failed_pending_not_allowed", total, counts, ret)
+        return ret if isinstance(ret, dict) else _rpp_not_ready_result("original_precheck_false", total, counts, None)
+
+    if total > 0 and _rpp_env_bool("RANKING_PRECHECK_PENDING_FAILOPEN_ENABLED", False):
+        logger.warning(
+            "[RANKING PRECHECK PENDING STRICT] original unavailable but explicit fail-open enabled pending_count=%s symbols=%s",
+            total,
+            counts,
+        )
+        return _rpp_pending_ready_result(total, counts)
+
+    return _rpp_not_ready_result("original_precheck_unavailable", total, counts, None)
+
+
+_RPP_SCOPE = None
+
+
+def _rpp_scope_enabled() -> bool:
+    global _RPP_SCOPE
+    if _RPP_SCOPE is not None:
+        return _RPP_SCOPE
+    enabled = False
+    try:
+        import sys as _sys
+
+        argv_text = " ".join(str(x) for x in _sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if not any(n in argv_text for n in db_names):
+            enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _RPP_SCOPE = enabled
+    return enabled
+
+
+def precheck_ranking_entry() -> Dict[str, Any]:
+    if not _rpp_scope_enabled():
+        return _precheck_ranking_entry_core()
+    return _rpp_precheck_strict()

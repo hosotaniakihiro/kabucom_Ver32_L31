@@ -60,6 +60,8 @@ from .time_utils import (
     floor_to_interval,
     is_market_session,
 )
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +226,43 @@ def _slot_aligned_latest_rows(
         return x.reset_index(drop=True)
 
 
+def _stale_fallback_max_age_sec() -> float:
+    """旧 summary_ai_candidate_refill_patch の SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC。"""
+    try:
+        v = os.getenv("SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC")
+        if v is None or str(v).strip() == "":
+            return 420.0
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return 420.0
+
+
+def _stale_fallback_latest_age_sec(df: pd.DataFrame) -> tuple[bool, Optional[float], Any, int]:
+    """旧 summary_ai_candidate_refill_patch._df_latest_age_sec() と同じ判定。"""
+    try:
+        if df is None or getattr(df, "empty", True):
+            return False, None, None, 0
+        cols = getattr(df, "columns", [])
+        dt_col = None
+        for c in ("datetime", "end_time", "last_update", "updated_at", "inserted_at"):
+            if c in cols:
+                dt_col = c
+                break
+        if not dt_col:
+            return False, None, None, len(df)
+        latest = pd.to_datetime(df[dt_col], errors="coerce").max()
+        if pd.isna(latest):
+            return False, None, None, len(df)
+        try:
+            latest_py = latest.to_pydatetime().replace(tzinfo=None)
+        except Exception:
+            latest_py = latest
+        age = (dt.datetime.now().replace(tzinfo=None) - latest_py).total_seconds()
+        return True, float(age), latest_py, len(df)
+    except Exception:
+        return False, None, None, 0
+
+
 def select_best_candidate(
     candidates: list[tuple[str, pd.DataFrame]],
     *,
@@ -325,7 +364,27 @@ def select_best_candidate(
         chosen_fresh,
         expected_slot,
     )
-    return chosen_df.reset_index(drop=True)
+    out = chosen_df.reset_index(drop=True)
+
+    # 旧 core/startup/summary_ai_candidate_refill_patch._install_stale_fallback_guard()
+    # を本文化。ranking 用途以外で、選んだ fallback が
+    # SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC より古ければ空を返す。
+    # 旧パッチは select_best_candidate をラップしていたが、包む側が他に無く
+    # 生きた呼び出し元 (このファイル内の 4 箇所) は全てモジュール名解決なので、
+    # 本体末尾へ畳んでも到達範囲は変わらない。
+    if not for_ranking and not out.empty:
+        try:
+            ok, age, latest, rows = _stale_fallback_latest_age_sec(out)
+            max_age = _stale_fallback_max_age_sec()
+            if ok and age is not None and age > max_age:
+                logger.warning(
+                    "[SUMMARY FALLBACK STALE GUARD] dropped stale fallback rows=%s latest=%s age=%.1f max=%.1f",
+                    rows, latest, age, max_age,
+                )
+                return pd.DataFrame()
+        except Exception:
+            logger.exception("[SUMMARY FALLBACK STALE GUARD] check failed")
+    return out
 
 
 def today_summary_db_path(*, now: Optional[dt.datetime] = None) -> Optional[Path]:
@@ -395,7 +454,7 @@ def load_latest_summary_from_db(
     params.append(int(limit_rows))
 
     try:
-        with sqlite3.connect(str(db_path), timeout=0.75) as conn:
+        with committing_connect(str(db_path), timeout=0.75) as conn:
             df = pd.read_sql_query(sql, conn, params=params)
     except Exception:
         logger.debug(
@@ -427,15 +486,24 @@ def load_latest_summary_from_db(
 
 
 def _push_db_path() -> str:
-    base = os.getenv(
-        "PUSH_DB_DIR",
-        os.getenv(
-            "RAW_PUSH_DIR",
-            r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\push",
-        ),
-    )
+    explicit = os.getenv("PUSH_DB_PATH")
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+
+    base = os.getenv("PUSH_DB_DIR") or os.getenv("RAW_PUSH_DIR")
+    if not base:
+        # 2026-09-05: writer がローカルへ書くようになったので、既定の
+        # 置き場所は push_db_location に聞く。NAS 固定のままにすると
+        # 場中ずっと前日の複製を読むことになる。
+        try:
+            from trading.push import push_db_location
+
+            return str(push_db_location.push_db_path())
+        except Exception:
+            base = nas_path(r"raw_data\kabu_station\push")
+
     today_s = dt.datetime.now().strftime("%Y%m%d")
-    return os.getenv("PUSH_DB_PATH", str(Path(base) / f"push{today_s}.db"))
+    return str(Path(base) / f"push{today_s}.db")
 
 
 def _qident(name: Any) -> str:
@@ -586,7 +654,7 @@ def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.
     since = now_i - dt.timedelta(minutes=lookback_min)
 
     try:
-        with sqlite3.connect(str(p), timeout=timeout_sec) as conn:
+        with committing_connect(str(p), timeout=timeout_sec) as conn:
             conn.execute(f"PRAGMA busy_timeout={busy_ms};")
             table = "stream_data_raw" if _table_exists(conn, "stream_data_raw") else "stream_data"
             cols = _table_cols(conn, table)
@@ -646,16 +714,20 @@ def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.
         if pd.isna(latest_slot) or latest_slot.date() != today_date(now=now_i):
             logger.warning("[PUSH RAW DB FALLBACK] reject old latest_slot interval=%s latest_slot=%s today=%s", interval_i, latest_slot, today_date(now=now_i))
             return pd.DataFrame()
+        # 2026-10-03: stream_data の volume / trading_value は PUSH の当日累計 (TradingVolume)。
+        #   以前は最新の足の max をそのまま出来高にしていたので、この経路の足は「当日の累計」が
+        #   1 本の出来高になり、殿様イナゴの出来高急増倍率が 95 倍・8,975 倍のような値になっていた
+        #   (10/2 の 4462: 12:24/12:26/12:28 の足がすべて 49,900)。
+        #   1 本の出来高 = 足の中の累計の最大 - 直前の足までの累計の最大。直前が読込範囲に無ければ 足の中の 最大 - 最小。
+        for _c in ("volume", "trading_value"):
+            if _c in df.columns:
+                df[_c] = _safe_to_num(df[_c]).fillna(0.0)
+            else:
+                df[_c] = 0.0
+        _before = df[df["slot"] < latest_slot]
+        _prev_cum = _before.groupby("symbol")[["volume", "trading_value"]].max()
         df = df[df["slot"] == latest_slot].copy()
         df = df.sort_values(["symbol", "datetime"])
-        if "volume" in df.columns:
-            df["volume"] = _safe_to_num(df["volume"]).fillna(0.0)
-        else:
-            df["volume"] = 0.0
-        if "trading_value" in df.columns:
-            df["trading_value"] = _safe_to_num(df["trading_value"]).fillna(0.0)
-        else:
-            df["trading_value"] = 0.0
         if "symbolname" not in df.columns:
             df["symbolname"] = ""
 
@@ -670,7 +742,14 @@ def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.
             "close": grouped["price"].last(),
             "volume": grouped["volume"].max(),
             "trading_value": grouped["trading_value"].max(),
+            "_cum_min_volume": grouped["volume"].min(),
+            "_cum_min_trading_value": grouped["trading_value"].min(),
         }).reset_index(drop=True)
+        for _c in ("volume", "trading_value"):
+            _prev = out["symbol"].map(_prev_cum[_c]) if not _prev_cum.empty else pd.Series(float("nan"), index=out.index)
+            _base = _prev.where(_prev.notna() & (_prev > 0), out[f"_cum_min_{_c}"])
+            out[_c] = (out[_c] - _base).clip(lower=0.0)
+        out = out.drop(columns=["_cum_min_volume", "_cum_min_trading_value"])
         out = _same_day_push_rows(out, now_i=now_i, label=f"raw_db.out.interval{interval_i}")
         if out.empty or not _latest_is_today(out, now_i=now_i, label=f"raw_db.out.interval{interval_i}"):
             return pd.DataFrame()

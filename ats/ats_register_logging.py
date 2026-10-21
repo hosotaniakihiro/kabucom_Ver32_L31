@@ -19,6 +19,7 @@ from database.models import Position
 
 from .ats_rankinfo import format_symbol_ranking_info
 from .ats_register_state import sanitize_symbols, unique_keep_order, get_registered_symbols
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ def load_symbol_names(symbols: List[str]):
     out = {}
 
     try:
-        with sqlite3.connect(db) as conn:
+        with committing_connect(db) as conn:
             for s, name in conn.execute(q, symbols):
                 out[str(s)] = name or ""
     except Exception:
@@ -108,7 +109,7 @@ def save_ats_register_log(symbols: List[str]):
     now = dt.datetime.now().isoformat(timespec="seconds")
 
     try:
-        with sqlite3.connect(db) as conn:
+        with committing_connect(db) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS ats_registered_log (
                     time TEXT,

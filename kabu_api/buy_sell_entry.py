@@ -17,13 +17,14 @@
 # ✔ Ver28: 新規エントリー注文の Exchange を既定で SOR=9 に統一
 # ============================================================
 
+import datetime as dt
 import logging
 import configparser
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from utils_common import (
-    get_latest_bid_ask,
+    get_latest_bid_ask as _get_latest_bid_ask_core,
     get_trading_unit,
 )
 
@@ -240,7 +241,7 @@ def _enforce_oneshot_rule(symbol, price, qty):
 # Payload Builder
 # ============================================================
 
-def _make_payload(
+def _make_payload_core(
     symbol,
     side,
     qty,
@@ -296,14 +297,127 @@ def _make_payload(
 # API SEND WRAPPER
 # ============================================================
 
+# 旧 trading/audit_logging/buy_sell_entry_audit_patch.py の本文化。
+# 発注送信の前後で audit DB へ記録する。売買ロジックと payload は変更しない。
+# 旧パッチは _send_order を外から包んでいたが、包む相手が他に無く、
+# 呼び出し元 6 箇所もすべてこのファイル内のモジュール名解決なので本体へ畳んだ。
+
+
+def _audit_side_from_payload(payload: Any) -> str:
+    try:
+        side = int(payload.get("Side"))
+        if side == 2:
+            return "BUY"
+        if side == 1:
+            return "SELL"
+    except Exception:
+        pass
+    return ""
+
+
+def _audit_order_type_from_payload(payload: Any) -> str:
+    try:
+        t = int(payload.get("FrontOrderType"))
+        if t == 10:
+            return "MARKET"
+        if t == 20:
+            return "LIMIT"
+        if t == 30:
+            return "STOP"
+    except Exception:
+        pass
+    try:
+        return str(payload.get("FrontOrderType") or "")
+    except Exception:
+        return ""
+
+
+def _audit_payload_get(payload: Any, key: str, default=None):
+    try:
+        if isinstance(payload, dict):
+            return payload.get(key, default)
+    except Exception:
+        pass
+    return default
+
+
+def _audit_order_sent_safe(**kwargs) -> None:
+    try:
+        from trading.audit_logging.order_exit_audit import audit_order_sent
+
+        audit_order_sent(**kwargs)
+    except Exception:
+        pass
+
+
+def _buy_entry_disabled(payload) -> bool:
+    """2026-10-19: 信用の新規買いを止める (ユーザー判断)。ENTRY_BUY_ENABLED=1 で戻す。
+
+    過去 18 日の実売買で 買い 215 回 -62,140 円 / 売り 32 回 +45,240 円。5 分足 6 か月の検証でも
+    順張り・逆張りのどの買い方もコスト負け (ops/research/buy_style_scan.py)。
+    新規 (CashMargin=2) の買い (Side=2) だけ。返済の買い戻しは kabu_api.close 側なので止まらない。
+    """
+    try:
+        if str(os.getenv("ENTRY_BUY_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on"):
+            return False
+        return isinstance(payload, dict) and int(payload.get("CashMargin") or 0) == 2 and str(payload.get("Side")) == "2"
+    except Exception:
+        return False
+
+
 def _send_order(payload, symbol):
+    if _buy_entry_disabled(payload):
+        logger.warning("[ENTRY BUY DISABLED] 新規買いを送らない symbol=%s qty=%s price=%s (ENTRY_BUY_ENABLED=1 で戻す)",
+                       symbol, payload.get("Qty"), payload.get("Price"))
+        return {"OrderId": None, "Code": -1, "Message": "ENTRY_BUY_DISABLED"}
+    side = _audit_side_from_payload(payload if isinstance(payload, dict) else {})
+    order_type = _audit_order_type_from_payload(payload if isinstance(payload, dict) else {})
+    qty = _audit_payload_get(payload, "Qty", 0)
+    price = _audit_payload_get(payload, "Price", 0)
+
+    _audit_order_sent_safe(
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        order_type=order_type,
+        price=price,
+        order_id="",
+        detail={"phase": "before_send_order_common"},
+    )
+
+    res = _send_order_core(payload, symbol)
+
+    if isinstance(res, dict) and res.get("OrderId"):
+        _audit_order_sent_safe(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            order_type=order_type,
+            price=res.get("Price", price),
+            order_id=res.get("OrderId"),
+            detail={"phase": "order_id_received", "response": res},
+        )
+    else:
+        _audit_order_sent_safe(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            order_type=order_type,
+            price=price,
+            order_id="",
+            detail={"phase": "send_order_failed_or_no_order_id", "response": res},
+        )
+    return res
+
+
+def _send_order_core(payload, symbol):
     try:
         logger.info(
             "[KABU PAYLOAD] symbol=%s exchange=%s sor=%s payload=%s",
             symbol,
             payload.get("Exchange") if isinstance(payload, dict) else None,
             bool(isinstance(payload, dict) and payload.get("Exchange") == 9),
-            payload,
+            ({**payload, "Password": "***"} if isinstance(payload, dict) and "Password" in payload else payload),
         )
 
         res = send_order_common(payload)
@@ -659,3 +773,395 @@ def buy_entry(symbol, qty=None, price=None):
 
 def sell_entry(symbol, qty=None, price=None):
     return execute_short_at_best_bid(symbol, qty=qty)
+
+
+# ============================================================
+# ENTRY FRESH QUOTE GUARD
+# (旧 core/startup/entry_fresh_quote_guard_patch.py を本文化)
+# ------------------------------------------------------------
+# 発注前の気配を PUSH の最新値から作り直し、古い気配での発注を防ぐ。
+# 鮮度が足りなければ None を返して呼び出し側に見送らせる。
+#
+# 実測: kabu_api.buy_sell_entry.get_latest_bid_ask を差し替えていたのは
+# このパッチだけで (board_retry_patch / summary_ai_strict_board_rest_patch は
+# 名前に言及するだけ)、しかも元関数を呼ばない**完全置換**だった。
+# よって本文でも同じく置換にしてある。
+# utils_common 側の実装は _get_latest_bid_ask_core として残してあるが、
+# 旧構成と同じくここからは呼ばない。
+#
+# 有効/無効は旧 install と同じ ENTRY_FRESH_QUOTE_GUARD_ENABLED (既定 True)。
+# ============================================================
+
+_FQG__INSTALLED = False
+_FQG__ORIG_BSE_GET_LATEST_BID_ASK = None
+
+
+def _fqg_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok"}
+    except Exception:
+        return bool(default)
+
+
+def _fqg_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _fqg_norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip().upper()
+        if s.endswith(".T"):
+            s = s[:-2]
+        if s.endswith(".0") and s[:-2].isdigit():
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _fqg_to_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(v)
+        return float(default) if x != x else x
+    except Exception:
+        return float(default)
+
+
+def _fqg_parse_dt(v: Any) -> Optional[dt.datetime]:
+    if v is None:
+        return None
+    try:
+        import pandas as pd
+        t = pd.to_datetime(v, errors="coerce")
+        if pd.isna(t):
+            return None
+        # pandas Timestamp -> python datetime
+        if hasattr(t, "to_pydatetime"):
+            t = t.to_pydatetime()
+        if isinstance(t, dt.datetime):
+            # timezone awareの場合はnaiveに揃える
+            if t.tzinfo is not None:
+                t = t.astimezone().replace(tzinfo=None)
+            return t
+    except Exception:
+        pass
+    return None
+
+
+def _fqg_latest_push_quote(symbol: str) -> Optional[dict[str, Any]]:
+    symbol = _fqg_norm_symbol(symbol)
+    if not symbol:
+        return None
+    try:
+        from global_state import global_data
+
+        dfp = global_data.get_push_df()
+        if dfp is None or getattr(dfp, "empty", True):
+            return None
+
+        df = dfp.copy()
+        rename_map = {
+            "Symbol": "symbol",
+            "BidPrice": "bid_price",
+            "AskPrice": "ask_price",
+            "BidQty": "bid_qty",
+            "AskQty": "ask_qty",
+            "CurrentPrice": "current_price",
+            "CurrentPriceTime": "datetime",
+            "time": "datetime",
+            "DateTime": "datetime",
+            "datetime": "datetime",
+        }
+        for old, new in rename_map.items():
+            if old in df.columns and new not in df.columns:
+                df[new] = df[old]
+
+        if "symbol" not in df.columns:
+            return None
+        try:
+            df["_sym_norm"] = df["symbol"].map(_fqg_norm_symbol)
+            df_sym = df[df["_sym_norm"] == symbol]
+        except Exception:
+            df_sym = df[df["symbol"].astype(str) == symbol]
+
+        if df_sym.empty:
+            return None
+
+        dt_col = None
+        for c in ("datetime", "CurrentPriceTime", "time", "timestamp", "updated_at"):
+            if c in df_sym.columns:
+                dt_col = c
+                break
+
+        row = None
+        quote_dt = None
+        if dt_col:
+            import pandas as pd
+            x = df_sym.copy()
+            x["_quote_dt"] = pd.to_datetime(x[dt_col], errors="coerce")
+            x2 = x.dropna(subset=["_quote_dt"])
+            if not x2.empty:
+                row = x2.sort_values("_quote_dt").iloc[-1]
+                quote_dt = _fqg_parse_dt(row.get("_quote_dt"))
+        if row is None:
+            row = df_sym.iloc[-1]
+            quote_dt = None
+
+        ask = _fqg_to_float(row.get("ask_price"), 0.0)
+        bid = _fqg_to_float(row.get("bid_price"), 0.0)
+        cur = _fqg_to_float(row.get("current_price") or row.get("price") or row.get("CurrentPrice"), 0.0)
+        if ask <= 0 or bid <= 0:
+            return None
+
+        now = dt.datetime.now()
+        age_sec = None
+        if quote_dt is not None:
+            # 日付が無い時刻だけの場合、古い年になることがあるので当日補正
+            if quote_dt.year < 2000:
+                quote_dt = now.replace(hour=quote_dt.hour, minute=quote_dt.minute, second=quote_dt.second, microsecond=quote_dt.microsecond)
+            age_sec = max(0.0, (now - quote_dt).total_seconds())
+
+        return {
+            "symbol": symbol,
+            "ask_price": ask,
+            "bid_price": bid,
+            "ask_qty": int(_fqg_to_float(row.get("ask_qty"), 0.0)),
+            "bid_qty": int(_fqg_to_float(row.get("bid_qty"), 0.0)),
+            "current_price": cur,
+            "quote_dt": quote_dt,
+            "age_sec": age_sec,
+            "source": "push_df_fresh_guard",
+        }
+    except Exception as e:
+        logger.warning("[ENTRY FRESH QUOTE] read failed symbol=%s err=%s", symbol, e, exc_info=False)
+        return None
+
+
+def _fqg_fresh_quote(symbol: str, *, side: str) -> Optional[dict[str, Any]]:
+    q = _fqg_latest_push_quote(symbol)
+    max_age = _fqg_env_float("ENTRY_MAX_QUOTE_AGE_SEC", 8.0)
+    if not q:
+        logger.warning("[ENTRY FRESH QUOTE] SKIP no_quote symbol=%s side=%s", symbol, side)
+        return None
+    age = q.get("age_sec")
+    # datetimeが取れない場合は危険なので、デフォルトでは古い扱いにする
+    if age is None:
+        if _fqg_env_bool("ENTRY_ALLOW_QUOTE_WITHOUT_TIMESTAMP", False):
+            logger.warning("[ENTRY FRESH QUOTE] timestamp missing but allowed symbol=%s side=%s q=%s", symbol, side, q)
+            return q
+        logger.warning("[ENTRY FRESH QUOTE] SKIP no_timestamp symbol=%s side=%s q=%s", symbol, side, q)
+        return None
+    if float(age) > max_age:
+        logger.warning(
+            "[ENTRY FRESH QUOTE] SKIP stale_quote symbol=%s side=%s age=%.3fs max=%.3fs bid=%s ask=%s current=%s quote_dt=%s",
+            symbol, side, float(age), max_age, q.get("bid_price"), q.get("ask_price"), q.get("current_price"), q.get("quote_dt"),
+        )
+        return None
+    return q
+
+
+def get_latest_bid_ask(symbol: str):
+    if not _fqg_env_bool("ENTRY_FRESH_QUOTE_GUARD_ENABLED", True):
+        return _get_latest_bid_ask_core(symbol)
+    q = _fqg_fresh_quote(symbol, side="UNKNOWN")
+    if not q:
+        return None
+    return {
+        "symbol": q.get("symbol"),
+        "ask_price": q.get("ask_price"),
+        "bid_price": q.get("bid_price"),
+        "ask_qty": q.get("ask_qty", 0),
+        "bid_qty": q.get("bid_qty", 0),
+        "current_price": q.get("current_price", 0.0),
+        "age_sec": q.get("age_sec"),
+        "quote_dt": q.get("quote_dt"),
+        "source": q.get("source"),
+    }
+
+
+# ============================================================
+# ONESHOT LIMIT / 起動時 env 既定値
+# (旧 core/startup/oneshot_limit_700k_patch.py を本文化)
+# ------------------------------------------------------------
+# 旧パッチは 19 個のサブ install を持つランチャーだったが、実体は
+#   - env 既定値 45 件 (setdefault が中心)
+#   - entry_controller のスコアしきい値 4 定数
+#   - kabu_api.buy_sell_entry.MAX_ONESHOT = 700_000
+#   - 生きている連鎖 install 3 件
+# だけだった (他 15 個は本文化済みの空スタブか env のみ)。
+#
+# **import 時ではなく main.py の patches リストの旧位置 (:250) から呼ぶこと。**
+# entry_controller のしきい値は tonosama_history_failclose_strict_patch の
+# watcher が 3.0 へ書き戻す関係があり、位置を変えると最終値が変わる。
+# ============================================================
+
+_OL7_ENV_SET: list[str] = []
+
+
+def _ol7_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).strip())
+    except Exception:
+        return float(default)
+
+
+def apply_oneshot_limit_defaults() -> bool:
+    """旧 oneshot_limit_700k_patch.install() の実体。"""
+    global MAX_ONESHOT
+    os.environ.setdefault("MAX_ENTRY_ONESHOT_YEN", "700000")
+    os.environ.setdefault("ENTRY_LOW_PRICE_ONESHOT_YEN", "700000")
+    os.environ.setdefault("ENTRY_HIGH_PRICE_ONESHOT_YEN", "700000")
+    os.environ.setdefault("ENTRY_MAX_PRICE", "7000")
+    os.environ.setdefault("ORDER_LOT_SIZE", "100")
+    os.environ.setdefault("ENTRY_AFFORDABILITY_FILTER_ENABLED", "1")
+    os.environ.setdefault("PUSH_BOOTSTRAP_FAST_RESTORE", "1")
+    os.environ.setdefault("PUSH_BOOTSTRAP_FAST_MAX_ROWS", "3000")
+    os.environ.setdefault("PUSH_BOOTSTRAP_FAST_LOOKBACK_MINUTES", "45")
+    os.environ.setdefault("ENTRY_FRESH_QUOTE_GUARD_ENABLED", "1")
+    os.environ.setdefault("ENTRY_MAX_QUOTE_AGE_SEC", "8.0")
+    os.environ.setdefault("ENTRY_ALLOW_QUOTE_WITHOUT_TIMESTAMP", "0")
+    os.environ.setdefault("ENTRY_MIN_LOT_FALLBACK_WHEN_AFFORDABLE", "1")
+    os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY", "1")
+    os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", "0")
+    os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", "20")
+    os.environ.setdefault("SUMMARY_AI_STRICT_LIQ_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_AI_LIQ_MIN_LATEST_VOLUME", "30000")
+    os.environ.setdefault("SUMMARY_AI_LIQ_MIN_AVG_VOLUME", "30000")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_ENABLED", "1")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_MIN_LATEST_VOLUME", "3000")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_MIN_AVG_VOLUME", "3000")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN", "1000000")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_BARS", "5")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_PROTECT_BYPASS", "1")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_CACHE_TTL_SEC", "10")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_BULK_LOG_SEC", "0.5")
+    os.environ.setdefault("SUMMARY_PARALLEL_INTERVALS_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_PARALLEL_INTERVAL_WORKERS", "3")
+    os.environ.setdefault("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", "55")
+    os.environ.setdefault("SUMMARY_PARALLEL_RANKING_ENABLED", "1")
+    os.environ.setdefault("ENTRY_PIPELINE_BUCKET_PREFILTER", "1")
+    os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_VOLUME", "30000")
+    os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_TURNOVER", "10000000")
+    os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_PRICE", "1500")
+    os.environ.setdefault("ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI", "1")
+    os.environ.setdefault("EXIT_BOARD_PROFIT_ENABLED", "1")
+    os.environ.setdefault("EXIT_BOARD_MIN_PROFIT_PCT", "0.0010")
+    os.environ.setdefault("EXIT_BOARD_THICK_QTY_MULT", "3.0")
+    os.environ.setdefault("EXIT_BOARD_MIN_THICK_QTY", "1000")
+    os.environ.setdefault("EXIT_BOARD_MAX_WAIT_SEC", "2.0")
+    os.environ.setdefault("EXIT_BOARD_POLL_SEC", "0.25")
+    os.environ.setdefault("EXIT_BOARD_REVERSE_GAP_PCT", "0.0010")
+
+    try:
+        old_value = globals().get("MAX_ONESHOT")
+        MAX_ONESHOT = 700_000
+        logger.warning("[ONESHOT LIMIT PATCH] MAX_ONESHOT changed old=%s new=%s", old_value, MAX_ONESHOT)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] MAX_ONESHOT apply failed")
+
+    try:
+        import trading.handlers.entry_controller as ec
+
+        old = (getattr(ec, "MIN_SUMMARY_SCORE_BUY", None), getattr(ec, "MIN_COMPOSITE_SCORE_BUY", None),
+               getattr(ec, "MIN_SUMMARY_SCORE_SELL", None), getattr(ec, "MIN_COMPOSITE_SCORE_SELL", None))
+        ec.MIN_SUMMARY_SCORE_BUY = _ol7_env_float("MIN_SUMMARY_SCORE_BUY", 1.0)
+        ec.MIN_COMPOSITE_SCORE_BUY = _ol7_env_float("MIN_COMPOSITE_SCORE_BUY", 0.8)
+        ec.MIN_SUMMARY_SCORE_SELL = _ol7_env_float("MIN_SUMMARY_SCORE_SELL", 1.0)
+        ec.MIN_COMPOSITE_SCORE_SELL = _ol7_env_float("MIN_COMPOSITE_SCORE_SELL", 1.0)
+        logger.warning("[ENTRY THRESHOLD PATCH] installed BUY score %s->%s comp %s->%s SELL score %s->%s comp %s->%s",
+                       old[0], ec.MIN_SUMMARY_SCORE_BUY, old[1], ec.MIN_COMPOSITE_SCORE_BUY,
+                       old[2], ec.MIN_SUMMARY_SCORE_SELL, old[3], ec.MIN_COMPOSITE_SCORE_SELL)
+    except Exception:
+        logger.exception("[ENTRY THRESHOLD PATCH] install failed")
+
+    for _mod_name, _label in (
+        ("trading.entry.summary_ai.direct_snapshot", "summary_ai_async_entry"),
+        # summary_parallel_intervals は scheduler_jobs/summary/parallel_intervals.py へ
+        # 移設済みで、env 既定値も import 時に入るため連鎖 install は不要。
+        ("kabu_api.exit_board_profit", "exit_board_profit"),
+    ):
+        try:
+            _m = __import__(_mod_name, fromlist=["install"])
+            _fn = (getattr(_m, "install", None)
+                   or getattr(_m, "apply_async_entry_defaults", None)
+                   or getattr(_m, "enable_exit_board_profit", None))
+            _ok = bool(_fn()) if callable(_fn) else False
+            logger.warning("[ONESHOT LIMIT PATCH] %s installed=%s", _label, _ok)
+        except Exception:
+            logger.exception("[ONESHOT LIMIT PATCH] %s install failed", _label)
+    return True
+
+
+# ============================================================
+# デイトレ信用 / 制度信用の切り替え
+# (旧 core/startup/daytrade_credit_force_close_patch._patch_buy_sell_entry_payload)
+# ------------------------------------------------------------
+# 旧ラッパーは既定値が素の実装と違った (exchange=1 / margin_type=None)。
+# 呼び出し側が省略したときの値が変わらないよう、sentinel で
+# 「省略された」ことを検出してから層ごとの既定値を入れる。
+# ============================================================
+
+_MP_UNSET = object()
+
+
+def _daytrade_credit_layer():
+    try:
+        from kabu_api import daytrade_credit as _m
+
+        return _m if _m.daytrade_enabled() else None
+    except Exception:
+        return None
+
+
+def _make_payload(
+    symbol,
+    side,
+    qty,
+    price,
+    *,
+    exchange=_MP_UNSET,
+    margin_type=_MP_UNSET,
+    cash_margin=2,
+    front_order_type=20,
+    stop_price=None,
+):
+    _m = _daytrade_credit_layer()
+    if _m is None:
+        return _make_payload_core(
+            symbol,
+            side,
+            qty,
+            price,
+            exchange=(None if exchange is _MP_UNSET else exchange),
+            margin_type=(1 if margin_type is _MP_UNSET else margin_type),
+            cash_margin=cash_margin,
+            front_order_type=front_order_type,
+            stop_price=stop_price,
+        )
+    return _m.make_payload_daytrade_cutoff(
+        _make_payload_core,
+        symbol,
+        side,
+        qty,
+        price,
+        exchange=(1 if exchange is _MP_UNSET else exchange),
+        margin_type=(None if margin_type is _MP_UNSET else margin_type),
+        cash_margin=cash_margin,
+        front_order_type=front_order_type,
+        stop_price=stop_price,
+    )

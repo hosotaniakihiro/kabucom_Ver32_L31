@@ -147,4 +147,6 @@ if __name__ == "__main__":
         FAST_RET_MIN=0.3,
     )
 
-    print("=== BAC
+    print("=== BACKTEST RESULT ===")
+    for key in ("total_pnl", "max_drawdown", "trade_count", "score"):
+        print(f"{key}: {res.get(key)}")

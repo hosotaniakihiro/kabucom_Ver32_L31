@@ -47,7 +47,9 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import queue
 import re
+import threading
 
 import numpy as np
 import pandas as pd
@@ -77,6 +79,122 @@ from .display_sorting import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# Discord 送信を summary の tick から外す
+# ============================================================
+# 2026-09-09: この Top10 表示は summary の tick の中 (diff_update ->
+# _safe_run_display) から呼ばれていて、1900 字ごとに分割した 3 チャンクを
+# 同期で送っていた。1 回ごとに TLS ハンドシェイクが走り、さらに
+# alerts_util の SEND_INTERVAL=0.7 秒がロックを持ったまま sleep するので、
+# 毎 tick 約 3 秒が売買と無関係な通知に消えていた (py-spy 実測で summary
+# ワーカースレッドのサンプルの 13.1% が display_push_summary 配下)。
+#
+# 表示は監視用で、tick の処理と順序を揃える必要がない。専用スレッドへ
+# 渡し、tick は待たずに先へ進む。
+#
+# 環境変数:
+#   SUMMARY_DISCORD_ASYNC  0 で従来どおり同期送信に戻す (既定 1)
+#   SUMMARY_DISCORD_QUEUE_MAX  溜められる最大チャンク数 (既定 60)
+
+_discord_queue: "queue.Queue[tuple[int, int, str]] | None" = None
+_discord_worker: "threading.Thread | None" = None
+_discord_worker_lock = threading.Lock()
+_discord_dropped = 0
+
+
+def _discord_async_enabled() -> bool:
+    v = os.getenv("SUMMARY_DISCORD_ASYNC")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _discord_queue_max() -> int:
+    try:
+        return max(1, int(str(os.getenv("SUMMARY_DISCORD_QUEUE_MAX", "60")).strip()))
+    except Exception:
+        return 60
+
+
+def _send_one_chunk(idx: int, total: int, chunk: str) -> None:
+    try:
+        send_discord_message(content=chunk)
+        logger.info(
+            "[SUMMARY DISPLAY] discord sent chunk=%s/%s chars=%s",
+            idx,
+            total,
+            len(chunk),
+        )
+    except Exception:
+        logger.exception("[SUMMARY DISPLAY] discord send failed chunk=%s/%s", idx, total)
+
+
+def _discord_worker_loop() -> None:
+    while True:
+        try:
+            idx, total, chunk = _discord_queue.get()
+        except Exception:
+            logger.exception("[SUMMARY DISPLAY] discord queue get failed")
+            return
+        try:
+            _send_one_chunk(idx, total, chunk)
+        finally:
+            try:
+                _discord_queue.task_done()
+            except Exception:
+                pass
+
+
+def _ensure_discord_worker() -> bool:
+    """送信スレッドを用意する。用意できなければ False (同期送信へ落とす)。"""
+    global _discord_queue, _discord_worker
+    if _discord_worker is not None and _discord_worker.is_alive():
+        return True
+    with _discord_worker_lock:
+        if _discord_worker is not None and _discord_worker.is_alive():
+            return True
+        try:
+            if _discord_queue is None:
+                _discord_queue = queue.Queue(maxsize=_discord_queue_max())
+            t = threading.Thread(
+                target=_discord_worker_loop,
+                name="summary-discord-sender",
+                daemon=True,
+            )
+            t.start()
+            _discord_worker = t
+            logger.info("[SUMMARY DISPLAY] discord sender thread started maxsize=%s", _discord_queue.maxsize)
+            return True
+        except Exception:
+            logger.exception("[SUMMARY DISPLAY] discord sender thread の起動に失敗")
+            return False
+
+
+def _dispatch_chunks(chunks: list[str]) -> None:
+    """チャンクを送信スレッドへ渡す。渡せなければその場で同期送信する。"""
+    global _discord_dropped
+    total = len(chunks)
+
+    if not _discord_async_enabled() or not _ensure_discord_worker():
+        for idx, chunk in enumerate(chunks, start=1):
+            _send_one_chunk(idx, total, chunk)
+        return
+
+    for idx, chunk in enumerate(chunks, start=1):
+        try:
+            _discord_queue.put_nowait((idx, total, chunk))
+        except queue.Full:
+            # 送信が詰まっている。tick を止めてまで送る内容ではないので捨てる。
+            _discord_dropped += 1
+            logger.warning(
+                "[SUMMARY DISPLAY] discord queue full; chunk=%s/%s を捨てた dropped_total=%s qsize=%s",
+                idx,
+                total,
+                _discord_dropped,
+                _discord_queue.qsize(),
+            )
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -199,17 +317,7 @@ def _send_to_discord(lines: list[str], title: str | None = None) -> None:
             chunks.append(text[:cut].rstrip())
             text = text[cut:].lstrip()
 
-        for idx, chunk in enumerate(chunks, start=1):
-            try:
-                send_discord_message(content=chunk)
-                logger.info(
-                    "[SUMMARY DISPLAY] discord sent chunk=%s/%s chars=%s",
-                    idx,
-                    len(chunks),
-                    len(chunk),
-                )
-            except Exception:
-                logger.exception("[SUMMARY DISPLAY] discord send failed chunk=%s/%s", idx, len(chunks))
+        _dispatch_chunks(chunks)
 
     except Exception:
         logger.exception("[SUMMARY DISPLAY] _send_to_discord failed")

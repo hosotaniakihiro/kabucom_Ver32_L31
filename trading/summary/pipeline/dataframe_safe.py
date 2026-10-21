@@ -113,6 +113,34 @@ def safe_to_datetime(value: Any) -> pd.Series:
         text = text.replace({"": pd.NA, "None": pd.NA, "NaT": pd.NA, "nan": pd.NA, "NaN": pd.NA})
         remaining = text.notna()
 
+        # 2026-09-09: 実データ (push DB の datetime 列) は
+        #     2026-09-09T10:53:47.803096+09:00
+        # という tz 付き ISO だが、下の _DATETIME_FORMATS に %z が無いため
+        # どの形式にも当たらない。当たらないまま 8 形式ぶん列全体を strptime で
+        # 走査し、最後の fallback でようやく拾っていた。
+        # 30,000 行での実測: 現行 2417ms / format="ISO8601" 83ms (約 29 倍)。
+        # ISO を先に処理し、残りだけを従来の総当りへ回す。
+        if remaining.any():
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    iso = pd.to_datetime(text.loc[remaining], format="ISO8601", errors="coerce")
+                # tz 付きと非 tz が混ざると object 型で返り、tz の外し方が
+                # 従来経路と変わってしまう。素直に datetime64 で返ったときだけ
+                # 採用し、それ以外は従来どおりに任せる。
+                if not pd.api.types.is_datetime64_any_dtype(iso):
+                    raise TypeError("ISO8601 が datetime64 を返さなかった")
+                ok = iso.notna()
+                if ok.any():
+                    idx = iso.index[ok]
+                    # tz 付きが入りうるので、代入前に外す (下の fallback と同じ理由)。
+                    out.loc[idx] = _drop_timezone(iso).loc[idx]
+                    remaining.loc[idx] = False
+            except Exception:
+                # pandas が古く format="ISO8601" を解さない場合はここに来る。
+                # 従来経路がそのまま拾うので握りつぶしてよい。
+                pass
+
         for fmt in _DATETIME_FORMATS:
             if not remaining.any():
                 break
@@ -135,7 +163,12 @@ def safe_to_datetime(value: Any) -> pd.Series:
                     fallback = pd.to_datetime(text.loc[remaining], errors="coerce")
                 ok = fallback.notna()
                 if ok.any():
-                    out.loc[fallback.index[ok]] = fallback.loc[fallback.index[ok]]
+                    # fallback は ISO の tz 付きを拾うので tz-aware になりうる。
+                    # tz-naive な out へそのまま入れると
+                    #   FutureWarning: Setting an item of incompatible dtype
+                    # になり、将来の pandas ではエラーになる。
+                    # どのみち最後に _drop_timezone するので、入れる前に外す。
+                    out.loc[fallback.index[ok]] = _drop_timezone(fallback).loc[fallback.index[ok]]
             except Exception:
                 pass
 

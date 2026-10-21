@@ -57,7 +57,12 @@ def _safe_df(df):
             pass
 
         try:
-            df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            # 全列に replace をかけると object 列で暗黙ダウンキャストが起き
+            # FutureWarning (Downcasting behavior in `replace` is deprecated) になる。
+            # inf は数値列にしか入らないので数値列だけに限定する (値は変わらない)。
+            num_cols = df.select_dtypes(include=[np.number]).columns
+            if len(num_cols) > 0:
+                df[num_cols] = df[num_cols].replace([np.inf, -np.inf], np.nan)
         except Exception:
             pass
 

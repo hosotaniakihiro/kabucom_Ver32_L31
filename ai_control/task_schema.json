@@ -1,0 +1,91 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "severity",
+    "category",
+    "summary",
+    "root_cause",
+    "evidence_lines",
+    "files",
+    "instructions",
+    "forbidden",
+    "tests",
+    "restart_required",
+    "confidence"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["FIX_REQUIRED", "NO_ACTION", "NEED_MORE_INFO"]
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "logging",
+        "retry",
+        "exception_handling",
+        "memory_cleanup",
+        "display",
+        "ranking",
+        "summary",
+        "push",
+        "database_writer",
+        "scheduler",
+        "order",
+        "entry",
+        "exit",
+        "position",
+        "capital",
+        "authentication",
+        "database_schema",
+        "unknown"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "description": "1行。何が起きているかだけ。"
+    },
+    "root_cause": {
+      "type": "string",
+      "description": "ソースを読んで特定した原因。推測しかできない場合はその旨を明記する。"
+    },
+    "evidence_lines": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "判断の根拠にしたログの実際の行（原文のまま。最大10行）。"
+    },
+    "files": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "修正対象。プロジェクトルートからの相対パス。"
+    },
+    "instructions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "修正担当への具体的な指示。コードは書かず、何をどう変えるかを書く。"
+    },
+    "forbidden": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "この修正で触ってはいけないもの。"
+    },
+    "tests": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "修正後に実行すべきコマンド。"
+    },
+    "restart_required": {
+      "type": "boolean"
+    },
+    "confidence": {
+      "type": "number",
+      "description": "0.0-1.0。原因特定の確信度。0.5未満なら status を NEED_MORE_INFO にする。"
+    }
+  }
+}

@@ -45,6 +45,32 @@ def resolve_callable(candidates: Iterable[tuple[str, str]]) -> Optional[Callable
     return None
 
 
+# ============================================================
+# 追加P0-2: bootstrap 読み込み量の上限設定
+# ============================================================
+
+def _bootstrap_lookback_min() -> int:
+    """bootstrap で遡る分数。0 以下で無制限 (従来動作)。"""
+    try:
+        v = os.getenv("RANKING_BOOTSTRAP_LOOKBACK_MIN")
+        if v and str(v).strip():
+            return int(float(str(v).strip()))
+    except Exception:
+        pass
+    return 180
+
+
+def _bootstrap_max_rows() -> int:
+    """bootstrap で読む最大行数。0 以下で無制限 (従来動作)。"""
+    try:
+        v = os.getenv("RANKING_BOOTSTRAP_MAX_ROWS")
+        if v and str(v).strip():
+            return int(float(str(v).strip()))
+    except Exception:
+        pass
+    return 80000
+
+
 def load_ranking_snapshot_fallback(
     ranking_db_path: str,
     *,
@@ -71,9 +97,37 @@ def load_ranking_snapshot_fallback(
             where = []
             params: list[Any] = []
 
-            if start_dt is not None:
+            # ============================================================
+            # 追加P0-2: bootstrap の読み込み量を有界にする
+            # ------------------------------------------------------------
+            # 2026-08-28 15:26-15:32 の実測:
+            #   [BOOTSTRAP LOADER] loaded ranking snapshot rows=290,939
+            #                      start=03:40:00 end=None
+            #   [BOOTSTRAP OHLCV]  1min built rows=113,789 symbols=1,321
+            #   [BOOTSTRAP LOADER] loaded push summary rows=76,531
+            #   [BOOTSTRAP RESAMPLE] 3min built rows=43,496
+            #   [BOOTSTRAP] done elapsed=362.52s
+            #   RSS 338.6MB -> 1,717.0MB (約 6 分で 5 倍)
+            #
+            # 巨大フレームを同時に複数保持することが RSS 急増の主因。
+            # indicator に必要なのは銘柄あたり最大 105 bars 程度なので、
+            # 一日分すべてを読む必要はない。
+            #
+            # start_dt が指定されていない / 過度に古い場合は
+            # RANKING_BOOTSTRAP_LOOKBACK_MIN (既定 180 分) で切る。
+            # 併せて SQL 側に LIMIT も掛ける。
+            # ============================================================
+            eff_start = start_dt
+            lookback_min = _bootstrap_lookback_min()
+            if lookback_min > 0:
+                base_end = pd.to_datetime(end_dt) if end_dt is not None else pd.Timestamp.now()
+                cutoff = base_end - pd.Timedelta(minutes=lookback_min)
+                if eff_start is None or pd.to_datetime(eff_start) < cutoff:
+                    eff_start = cutoff
+
+            if eff_start is not None:
                 where.append("datetime >= ?")
-                params.append(pd.to_datetime(start_dt).strftime("%Y-%m-%d %H:%M:%S"))
+                params.append(pd.to_datetime(eff_start).strftime("%Y-%m-%d %H:%M:%S"))
 
             if end_dt is not None:
                 where.append("datetime <= ?")
@@ -82,15 +136,29 @@ def load_ranking_snapshot_fallback(
             sql = f"SELECT * FROM {quote_ident(RANKING_SNAPSHOT_TABLE)}"
             if where:
                 sql += " WHERE " + " AND ".join(where)
-            sql += " ORDER BY datetime ASC"
+            # 直近側を確実に取るため DESC + LIMIT で切ってから昇順へ戻す。
+            max_rows = _bootstrap_max_rows()
+            if max_rows > 0:
+                sql += " ORDER BY datetime DESC LIMIT %d" % int(max_rows)
+            else:
+                sql += " ORDER BY datetime ASC"
 
             df = pd.read_sql_query(sql, conn, params=params)
 
-            logger.info(
-                "[RANKING SUMMARY BOOTSTRAP LOADER] loaded ranking snapshot rows=%d start=%s end=%s",
+            if max_rows > 0 and not df.empty and "datetime" in df.columns:
+                df = df.sort_values("datetime", kind="stable").reset_index(drop=True)
+
+            logger.warning(
+                "[RANKING SUMMARY BOOTSTRAP LOADER] loaded ranking snapshot rows=%d "
+                "start=%s (requested=%s) end=%s lookback_min=%s max_rows=%s "
+                "(bootstrap の読み込み量を有界化。RANKING_BOOTSTRAP_LOOKBACK_MIN / "
+                "RANKING_BOOTSTRAP_MAX_ROWS で調整可)",
                 len(df),
+                eff_start,
                 start_dt,
                 end_dt,
+                lookback_min,
+                max_rows,
             )
             return df
 

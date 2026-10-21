@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 
 import pandas as pd
 
@@ -234,33 +234,51 @@ def _copy_if_present(*, src: Dict[str, Any], dst: Dict[str, Any], keys: Iterable
         logger.debug("[SUMMARY_ENTRY] _copy_if_present failed", exc_info=True)
 
 
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_entry_controller_bridge_patch.py の
+# _strict_order_executed をここへ本文化 (V1.5)。
+# 旧パッチは install 時にこの関数をまるごと差し替えていた (合成ではない)。
+# approved/registered/entries や executed フラグだけでは成功扱いせず、
+# 実注文の根拠 (件数キー / order 系キー) が取れたときだけ True を返す。
+# ------------------------------------------------------------
+_STRICT_ORDER_KEYS = ("order_id", "OrderId", "orders", "order_ids", "sent_orders", "executed_symbols")
+_STRICT_EXECUTED_COUNT_KEYS = ("executed_count", "order_count", "submitted_count", "sent_count")
+
+
+def _strict_has_payload(v: Any) -> bool:
+    if isinstance(v, (list, tuple, set, dict)):
+        return len(v) > 0
+    return bool(v)
+
+
 def _result_executed(result: Any) -> bool:
+    """実注文が確認できた場合だけ True。approved/registered/entries/pending減少だけでは成功扱いしない。"""
     try:
         if result is None:
             return False
         if isinstance(result, bool):
-            return result
+            # 既存の真偽戻り値は尊重。ただし wrapper が作った dict の executed は下で order根拠付きだけを見る。
+            return bool(result)
         if isinstance(result, dict):
-            if bool(result.get("executed")):
-                return True
-            for key in ("executed_count", "approved_count", "order_count"):
+            for key in _STRICT_EXECUTED_COUNT_KEYS:
                 try:
                     if int(result.get(key) or 0) > 0:
                         return True
                 except Exception:
                     pass
-            for key in ("order_id", "OrderId", "orders", "order_ids", "sent_orders", "executed_symbols"):
-                v = result.get(key)
-                if isinstance(v, (list, tuple, set, dict)):
-                    if len(v) > 0:
-                        return True
-                elif v:
+            for key in _STRICT_ORDER_KEYS:
+                if _strict_has_payload(result.get(key)):
+                    return True
+            for key in ("result", "pipeline_result", "order_result"):
+                child = result.get(key)
+                if child is not result and _result_executed(child):
                     return True
             return False
         if isinstance(result, (list, tuple, set)):
-            return len(result) > 0
-        return bool(result)
+            return any(_result_executed(x) for x in result)
+        return False
     except Exception:
+        logger.exception("[SUMMARY AI ENTRY BRIDGE] strict order result judgement failed result=%s", result)
         return False
 
 
@@ -384,7 +402,7 @@ def build_entry_rows(approved_rows: Any) -> List[Dict[str, Any]]:
         return entries
 
 
-def register_pending_entries(entries: List[Dict[str, Any]]) -> int:
+def _register_pending_entries_core(entries: List[Dict[str, Any]]) -> int:
     registered = 0
     rejected = 0
     try:
@@ -443,7 +461,7 @@ def register_pending_entries(entries: List[Dict[str, Any]]) -> int:
         return registered
 
 
-def execute_entry_pipeline(entries: List[Dict[str, Any]], *, pipeline_source: str | None = None, interval: int | None = None) -> Dict[str, Any]:
+def _execute_entry_pipeline_core(entries: List[Dict[str, Any]], *, pipeline_source: str | None = None, interval: int | None = None) -> Dict[str, Any]:
     try:
         if not entries:
             logger.info("[SUMMARY_ENTRY] entry pipeline skipped reason=no_entries")
@@ -584,3 +602,576 @@ def run_summary_entry_executor(approved_rows: Any, df_summary: pd.DataFrame, int
             "interval": interval,
             "skip_reason": "summary_entry_exception",
         }
+
+
+# ============================================================
+# register_pending_entries の2層ガード
+# ------------------------------------------------------------
+# 旧 core/startup の2パッチを本文化。実行時の合成は
+#   native <- summary_entry_pending_existing_fix <- summary_ai_direct_timeout_continue
+# の2層 (実測)。3件目の summary_entry_pending_duplicate_registered_patch は
+# direct_timeout_continue に剥がされる死に層だったので f2276d1 で削除済み。
+#
+#   1層目 _pef_*: 既存 pending の refresh / stale 判定 (fresh dispatch 救済込み)
+#   2層目 _dtc_*: timeout した内側スレッドが遅れて登録しても期限切れなら拒否
+#
+# スコープは旧 install 導線 (いずれも main.py 経由) を再現する。
+# ============================================================
+
+import datetime as dt
+import functools
+import time
+
+_PEF_VERSION = "V3-SUMMARY-ENTRY-PENDING-EXISTING-FIX"
+_DTC_VERSION = "V15-SUMMARY-AI-DIRECT-TIMEOUT-CONTINUE"
+_RPE_SCOPE = None
+# 旧パッチ内で誰も書き込まなくなったが、判定の形を変えないため残す。
+_DTC_FRESHNESS_BY_SYMBOL: dict = {}
+
+_TRUE_SET = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_FALSE_SET = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
+_STALE_RESCUE_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_STALE_RESCUE_FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
+
+def _pef_env_bool(name: str, default: bool) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None:
+            return bool(default)
+        s = str(raw).strip().lower()
+        if s in _TRUE_SET:
+            return True
+        if s in _FALSE_SET:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _pef_env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _pef_norm(v: Any) -> str:
+    try:
+        if v is None:
+            return ""
+        return str(v).strip().upper()
+    except Exception:
+        return ""
+
+
+def _pef_norm_interval(v: Any) -> str:
+    try:
+        if v is None or v == "":
+            return ""
+        s = str(v).strip()
+        return s[:-2] if s.endswith(".0") else s
+    except Exception:
+        return ""
+
+
+def _pef_norm_side(v: Any) -> str:
+    s = _pef_norm(v)
+    if s in {"BUY", "LONG", "2", "買", "買い"}:
+        return "BUY"
+    if s in {"SELL", "SHORT", "1", "売", "売り"}:
+        return "SELL"
+    return s
+
+
+def _pef_identity(e: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    return (
+        _pef_norm(e.get("source")),
+        _pef_norm(e.get("entry_type")),
+        _pef_norm_side(e.get("side") or e.get("entry_decision") or e.get("ai_side")),
+        _pef_norm_interval(e.get("interval")),
+    )
+
+
+def _pef_symbol(e: Dict[str, Any]) -> str:
+    s = str(e.get("symbol") or "").strip()
+    return s[:-2] if s.endswith(".0") and s[:-2].isdigit() else s
+
+
+def _pef_stamp(entry: Dict[str, Any]) -> None:
+    try:
+        now = dt.datetime.now()
+        entry["created_at"] = entry.get("created_at") or now
+        entry["pending_refreshed_at"] = now
+        entry["pending_duplicate_refreshed"] = True
+    except Exception:
+        pass
+
+
+def _pef_as_datetime(value: Any) -> dt.datetime | None:
+    if value is None or value == "":
+        return None
+    try:
+        # pandas.Timestamp / datetime.datetime compatible path
+        if hasattr(value, "to_pydatetime"):
+            value = value.to_pydatetime()
+        if isinstance(value, dt.datetime):
+            return value.replace(tzinfo=None) if value.tzinfo is not None else value
+        if isinstance(value, dt.date):
+            return dt.datetime.combine(value, dt.time.min)
+    except Exception:
+        pass
+
+    try:
+        s = str(value).strip()
+        if not s or s.lower() in {"nat", "nan", "none", "null"}:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        parsed = dt.datetime.fromisoformat(s)
+        return parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
+    except Exception:
+        pass
+
+    # Last resort for common pandas-like strings with slash date or seconds suffix.
+    try:
+        import pandas as pd  # type: ignore
+
+        parsed = pd.to_datetime(value, errors="coerce")
+        if parsed is None or getattr(parsed, "tzinfo", None) is None and str(parsed) == "NaT":
+            return None
+        if hasattr(parsed, "to_pydatetime"):
+            parsed = parsed.to_pydatetime()
+        if isinstance(parsed, dt.datetime):
+            return parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
+    except Exception:
+        pass
+
+    return None
+
+
+def _pef_entry_datetime(entry: Dict[str, Any]) -> dt.datetime | None:
+    for key in (
+        "datetime",
+        "summary_datetime",
+        "entry_datetime",
+        "signal_datetime",
+        "latest_dt",
+        "latest_datetime",
+        "end_time",
+        "timestamp",
+    ):
+        try:
+            parsed = _pef_as_datetime(entry.get(key))
+            if parsed is not None:
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _pef_summary_max_age_sec() -> float:
+    # エントリー最終ガードのデフォルトと合わせる。0以下なら無効化。
+    for name in (
+        "SUMMARY_ENTRY_PENDING_MAX_AGE_SEC",
+        "SUMMARY_AI_PENDING_MAX_AGE_SEC",
+        "SUMMARY_AI_MAX_CANDIDATE_AGE_SEC",
+        "ENTRY_CANDIDATE_MAX_AGE_SEC",
+    ):
+        raw = os.getenv(name)
+        if raw is not None and str(raw).strip() != "":
+            return _pef_env_float(name, 180.0)
+    return 180.0
+
+
+def _pef_is_summary_ai_entry(entry: Dict[str, Any]) -> bool:
+    source = _pef_norm(entry.get("source"))
+    entry_type = _pef_norm(entry.get("entry_type"))
+    if source in {"SUMMARY", "SUMMARY_AI", "PUSH", "AI"} and "SUMMARY" in entry_type:
+        return True
+    if entry_type in {"SUMMARY_AI", "SUMMARY", "AI_SUMMARY"}:
+        return True
+    return False
+
+
+def _pef_stale_summary_reason_base(entry: Dict[str, Any]) -> str | None:
+    if not _pef_env_bool("SUMMARY_SKIP_STALE_PENDING_ENABLED", True):
+        return None
+    if not _pef_is_summary_ai_entry(entry):
+        return None
+
+    max_age = _pef_summary_max_age_sec()
+    if max_age <= 0:
+        return None
+
+    signal_dt = _pef_entry_datetime(entry)
+    if signal_dt is None:
+        if _pef_env_bool("SUMMARY_SKIP_MISSING_DATETIME_PENDING", True):
+            return f"missing_datetime max_age={max_age:.1f}s"
+        return None
+
+    age = (dt.datetime.now() - signal_dt).total_seconds()
+    if age > max_age:
+        return f"stale age={age:.1f}s max_age={max_age:.1f}s datetime={signal_dt}"
+    if age < -60:
+        return f"future_datetime age={age:.1f}s datetime={signal_dt}"
+    return None
+
+
+def _pef_same_pending_rows(symbol: str, entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    try:
+        from trading.entry.pending_manager import get_bucket
+
+        target = _pef_identity(entry)
+        return [old for old in get_bucket(symbol) if isinstance(old, dict) and _pef_identity(old) == target]
+    except Exception:
+        logger.debug("[SUMMARY ENTRY PENDING FIX] same pending rows check failed", exc_info=True)
+        return []
+
+
+def _pef_refresh_same_pending(symbol: str, entry: Dict[str, Any]) -> bool:
+    """
+    add_pending() が同一 identity duplicate で False を返した場合、
+    古いpendingを最新entryで置換する。
+    """
+    if not _pef_env_bool("SUMMARY_PENDING_DUPLICATE_REFRESH_ENABLED", True):
+        return False
+    try:
+        stale_reason = _pef_stale_summary_reason(entry)
+        if stale_reason:
+            logger.warning(
+                "[SUMMARY ENTRY PENDING FIX] duplicate refresh skipped stale symbol=%s identity=%s reason=%s score=%s",
+                symbol,
+                _pef_identity(entry),
+                stale_reason,
+                entry.get("score", entry.get("final_score")),
+            )
+            return False
+
+        from trading.entry.pending_manager import get_bucket, replace_bucket
+
+        target = _pef_identity(entry)
+        bucket = get_bucket(symbol)
+        if not any(isinstance(old, dict) and _pef_identity(old) == target for old in bucket):
+            return False
+
+        kept: List[Dict[str, Any]] = []
+        removed = 0
+        old_samples: List[Dict[str, Any]] = []
+        for old in bucket:
+            if isinstance(old, dict) and _pef_identity(old) == target:
+                removed += 1
+                if len(old_samples) < 3:
+                    old_samples.append({
+                        "score": old.get("score"),
+                        "score_buy": old.get("score_buy"),
+                        "score_sell": old.get("score_sell"),
+                        "side": old.get("side"),
+                        "datetime": old.get("datetime"),
+                        "created_at": old.get("created_at"),
+                    })
+                continue
+            kept.append(old)
+
+        _pef_stamp(entry)
+        replace_bucket(symbol, kept + [entry])
+        logger.warning(
+            "[SUMMARY ENTRY PENDING FIX] duplicate pending refreshed symbol=%s identity=%s removed=%s old_samples=%s new_score=%s new_side=%s new_datetime=%s",
+            symbol,
+            target,
+            removed,
+            old_samples,
+            entry.get("score", entry.get("final_score")),
+            entry.get("side") or entry.get("entry_decision") or entry.get("ai_side"),
+            entry.get("datetime"),
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY ENTRY PENDING FIX] duplicate refresh failed symbol=%s identity=%s", symbol, _pef_identity(entry))
+        return False
+
+
+def _pef_patched_register_pending_entries(entries: List[Dict[str, Any]]) -> int:
+    try:
+        from trading.entry.pending_manager import add_pending, snapshot_root
+
+        registered = 0
+        rejected = 0
+        refreshed = 0
+        existing = 0
+        stale_skipped = 0
+
+        if not entries:
+            logger.info("[SUMMARY ENTRY PENDING FIX] pending registration skipped reason=no_entries")
+            return 0
+
+        for entry in entries:
+            try:
+                if not isinstance(entry, dict):
+                    rejected += 1
+                    continue
+                sym = _pef_symbol(entry)
+                if not sym:
+                    rejected += 1
+                    logger.warning("[SUMMARY ENTRY PENDING FIX] pending skip reason=no_symbol entry=%s", entry)
+                    continue
+                entry["symbol"] = sym
+
+                stale_reason = _pef_stale_summary_reason(entry)
+                if stale_reason:
+                    stale_skipped += 1
+                    logger.warning(
+                        "[SUMMARY ENTRY PENDING FIX] stale pending skipped symbol=%s identity=%s reason=%s score=%s side=%s",
+                        sym,
+                        _pef_identity(entry),
+                        stale_reason,
+                        entry.get("score", entry.get("final_score")),
+                        entry.get("side") or entry.get("entry_decision") or entry.get("ai_side"),
+                    )
+                    continue
+
+                ok = bool(add_pending(entry))
+                if ok:
+                    registered += 1
+                    continue
+
+                same_rows = _pef_same_pending_rows(sym, entry)
+                if same_rows:
+                    existing += 1
+                    if _pef_refresh_same_pending(sym, entry):
+                        refreshed += 1
+                        registered += 1
+                    else:
+                        # stale refreshなどで置換しなかった場合も、既存pendingはあるので
+                        # no_pending_registered 誤判定だけは避ける。ただし新規staleは上で除外済み。
+                        registered += 1
+                    logger.warning(
+                        "[SUMMARY ENTRY PENDING FIX] duplicate existing pending treated as registered symbol=%s identity=%s refreshed=%s",
+                        sym,
+                        _pef_identity(entry),
+                        bool(same_rows),
+                    )
+                    continue
+
+                rejected += 1
+                logger.warning(
+                    "[SUMMARY ENTRY PENDING FIX] pending rejected symbol=%s identity=%s entry=%s",
+                    sym,
+                    _pef_identity(entry),
+                    entry,
+                )
+            except Exception:
+                rejected += 1
+                logger.exception("[SUMMARY ENTRY PENDING FIX] pending add failed entry=%s", entry)
+
+        logger.warning(
+            "[SUMMARY ENTRY PENDING FIX] pending registration done entries=%s registered=%s existing=%s refreshed=%s stale_skipped=%s rejected=%s root=%s",
+            len(entries),
+            registered,
+            existing,
+            refreshed,
+            stale_skipped,
+            rejected,
+            snapshot_root(),
+        )
+        return registered
+    except Exception as e:
+        logger.exception("[SUMMARY ENTRY PENDING FIX] patched register failed err=%s", e)
+        if callable(_register_pending_entries_core):
+            return int(_register_pending_entries_core(entries) or 0)
+        return 0
+
+
+def _pef_stale_rescue_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None:
+            return bool(default)
+        s = str(raw).strip().lower()
+        if s in _STALE_RESCUE_TRUE:
+            return True
+        if s in _STALE_RESCUE_FALSE:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _pef_stale_rescue_env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _pef_stale_rescue_as_dt(v: Any) -> dt.datetime | None:
+    try:
+        if v is None or str(v).strip() == "":
+            return None
+        if hasattr(v, "to_pydatetime"):
+            v = v.to_pydatetime()
+        if isinstance(v, dt.datetime):
+            return v.replace(tzinfo=None)
+        s = str(v).strip()
+        if s.lower() in {"nat", "nan", "none", "null"}:
+            return None
+        try:
+            return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            pass
+        try:
+            import pandas as pd  # type: ignore
+            p = pd.to_datetime(v, errors="coerce")
+            if str(p) == "NaT":
+                return None
+            if hasattr(p, "to_pydatetime"):
+                p = p.to_pydatetime()
+            if isinstance(p, dt.datetime):
+                return p.replace(tzinfo=None)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
+
+def _pef_stale_rescue_fresh_runtime_age(entry: dict[str, Any]) -> tuple[float | None, str]:
+    for key in ("pending_refreshed_at", "created_at", "queued_at", "approved_at", "built_at", "updated_at"):
+        ts = _pef_stale_rescue_as_dt(entry.get(key))
+        if ts is None:
+            continue
+        try:
+            return max(0.0, (dt.datetime.now() - ts).total_seconds()), key
+        except Exception:
+            continue
+    return None, ""
+
+
+def _pef_stale_summary_reason(entry: Dict[str, Any]) -> str | None:
+    try:
+        if not _pef_stale_rescue_env_bool("SUMMARY_ENTRY_STALE_RESCUE_ENABLED", True):
+            return _pef_stale_summary_reason_base(entry)
+
+        is_summary = False
+        try:
+            fn = globals().get("_pef_is_summary_ai_entry")
+            is_summary = bool(fn(entry)) if callable(fn) else False
+        except Exception:
+            is_summary = False
+
+        if is_summary:
+            runtime_age, runtime_key = _pef_stale_rescue_fresh_runtime_age(entry)
+            fresh_limit = _pef_stale_rescue_env_float("SUMMARY_ENTRY_FRESH_DISPATCH_MAX_AGE_SEC", 45.0)
+            if runtime_age is not None and runtime_age <= fresh_limit:
+                _identity_fn = globals().get("_pef_identity")
+                logger.warning(
+                    "[SUMMARY ENTRY STALE RESCUE] allow fresh runtime candidate symbol=%s identity=%s runtime_key=%s runtime_age=%.1fs limit=%.1fs bar_datetime=%s score=%s side=%s",
+                    entry.get("symbol"),
+                    _identity_fn(entry) if callable(_identity_fn) else "",
+                    runtime_key,
+                    runtime_age,
+                    fresh_limit,
+                    entry.get("datetime"),
+                    entry.get("score", entry.get("final_score")),
+                    entry.get("side") or entry.get("entry_decision") or entry.get("ai_side"),
+                )
+                return None
+
+        return _pef_stale_summary_reason_base(entry)
+    except Exception:
+        logger.debug("[SUMMARY ENTRY STALE RESCUE] rescued stale check failed", exc_info=True)
+        return _pef_stale_summary_reason_base(entry)
+
+
+def _rpe_scope_enabled() -> bool:
+    global _RPE_SCOPE
+    if _RPE_SCOPE is not None:
+        return _RPE_SCOPE
+    enabled = False
+    try:
+        import sys as _sys
+
+        argv_text = " ".join(str(x) for x in _sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if not any(n in argv_text for n in db_names):
+            enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _RPE_SCOPE = enabled
+    return enabled
+
+
+def register_pending_entries(entries: List[Dict[str, Any]], *args: Any, **kwargs: Any) -> int:
+    if not _rpe_scope_enabled():
+        return _register_pending_entries_core(entries)
+
+    def _layer1(ents, *a, **k):
+        return _pef_patched_register_pending_entries(ents)
+
+    try:
+        if not entries:
+            return _layer1(entries, *args, **kwargs)
+        now = time.time()
+        kept = []
+        skipped = []
+        for entry in list(entries or []):
+            try:
+                if not isinstance(entry, dict):
+                    kept.append(entry)
+                    continue
+                sym = str(entry.get("symbol") or "").strip()
+                meta = _DTC_FRESHNESS_BY_SYMBOL.get(sym) if sym else None
+                valid_until = entry.get("summary_ai_valid_until_ts")
+                if valid_until is None and meta:
+                    valid_until = meta.get("valid_until_ts")
+                if valid_until is not None and now > float(valid_until):
+                    skipped.append(sym or "?")
+                    continue
+                kept.append(entry)
+            except Exception:
+                kept.append(entry)
+        if skipped:
+            logger.warning(
+                "[SUMMARY AI DIRECT FRESHNESS] pending skip expired symbols=%s kept=%s skipped=%s version=%s",
+                skipped, len(kept), len(skipped), _DTC_VERSION,
+            )
+        if not kept:
+            return 0
+        return _layer1(kept, *args, **kwargs)
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT FRESHNESS] pending guard failed; use original")
+        return _layer1(entries, *args, **kwargs)
+
+
+# ============================================================
+# SUMMARY-AI DIRECT SNAPSHOT
+# (旧 core/startup/summary_ai_async_entry_patch.py の本文化)
+# ------------------------------------------------------------
+# 旧 install() は
+#   se.execute_entry_pipeline = _summary_ai_direct_snapshot_execute
+# の 1 枚だけを被せていた (この属性を包む他パッチは無い)。
+# 実装本体は trading/entry/summary_ai/direct_snapshot.py にあり、
+# SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT が false のときは
+# _execute_entry_pipeline_core へ戻る。
+#
+# direct_snapshot を import できない場合は素の実装を使う
+# (旧構成でも install 失敗時は native のままだった)。
+# ============================================================
+
+
+def execute_entry_pipeline(entries: List[Dict[str, Any]], *, pipeline_source: str | None = None, interval: int | None = None) -> Dict[str, Any]:
+    try:
+        from trading.entry.summary_ai.direct_snapshot import _summary_ai_direct_snapshot_execute
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT SNAPSHOT] import failed; use core pipeline")
+        return _execute_entry_pipeline_core(entries, pipeline_source=pipeline_source, interval=interval)
+    return _summary_ai_direct_snapshot_execute(entries, pipeline_source=pipeline_source, interval=interval)

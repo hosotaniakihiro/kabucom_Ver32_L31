@@ -42,8 +42,30 @@ import numpy as np
 # ============================================================
 
 def _safe_datetime(series):
+    """datetime へ変換する。
+
+    format を渡さないと pandas が 1 要素ずつ dateutil で推定し
+    ("Could not infer format" UserWarning) 遅いので、
+    summary の標準形式を先に試し、失敗時だけ推定に戻す。
+    """
     if series is None:
         return None
+    try:
+        if isinstance(series, pd.Series) and pd.api.types.is_datetime64_any_dtype(series):
+            return series
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            out = pd.to_datetime(series, format=fmt, errors="coerce")
+            if getattr(out, "notna", None) is not None and bool(out.notna().any()):
+                return out
+        except Exception:
+            continue
+    try:
+        return pd.to_datetime(series, errors="coerce", format="mixed")
+    except Exception:
+        pass
     try:
         return pd.to_datetime(series, errors="coerce")
     except Exception:
@@ -71,6 +93,22 @@ def _col(df, *names):
         if key in lower_map:
             return df[lower_map[key]]
     return None
+
+
+def _shifted_rolling_any(mask, periods: int, window: int):
+    """mask.shift(periods).rolling(window, min_periods=1).max() を bool で返す。
+
+    bool Series をそのまま shift すると NaN のせいで object dtype へ昇格し、
+    続く fillna(False) が pandas の暗黙 downcast 非推奨警告
+    ("Downcasting object dtype arrays on .fillna ... is deprecated") に
+    なるため、float64 のまま計算して最後に bool へ戻す。
+    真偽値は従来と同一 (NaN は False 扱い)。
+    """
+    s = pd.Series(mask)
+    if s.dtype != "float64":
+        s = s.astype("float64")
+    rolled = s.shift(periods).rolling(window, min_periods=1).max()
+    return rolled.fillna(0.0).astype(bool)
 
 
 def _flag(expr, index=None):
@@ -232,9 +270,9 @@ def _apply_time_flags_per_group(g: pd.DataFrame) -> pd.DataFrame:
     g["flag_open_pullback_0910_0930"] = _flag(
         _between_hhmm(hhmm, 910, 930) &
         (
-            open_impulse.shift(1).rolling(5, min_periods=1).max().fillna(False).astype(bool) |
-            open_impulse.shift(2).rolling(5, min_periods=1).max().fillna(False).astype(bool) |
-            open_impulse.shift(3).rolling(5, min_periods=1).max().fillna(False).astype(bool)
+            _shifted_rolling_any(open_impulse, 1, 5) |
+            _shifted_rolling_any(open_impulse, 2, 5) |
+            _shifted_rolling_any(open_impulse, 3, 5)
         ) &
         (
             touch_support |
@@ -300,7 +338,7 @@ def _apply_time_flags_per_group(g: pd.DataFrame) -> pd.DataFrame:
 
     g["flag_lunch_break_hold"] = _flag(
         _between_hhmm(hhmm, 1230, 1300) &
-        pre_lunch_strong.shift(1).rolling(10, min_periods=1).max().fillna(False).astype(bool) &
+        _shifted_rolling_any(pre_lunch_strong, 1, 10) &
         (close >= ma25) &
         ((close >= vwap) | vwap.isna()),
         idx,
@@ -372,7 +410,7 @@ def _apply_time_flags_per_group(g: pd.DataFrame) -> pd.DataFrame:
     )
 
     g["flag_time_decay_pullback_resolved"] = _flag(
-        pullback_now.shift(1).rolling(3, min_periods=1).max().fillna(False).astype(bool) &
+        _shifted_rolling_any(pullback_now, 1, 3) &
         rebound_soon,
         idx,
     )

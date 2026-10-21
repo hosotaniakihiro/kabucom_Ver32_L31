@@ -25,6 +25,8 @@ import pandas as pd
 
 from global_state import global_data
 from .utils import normalize_symbol, first_existing_col
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +208,7 @@ def _call_global_context_method(name: str, interval: int, *, source: str = "push
 
 
 def _summary_db_path() -> str:
-    base = os.getenv("AUTOSTOCK_SUMMARY_DB_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary")
+    base = os.getenv("AUTOSTOCK_SUMMARY_DB_DIR", nas_path(r"raw_data\kabu_station\summary"))
     return os.path.join(base, f"summary{_today_yyyymmdd()}.db")
 
 
@@ -233,7 +235,7 @@ def _load_summary_db_latest_slot(interval: int) -> pd.DataFrame:
         now = _now_naive()
         future_tolerance = _future_tolerance_sec(interval)
         max_allowed_dt = (now + dt.timedelta(seconds=future_tolerance)).strftime("%Y-%m-%d %H:%M:%S")
-        with sqlite3.connect(db, timeout=2.0) as conn:
+        with committing_connect(db, timeout=2.0) as conn:
             conn.row_factory = sqlite3.Row
             if not _table_exists(conn, table):
                 logger.warning("[TONOSAMA ENTRY] summary db fallback table missing interval=%s table=%s db=%s", interval, table, db)

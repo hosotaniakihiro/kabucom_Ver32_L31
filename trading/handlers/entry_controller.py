@@ -72,7 +72,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
+import sys
 import datetime as dt
 import queue
 import sqlite3
@@ -98,7 +100,7 @@ from trading.handlers.entry_handler import (
 )
 
 from AI.entry_row_builder import build_entry_row
-from AI.entry_gate import ai_final_entry_check
+from AI.entry_gate import ai_final_entry_check as _ai_final_entry_check_core
 from AI.entry_gate_tonosama import allow_tonosama_entry
 from AI.entry_gate_sell_tonosama import allow_sell_tonosama_entry
 
@@ -117,11 +119,13 @@ from trading.handlers.entry_precheck_ranking import (
 
 from trading.handlers.entry_order_builder import build_entry_order
 from trading.filters.volatility_filter import (
-    atr_1m_filter,
-    range_5m_filter,
+    atr_1m_filter as _atr_1m_filter_core,
+    range_5m_filter as _range_5m_filter_core,
 )
+from trading.filters.mtf_ma_gate import mtf_ma_gate
+from trading.filters.mtf_score_gate import mtf_score_gate
 
-from trading.entry.lot_sizer import calculate_entry_quantity
+from trading.entry.lot_sizer import calculate_entry_quantity as _calculate_entry_quantity_base
 
 from trading.risk.boost_engine import BoostEngine
 from trading.monitor.boost_monitor import BoostMonitor
@@ -131,6 +135,8 @@ from AI.ranking_feature_builder import build_ranking_feature_1min
 from AI.ranking_entry_predictor import predict_ranking_entry
 
 from utils_common import normalize_symbol
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger("entry_controller")
 
@@ -178,6 +184,155 @@ MIN_COMPOSITE_SCORE_SELL = 1.0
 
 MAX_CANDIDATES_PER_SYMBOL = 10
 MAX_APPROVED_PER_RUN = 3
+
+
+def apply_fast_startup_entry_limits() -> bool:
+    """旧 fast_startup_runtime_patch._patch_entry_max_approved() の本文化。
+
+    旧パッチは main.py:241 の _install_main_runtime_patches からのみ install され、
+    MAX_APPROVED_PER_RUN を ENTRY_MAX_APPROVED_PER_RUN (既定 10) で上書きしていた。
+    呼び出し元を main.py の patches リストに限ることでスコープを維持する。
+    """
+    global MAX_APPROVED_PER_RUN
+    old = MAX_APPROVED_PER_RUN
+
+    # ------------------------------------------------------------
+    # P0-5 / settings owner 一本化 (R17)
+    #
+    # 実測ログでこの値は 3 -> 10 -> 3 と揺れていた。
+    #   1. モジュール定数            MAX_APPROVED_PER_RUN = 3
+    #   2. ここ (fast startup)       env 未設定でも 10 へ引き上げ
+    #   3. strict_entry_defaults     180 秒 watcher が 3 へ戻す
+    # 2 と 3 の間 (最大 180 秒) だけ承認上限が 3 -> 10 と緩む。
+    # 承認上限の正本は strict_entry_defaults なので、
+    # env が明示されていない限りここでは引き上げない。
+    #
+    # env が明示されていれば運用者の意図としてそのまま従う。
+    # 旧動作へ戻すには ENTRY_MAX_APPROVED_FAST_STARTUP_SEED=1。
+    # ------------------------------------------------------------
+    raw = os.getenv("ENTRY_MAX_APPROVED_PER_RUN")
+    explicit = raw is not None and str(raw).strip() != ""
+    legacy_seed = str(os.getenv("ENTRY_MAX_APPROVED_FAST_STARTUP_SEED", "")).strip().lower() in {
+        "1", "true", "yes", "y", "on",
+    }
+
+    if not explicit and not legacy_seed:
+        logger.warning(
+            "[FAST STARTUP] entry_controller.MAX_APPROVED_PER_RUN は据え置く value=%s "
+            "(正本は core/startup/strict_entry_defaults。env 未設定で 10 へ引き上げると "
+            "strict watcher が戻すまで承認上限が緩む。"
+            "ENTRY_MAX_APPROVED_FAST_STARTUP_SEED=1 で旧動作)",
+            MAX_APPROVED_PER_RUN,
+        )
+        return True
+
+    try:
+        val = int(float(raw)) if explicit else 10
+    except Exception:
+        val = 10
+    if val <= 0:
+        val = 10
+    MAX_APPROVED_PER_RUN = int(val)
+    logger.warning(
+        "[FAST STARTUP] entry_controller.MAX_APPROVED_PER_RUN patched old=%s new=%s",
+        old,
+        MAX_APPROVED_PER_RUN,
+    )
+    return True
+
+
+# 旧 tonosama_history_failclose_strict_patch._patch_entry_controller() の定数表。
+# strict モードでのスコア/信頼度/承認上限の下限値。
+def _strict_threshold(name: str, fallback: float) -> float:
+    """strict 側が定める正本値を返す。
+
+    relax 系 env が未設定のときの既定値として使う。
+    参照順:
+      1. env ENTRY_CONTROLLER_<name>   (strict_entry_defaults.STRICT_ENV が hard-set)
+      2. env <name>                    (同上)
+      3. STRICT_ENTRY_CONSTANTS[name]  (このファイルの定数表)
+      4. fallback
+    """
+    import os as _os
+
+    for env_name in ("ENTRY_CONTROLLER_" + name, name):
+        try:
+            v = _os.getenv(env_name)
+            if v is not None and str(v).strip() != "":
+                return float(v)
+        except Exception:
+            pass
+    try:
+        return float(STRICT_ENTRY_CONSTANTS.get(name, fallback))
+    except Exception:
+        return float(fallback)
+
+
+STRICT_ENTRY_CONSTANTS: dict[str, float | int] = {
+    "MIN_SUMMARY_SCORE_BUY": 3.0,
+    "MIN_SUMMARY_SCORE_SELL": 3.0,
+    "MIN_COMPOSITE_SCORE_BUY": 3.0,
+    "MIN_COMPOSITE_SCORE_SELL": 3.0,
+    "MIN_AI_CONFIDENCE_BUY": 0.60,
+    "MIN_AI_CONFIDENCE_SELL": 0.60,
+    "MAX_APPROVED_PER_RUN": 3,
+}
+
+
+def apply_final_gate_relax_constants() -> bool:
+    """旧 summary_ai_more_candidates_patch._install_final_gate_relax_patch() の本文化。
+
+    _passes_ai_gate のラップ本体は当ファイルへ本文化済み。ここは旧 install() が
+    併せて上書きしていた 4 定数だけ。同じ定数を core/startup/__init__.py /
+    kabu_api.buy_sell_entry.apply_oneshot_limit_defaults /
+    core/startup/strict_entry_defaults も書くため**後勝ち**になる。
+    呼び出し位置 (main.py の patches リスト) は旧 install と同じに保つこと。
+    """
+    global MIN_SUMMARY_SCORE_BUY, MIN_COMPOSITE_SCORE_BUY
+    global MIN_SUMMARY_SCORE_SELL, MIN_COMPOSITE_SCORE_SELL
+    try:
+        if os.environ.get("ENTRY_CONTROLLER_FINAL_GATE_RELAX_ENABLED", "").strip() in {"0", "false", "no", "off"}:
+            return False
+
+        def _f(name: str, default: float) -> float:
+            try:
+                v = os.getenv(name)
+                return float(default) if v is None or str(v).strip() == "" else float(v)
+            except Exception:
+                return float(default)
+
+        # 既定値をハードコード 1.0 ではなく strict の正本値にする。
+        # (ENTRY_CONTROLLER_SUMMARY_*_MIN_* はプロジェクト内のどこからも
+        #  設定されておらず、従来は必ず 1.0 に落ちて strict 3.0 と綱引きになっていた)
+        MIN_SUMMARY_SCORE_BUY = _f("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_SCORE", _strict_threshold("MIN_SUMMARY_SCORE_BUY", 3.0))
+        MIN_COMPOSITE_SCORE_BUY = _f("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_COMPOSITE", _strict_threshold("MIN_COMPOSITE_SCORE_BUY", 3.0))
+        MIN_SUMMARY_SCORE_SELL = _f("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_SCORE", _strict_threshold("MIN_SUMMARY_SCORE_SELL", 3.0))
+        MIN_COMPOSITE_SCORE_SELL = _f("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_COMPOSITE", _strict_threshold("MIN_COMPOSITE_SCORE_SELL", 3.0))
+        logger.warning(
+            "[SUMMARY AI MORE CANDIDATES] final gate relax constants applied buy=%s/%s sell=%s/%s",
+            MIN_SUMMARY_SCORE_BUY, MIN_COMPOSITE_SCORE_BUY,
+            MIN_SUMMARY_SCORE_SELL, MIN_COMPOSITE_SCORE_SELL,
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI MORE CANDIDATES] final gate relax constants failed")
+        return False
+
+
+def apply_strict_entry_constants() -> dict[str, tuple[Any, Any]]:
+    """旧 tonosama_history_failclose_strict_patch._patch_entry_controller() の本文化。
+
+    core/startup/strict_entry_defaults.py が install 時と watcher から毎秒呼ぶ。
+    他 install (fast_startup / more_candidates / oneshot_limit) が緩めた値を
+    strict 側へ引き戻すのが役目なので、毎回無条件に書き戻す。
+    """
+    changed: dict[str, tuple[Any, Any]] = {}
+    for name, value in STRICT_ENTRY_CONSTANTS.items():
+        old = globals().get(name)
+        if old != value:
+            globals()[name] = value
+            changed[name] = (old, value)
+    return changed
 
 # ==========================================================
 # Orchestrator
@@ -445,7 +600,626 @@ def _resolve_entry_scores(entry_row: dict, side: str) -> tuple[float, float]:
     return score_buy, score_sell
 
 
-def _passes_ai_gate(entry_row: dict, ai: dict, side: str) -> tuple[bool, str]:
+# ============================================================
+# RANKING の最終段 ATR 救済
+#   旧 core/startup/ranking_entry_final_rescue_patch.py (V1.4)
+# ------------------------------------------------------------
+# RANKING pending が entry_controller まで到達しているのに、最終段で
+# 全落ちして注文が出ない問題を緩和する。range_5m_filter 側の softpass は
+# trading/filters/volatility_filter._range_5m_filter_from_entry_row (V6) へ
+# インライン化済みなので、残っていたのは ATR 救済と env 強制の2つ。
+#
+# 旧パッチは opt-in の RANKING_RESCUE_PATCHES グループ (既定 OFF) で
+# install されていた。そのスコープを再現する。
+#
+# 本文化にあたっての意図的な差分 2 点 (どちらも opt-in を ON にしたときだけ顕在化):
+#  1) 旧 patched_ai (ec.ai_final_entry_check のラップ) は移していない。
+#     install() が RANKING_FINAL_RESCUE_AI_FAILOPEN="0" をハード代入してから
+#     ラップするため、本体は常に早期 return する完全な no-op だった。
+#     実質的な効果は getattr(cur, "_original_ai_final_entry_check", cur) で
+#     summary_ai_entry_controller_bridge_patch のラッパーを剥がして捨てることだけ。
+#     本文化ではその破壊を再現しない。
+#  2) 旧 patched_atr は getattr(cur, "_original_atr_1m_filter", cur) で
+#     entry_final_filter_failopen_patch のラッパーを 1 段剥がしていた。
+#     どのラッパーが最上位かは install 順のレース次第で不定だったため、
+#     本文化では剥がさず、チェーン全体の結果に対して救済を掛ける。
+# ============================================================
+_RANKING_RESCUE_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+_RANKING_RESCUE_DB_PROCESS_ENVS = (
+    "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+    "AUTOSTOCK_SUMMARY_DB_WRITER",
+    "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+    "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+)
+
+# install() が setdefault ではなくハード代入していたもの。
+# sitecustomize / usercustomize の読み込み順に依存させないための意図的な force。
+_RANKING_RESCUE_FORCED_ENV = {
+    "RANKING_FINAL_RESCUE_MIN_SCORE": "50",
+    "RANKING_FINAL_RESCUE_MIN_TURNOVER": "30000000",
+    "RANKING_FINAL_RESCUE_MIN_DAY_ABS_PCT": "0.0",
+    "RANKING_FINAL_RESCUE_ATR_SOFTPASS": "1",
+    "RANKING_FINAL_RESCUE_RANGE_SOFTPASS": "1",
+    "LOW_MOVE_RANKING_ZERO_ATR_SOFTPASS": "1",
+    "LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE": "50",
+    "LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW": "50",
+    "LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER": "30000000",
+    "LOW_MOVE_RANKING_ZERO_ATR_MIN_DAY_ABS_PCT": "0.0",
+    "LOW_MOVE_RANKING_MIN_ATR_RATIO": "0.0",
+    "LOW_MOVE_RANKING_MIN_ABS_SLOPE": "0.0",
+    "RANKING_ENTRY_RESCUE_MIN_TURNOVER": "30000000",
+    "RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER": "30000000",
+}
+
+_RANKING_RESCUE_ENV_APPLIED = False
+
+
+def _ranking_rescue_scope_enabled() -> bool:
+    """このプロセスで RANKING final rescue を使うか。
+
+    旧パッチは sitecustomize の RANKING_RESCUE_PATCHES = opt-in グループ
+    (既定 OFF) 経由で、main lite の background loop か
+    SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1 のときだけ install されていた。
+    RANKING_FINAL_RESCUE_SCOPE_ENABLED=1/0 で明示上書きできる。
+    """
+    try:
+        raw = os.getenv("RANKING_FINAL_RESCUE_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool("RANKING_FINAL_RESCUE_SCOPE_ENABLED", False)
+        if str(os.environ.get("DISABLE_RANKING_FINAL_RESCUE_PATCH", "")).strip() == "1":
+            return False
+        if not (
+            _env_bool("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES", False)
+            or _env_bool("SITECUSTOMIZE_ENABLE_RANKING_FINAL_RESCUE_PATCH", False)
+            or _env_bool("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES", False)
+        ):
+            return False
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_list)
+        if any(name in argv for name in _RANKING_RESCUE_DB_PROCESS_NAMES):
+            return False
+        if any(_env_bool(name, False) for name in _RANKING_RESCUE_DB_PROCESS_ENVS):
+            return False
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv_list) and _env_bool("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _ranking_rescue_apply_env_defaults() -> None:
+    """旧 install() の env 副作用を、有効なときだけ 1 度だけ再現する。
+
+    LOW_MOVE_RANKING_* / RANKING_ENTRY_RESCUE_* は
+    low_movement_entry_guard_patch や ranking_entry_filter_rescue_patch が
+    ガード実行時に読む。range_5m_filter の softpass (volatility_filter) も
+    RANKING_FINAL_RESCUE_MIN_SCORE 等を atr_1m_filter より前に読むため、
+    このモジュールの import 時点で確定させる。
+    他の書き手はすべて setdefault なので、先に確定させても上書きされない。
+    """
+    global _RANKING_RESCUE_ENV_APPLIED
+    if _RANKING_RESCUE_ENV_APPLIED:
+        return
+    _RANKING_RESCUE_ENV_APPLIED = True
+    try:
+        changed = {}
+        for k, v in _RANKING_RESCUE_FORCED_ENV.items():
+            old = os.environ.get(k)
+            os.environ[k] = v
+            if old != v:
+                changed[k] = (old, v)
+        if changed:
+            logger.warning("[RANKING FINAL RESCUE] forced early ranking rescue env changed=%s", changed)
+
+        os.environ.setdefault("RANKING_FINAL_RESCUE_MIN_VOLUME", "30000")
+        os.environ.setdefault("RANKING_FINAL_RESCUE_SOFTPASS_MAX_RANGE_PCT", "0.0025")
+        os.environ.setdefault("RANKING_FINAL_RESCUE_ATR_FAILOPEN", "1")
+        os.environ.setdefault("RANKING_FINAL_RESCUE_ATR_MIN_RATIO", "0.0005")
+        # RANKING_FINAL_RESCUE_RANGE_ERROR_FAILOPEN / _AI_FAILOPEN / _AI_CONFIDENCE /
+        # _AI_REASONS は読み手が旧 patched_ai (常時 no-op) だけだったので移していない。
+    except Exception:
+        logger.exception("[RANKING FINAL RESCUE] env defaults failed")
+
+
+def _ranking_rescue_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _ranking_rescue_row_dict(v: Any) -> dict:
+    try:
+        if isinstance(v, dict):
+            return v
+        if hasattr(v, "to_dict"):
+            d = v.to_dict()
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _ranking_rescue_sf(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _ranking_rescue_is_ranking_row(row: Any) -> bool:
+    d = _ranking_rescue_row_dict(row)
+    try:
+        src = str(d.get("source") or d.get("pipeline_source") or d.get("entry_source") or "").strip().upper()
+        et = str(d.get("entry_type") or d.get("type") or d.get("strategy") or "").strip().upper()
+        return src == "RANKING" or et == "RANKING" or d.get("rank_type") is not None
+    except Exception:
+        return False
+
+
+def _ranking_rescue_score(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    return max(
+        _ranking_rescue_sf(d.get("pending_score"), 0.0),
+        _ranking_rescue_sf(d.get("score"), 0.0),
+        _ranking_rescue_sf(d.get("score_buy"), 0.0),
+        _ranking_rescue_sf(d.get("score_sell"), 0.0),
+        _ranking_rescue_sf(d.get("ranking_score"), 0.0),
+        _ranking_rescue_sf(d.get("final_score"), 0.0),
+        _ranking_rescue_sf(d.get("display_score"), 0.0),
+        _ranking_rescue_sf(d.get("score_total"), 0.0),
+    )
+
+
+def _ranking_rescue_price(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    return _ranking_rescue_sf(d.get("close_price") or d.get("close") or d.get("price") or d.get("current_price"), 0.0)
+
+
+def _ranking_rescue_atr(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    return _ranking_rescue_sf(d.get("atr_1m") or d.get("atr") or d.get("ATR") or d.get("atr14") or d.get("atr_14"), 0.0)
+
+
+def _ranking_rescue_volume(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    return _ranking_rescue_sf(d.get("volume") or d.get("Volume") or d.get("trading_volume"), 0.0)
+
+
+def _ranking_rescue_turnover(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    price = _ranking_rescue_price(row)
+    vol = _ranking_rescue_volume(row)
+    explicit = _ranking_rescue_sf(
+        d.get("turnover")
+        or d.get("turnover_raw")
+        or d.get("trading_value")
+        or d.get("trading_amount")
+        or d.get("turnover_value")
+        or d.get("amount"),
+        0.0,
+    )
+    if explicit > 0:
+        return explicit
+    if price > 0 and vol > 0:
+        return price * vol
+    return 0.0
+
+
+def _ranking_rescue_day_pct(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    return _ranking_rescue_sf(
+        d.get("day_change_pct")
+        or d.get("change_pct")
+        or d.get("change_percentage")
+        or d.get("change_rate")
+        or d.get("day")
+        or d.get("day_pct"),
+        0.0,
+    )
+
+
+def _ranking_rescue_high_low_close(row: Any) -> tuple[float, float, float]:
+    d = _ranking_rescue_row_dict(row)
+    high = _ranking_rescue_sf(d.get("high_price") or d.get("high") or d.get("High"), 0.0)
+    low = _ranking_rescue_sf(d.get("low_price") or d.get("low") or d.get("Low"), 0.0)
+    return high, low, _ranking_rescue_price(row)
+
+
+def _ranking_rescue_range_pct(row: Any) -> float:
+    high, low, close = _ranking_rescue_high_low_close(row)
+    if high > 0 and low > 0 and close > 0 and high >= low:
+        return max(0.0, (high - low) / close)
+    return 0.0
+
+
+def _ranking_rescue_ok(row: Any) -> bool:
+    if not _ranking_rescue_is_ranking_row(row):
+        return False
+    sc = _ranking_rescue_score(row)
+    price = _ranking_rescue_price(row)
+    vol = _ranking_rescue_volume(row)
+    min_score = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_MIN_SCORE", 50.0)
+    min_volume = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_MIN_VOLUME", 30000.0)
+    if price <= 0:
+        return False
+    if sc < min_score:
+        return False
+    if min_volume > 0 and vol < min_volume:
+        return False
+    return True
+
+
+def _ranking_rescue_low_move_soft_ok(row: Any) -> bool:
+    if not _ranking_rescue_ok(row):
+        return False
+
+    turnover = _ranking_rescue_turnover(row)
+    day_abs = abs(_ranking_rescue_day_pct(row))
+    min_turnover = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_MIN_TURNOVER", 30000000.0)
+    min_day_abs = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_MIN_DAY_ABS_PCT", 0.0)
+    if min_turnover > 0 and turnover < min_turnover:
+        return False
+    if min_day_abs > 0 and day_abs < min_day_abs:
+        return False
+
+    high, low, close = _ranking_rescue_high_low_close(row)
+    atr = _ranking_rescue_atr(row)
+    if atr <= 0:
+        return True
+    if not (high > 0 and low > 0 and close > 0 and high > low):
+        return True
+
+    max_range = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_SOFTPASS_MAX_RANGE_PCT", 0.0025)
+    return _ranking_rescue_range_pct(row) <= max_range
+
+
+def _ranking_final_rescue_atr(entry_row: Any, ret: Any) -> Any:
+    """atr_1m_filter の結果に噛ませる。旧 patched_atr の後段そのもの。"""
+    if not _ranking_rescue_scope_enabled():
+        return ret
+    try:
+        if bool(ret):
+            return ret
+        if not _env_bool("RANKING_FINAL_RESCUE_ATR_FAILOPEN", True):
+            return ret
+        if not _ranking_rescue_ok(entry_row):
+            return ret
+        price = _ranking_rescue_price(entry_row)
+        atr = _ranking_rescue_atr(entry_row)
+        ratio = (atr / price) if price > 0 else 0.0
+        min_ratio = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_ATR_MIN_RATIO", 0.0005)
+        if atr > 0 and ratio >= min_ratio:
+            logger.warning(
+                "[RANKING FINAL RESCUE] ATR fail-open symbol=%s score=%.3f atr=%.6f price=%.3f ratio=%.6f min_ratio=%.6f",
+                _ranking_rescue_row_dict(entry_row).get("symbol"), _ranking_rescue_score(entry_row), atr, price, ratio, min_ratio,
+            )
+            return True
+        if _env_bool("RANKING_FINAL_RESCUE_ATR_SOFTPASS", True) and _ranking_rescue_low_move_soft_ok(entry_row):
+            logger.warning(
+                "[RANKING FINAL RESCUE] ATR soft-pass symbol=%s score=%.3f atr=%.6f price=%.3f ratio=%.6f turnover=%.0f day=%.3f range_pct=%.6f",
+                _ranking_rescue_row_dict(entry_row).get("symbol"), _ranking_rescue_score(entry_row), atr, price, ratio,
+                _ranking_rescue_turnover(entry_row), _ranking_rescue_day_pct(entry_row), _ranking_rescue_range_pct(entry_row),
+            )
+            return True
+        return ret
+    except Exception:
+        return ret
+
+
+# ============================================================
+# TONOSAMA 専用ゲートのブリッジ
+#   旧 core/startup/entry_controller_tonosama_ai_bridge_patch.py (V3)
+# ------------------------------------------------------------
+# TONOSAMA は先に allow_tonosama_entry() / allow_sell_tonosama_entry() で
+# 専用判定を通しているのに、その後 SUMMARY 用の汎用 AI.entry_gate も通るため
+# low_turnover などで落ちてしまう。TONOSAMA の場合だけ「専用判定済み」として
+# AI 結果を OK に置き換える。SUMMARY / RANKING には影響させない。
+#
+# ただし ENTRY VOLUME DIRECTION GUARD や 3m5m candle guard の hard_reject は
+# 尊重する (V2)。TONOSAMA_DEDICATED_GATE_OK / TONOSAMA_OK が理由に入っていれば
+# 古い reject フラグが残っていても NG 扱いしない (V3)。
+#
+# 旧パッチは ec.ai_final_entry_check / ec._passes_ai_gate をモジュール属性ごと
+# 差し替えていた。どちらも読み手は下の呼び出し 1 箇所だけなので、
+# 呼び出し側で結果に噛ませる形にした。これで
+#   summary_ai_entry_controller_bridge_patch / entry_volume_direction_guard_patch
+#   entry_controller_final_gate_relax_patch
+# など他のラッパーの上に載る = 旧構成と同じ最外周の位置を保てる。
+# ============================================================
+_TONOSAMA_BRIDGE_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+_TONOSAMA_BRIDGE_DB_PROCESS_ENVS = (
+    "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+    "AUTOSTOCK_SUMMARY_DB_WRITER",
+    "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+    "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+)
+
+_TONOSAMA_BRIDGE_REJECT_TOKENS = (
+    "HARD_REJECT",
+    "VOLUME_DIRECTION_REJECT",
+    "TONOSAMA_BUY_REJECT",
+    "TONOSAMA_SELL_REJECT",
+    "TONOSAMA_REJECT",
+    "REJECT_3M5M",
+    "3M5M_CANDLE_REJECT",
+    "NO_STRONG_3M5M",
+    "MA5_DOWN_AND_PRICE_BELOW",
+    "MA5_UP_AND_PRICE_ABOVE",
+    "VOLUME_SURGE_AFTER_UP_MOVE",
+    "VOLUME_SURGE_AFTER_DOWN_MOVE",
+)
+
+_TONOSAMA_BRIDGE_OK_TOKENS = (
+    "TONOSAMA_DEDICATED_GATE_OK",
+    "TONOSAMA_OK",
+    "RULE_OK",
+)
+
+
+def _tonosama_bridge_scope_enabled() -> bool:
+    """このプロセスで TONOSAMA ブリッジを使うか。
+
+    旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由 (既定 ON) で、
+    main lite の background loop か SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1 の
+    ときだけ install されていた。
+    ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE_SCOPE_ENABLED=1/0 で明示上書きできる。
+    """
+    try:
+        raw = os.getenv("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE_SCOPE_ENABLED", False)
+        if str(os.environ.get("DISABLE_TONOSAMA_AI_BRIDGE_PATCH", "")).strip() == "1":
+            return False
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_list)
+        if any(name in argv for name in _TONOSAMA_BRIDGE_DB_PROCESS_NAMES):
+            return False
+        if any(_env_bool(name, False) for name in _TONOSAMA_BRIDGE_DB_PROCESS_ENVS):
+            return False
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv_list) and _env_bool("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _tonosama_bridge_sf(v: Any, default: float = 0.0) -> float:
+    """旧パッチの _sf。カンマ除去をしない点が本ファイルの _safe_float と違う。"""
+    try:
+        if v is None or str(v).strip() == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _tonosama_bridge_su(v: Any) -> str:
+    try:
+        return str(v or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _tonosama_bridge_is_tonosama(row: Any) -> bool:
+    try:
+        return isinstance(row, dict) and (
+            _tonosama_bridge_su(row.get("source")) == "TONOSAMA"
+            or _tonosama_bridge_su(row.get("entry_type")) == "TONOSAMA"
+        )
+    except Exception:
+        return False
+
+
+def _tonosama_bridge_score(row: dict, side: str) -> float:
+    base = _tonosama_bridge_sf(row.get("score"), 0.0)
+    raw = _tonosama_bridge_sf(row.get("_tonosama_score"), 0.0)
+    buy = _tonosama_bridge_sf(row.get("score_buy"), base)
+    sell = _tonosama_bridge_sf(row.get("score_sell"), 0.0)
+    if _tonosama_bridge_su(side) == "SELL":
+        return max(abs(base), abs(raw), abs(sell))
+    return max(base, raw, buy)
+
+
+def _tonosama_bridge_joined_text(*vals: Any) -> str:
+    try:
+        return " ".join(str(v or "") for v in vals).upper()
+    except Exception:
+        return ""
+
+
+def _tonosama_bridge_txt_contains_reject(*vals: Any) -> bool:
+    text = _tonosama_bridge_joined_text(*vals)
+    return any(tok in text for tok in _TONOSAMA_BRIDGE_REJECT_TOKENS)
+
+
+def _tonosama_bridge_txt_contains_ok(*vals: Any) -> bool:
+    text = _tonosama_bridge_joined_text(*vals)
+    return any(tok in text for tok in _TONOSAMA_BRIDGE_OK_TOKENS)
+
+
+def _tonosama_bridge_is_hard_reject(ai: Any) -> tuple[bool, str]:
+    if not isinstance(ai, dict):
+        return False, ""
+    try:
+        reason_text = _tonosama_bridge_joined_text(
+            ai.get("reason"),
+            ai.get("gate_reason"),
+            ai.get("ai_reason"),
+            ai.get("detail"),
+        )
+
+        # 最重要: TONOSAMA専用ゲートOKは、古い reject フラグが残っていてもNG扱いしない。
+        if _tonosama_bridge_txt_contains_ok(reason_text):
+            return False, ""
+
+        for k in ("hard_reject", "volume_direction_reject", "reject", "is_reject"):
+            if bool(ai.get(k)):
+                return True, str(ai.get("reason") or ai.get("gate_reason") or ai.get("ai_reason") or k)
+
+        # 明示的なFalse系を尊重する。ただし理由がOKなら上で除外済み。
+        for k in ("allow", "allowed", "is_allowed", "ai_allow", "passed", "ok"):
+            if k in ai and ai.get(k) is False:
+                reason = str(ai.get("reason") or ai.get("gate_reason") or ai.get("ai_reason") or k)
+                if _tonosama_bridge_txt_contains_reject(reason, ai.get("detail"), ai.get("volume_direction")):
+                    return True, reason
+
+        if _tonosama_bridge_txt_contains_reject(ai.get("reason"), ai.get("gate_reason"), ai.get("ai_reason"), ai.get("detail"), ai.get("volume_direction")):
+            return True, str(ai.get("reason") or ai.get("gate_reason") or ai.get("ai_reason") or "TONOSAMA_HARD_REJECT_REASON")
+    except Exception:
+        pass
+    return False, ""
+
+
+def _tonosama_bridge_force_ng(reason: str, ai: Any | None = None) -> dict:
+    out = dict(ai) if isinstance(ai, dict) else {}
+    for k in ("allow", "allowed", "is_allowed", "ai_allow", "passed", "ok"):
+        out[k] = False
+    for k in ("confidence", "ai_confidence", "conf"):
+        out[k] = 0.0
+    out["reason"] = reason or out.get("reason") or "TONOSAMA_HARD_REJECT"
+    out["gate_reason"] = reason or out.get("gate_reason") or "TONOSAMA_HARD_REJECT"
+    out["ai_reason"] = reason or out.get("ai_reason") or "TONOSAMA_HARD_REJECT"
+    out["hard_reject"] = True
+    out["tonosama_bridge_respected_reject"] = True
+    return out
+
+
+def _tonosama_bridge_force_ok(row: dict, side: str) -> dict:
+    s = _tonosama_bridge_score(row, side)
+    reason = "TONOSAMA_DEDICATED_GATE_OK"
+    return {
+        "allow": True,
+        "allowed": True,
+        "is_allowed": True,
+        "ai_allow": True,
+        "passed": True,
+        "ok": True,
+        "reject": False,
+        "is_reject": False,
+        "hard_reject": False,
+        "volume_direction_reject": False,
+        "confidence": 1.0,
+        "ai_confidence": 1.0,
+        "conf": 1.0,
+        "reason": reason,
+        "gate_reason": reason,
+        "ai_reason": reason,
+        "detail": reason,
+        "lot_multiplier": 1.0,
+        "score": s,
+    }
+
+
+def _tonosama_bridge_ai_result(row: dict, orig_ai: Any):
+    """ai_final_entry_check() の結果に噛ませる。旧 _ai_check の後段そのもの。"""
+    if not _tonosama_bridge_scope_enabled():
+        return orig_ai
+    try:
+        hard, reason = _tonosama_bridge_is_hard_reject(orig_ai)
+        if hard:
+            logger.warning(
+                "[TONOSAMA AI BRIDGE] keep NG reason=%s source=%s entry_type=%s symbol=%s side=%s",
+                reason,
+                row.get("source") if isinstance(row, dict) else None,
+                row.get("entry_type") if isinstance(row, dict) else None,
+                row.get("symbol") if isinstance(row, dict) else None,
+                row.get("side") if isinstance(row, dict) else None,
+            )
+            return _tonosama_bridge_force_ng(reason, orig_ai)
+
+        if _env_bool("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", True) and _tonosama_bridge_is_tonosama(row):
+            side = _tonosama_bridge_su(row.get("entry_decision") or row.get("side"))
+            return _tonosama_bridge_force_ok(row, side)
+        return orig_ai
+    except Exception:
+        logger.debug("[TONOSAMA AI BRIDGE] ai check bridge failed", exc_info=True)
+        return orig_ai
+
+
+def _tonosama_bridge_pass_check(row: dict, ai: dict, side: str):
+    """_passes_ai_gate() の前段。旧 _pass_check 相当。
+
+    ブリッジが判断しないケースは、モジュール属性の _passes_ai_gate を
+    呼び直す (entry_controller_final_gate_relax_patch のラッパーを尊重するため)。
+    """
+    if not _tonosama_bridge_scope_enabled():
+        return _passes_ai_gate(row, ai, side=side)
+    try:
+        if _env_bool("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", True) and _tonosama_bridge_is_tonosama(row) and _tonosama_bridge_txt_contains_ok(
+            ai.get("reason") if isinstance(ai, dict) else None,
+            ai.get("gate_reason") if isinstance(ai, dict) else None,
+            ai.get("ai_reason") if isinstance(ai, dict) else None,
+            ai.get("detail") if isinstance(ai, dict) else None,
+        ):
+            s = _tonosama_bridge_score(row, side)
+            min_s = _tonosama_bridge_sf(os.getenv("ENTRY_CONTROLLER_TONOSAMA_MIN_SCORE"), 0.01)
+            if s < min_s:
+                return False, f"TONOSAMA_SCORE_LOW:{s:.3f}<{min_s:.3f}"
+            logger.warning(
+                "[TONOSAMA AI BRIDGE] accept dedicated ok source=%s entry_type=%s symbol=%s side=%s score=%.4f",
+                row.get("source"),
+                row.get("entry_type"),
+                row.get("symbol"),
+                side,
+                s,
+            )
+            return True, f"TONOSAMA_OK score={s:.3f}"
+
+        hard, reason = _tonosama_bridge_is_hard_reject(ai)
+        if hard:
+            logger.warning(
+                "[TONOSAMA AI BRIDGE] reject preserved source=%s entry_type=%s symbol=%s side=%s reason=%s",
+                row.get("source") if isinstance(row, dict) else None,
+                row.get("entry_type") if isinstance(row, dict) else None,
+                row.get("symbol") if isinstance(row, dict) else None,
+                side,
+                reason,
+            )
+            return False, reason or "TONOSAMA_HARD_REJECT"
+
+        if _env_bool("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", True) and _tonosama_bridge_is_tonosama(row):
+            s = _tonosama_bridge_score(row, side)
+            min_s = _tonosama_bridge_sf(os.getenv("ENTRY_CONTROLLER_TONOSAMA_MIN_SCORE"), 0.01)
+            if s < min_s:
+                return False, f"TONOSAMA_SCORE_LOW:{s:.3f}<{min_s:.3f}"
+            logger.warning(
+                "[TONOSAMA AI BRIDGE] accept source=%s entry_type=%s symbol=%s side=%s score=%.4f ai_reason=%s",
+                row.get("source"),
+                row.get("entry_type"),
+                row.get("symbol"),
+                side,
+                s,
+                ai.get("reason") if isinstance(ai, dict) else "",
+            )
+            return True, f"TONOSAMA_OK score={s:.3f}"
+    except Exception:
+        logger.exception("[TONOSAMA AI BRIDGE] pass bridge failed")
+    return _passes_ai_gate(row, ai, side=side)
+
+
+def _passes_ai_gate_core(entry_row: dict, ai: dict, side: str) -> tuple[bool, str]:
     if not isinstance(ai, dict):
         return False, "AI_RESULT_INVALID"
 
@@ -874,7 +1648,7 @@ def _apply_ma5_third_bar_slope_guard(symbol: str, scored_candidates: list[dict])
         kept = []
         skipped = []
         for item in list(scored_candidates or []):
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or item.get("tonosama_validated"):
                 kept.append(item)
                 continue
             ok, diag = _ma5_third_bar_passes_guard(item)
@@ -1002,6 +1776,13 @@ def _build_scored_candidates(
             if "source" not in entry_row or not entry_row.get("source"):
                 entry_row["source"] = entry.get("source")
 
+            # 2026-09-16 (C9): 未約定キャンセル→再queue の回数を entry_row に引き継ぐ。
+            #   entry_order_builder が round 0 は自分側気配 (受け身)、round>=1 は
+            #   相手側気配 (従来の攻め指値) を選ぶための材料。
+            for _rk in ("summary_retry_round", "summary_retry_prev_order_id", "retry_reprice_reason"):
+                if entry.get(_rk) is not None and entry_row.get(_rk) is None:
+                    entry_row[_rk] = entry.get(_rk)
+
             if _normalize_interval(entry_row.get("interval")) is None:
                 entry_row["interval"] = _normalize_interval(entry.get("interval"))
             else:
@@ -1059,6 +1840,41 @@ def _build_scored_candidates(
                         logger.exception("SELL_TONOSAMA failed symbol=%s", symbol)
                         continue
 
+            # 2026-10-13: 検証どおりの殿様イナゴ (trading/entry/tonosama/validated_signal.py) は、検証に無い
+            #   汎用ゲート (殿様 AI モデル / ATR / RANGE_5M / 3m5m MA・点数 / AI ゲート / MA5 3 本目) を通さない。
+            #   日次リスク・時間帯・板・発注直前の当日騰落/スプレッド/板ガードは _execute_best_candidate 側で残る。
+            #   戻すなら TONOSAMA_BYPASS_GENERIC_GATES=0。
+            if side == "BUY" and tonosama_required:
+                try:
+                    from trading.entry.tonosama import validated_signal as _tv
+                    _tv_on = _tv.bypass_enabled() and _tv.is_validated_entry(entry, entry_row)
+                except Exception:
+                    logger.exception("[TONOSAMA VALIDATED] bypass check failed symbol=%s", symbol)
+                    _tv_on = False
+                if _tv_on:
+                    _tv_reason = _safe_str(entry.get("tonosama_validated_reason") or entry_row.get("tonosama_validated_reason") or "TONOSAMA_VALIDATED")
+                    entry_row["tonosama_validated"] = True
+                    ai = {"ok": True, "decision": "BUY", "confidence": 1.0, "lot_multiplier": 1.0,
+                          "reason": _tv_reason, "tonosama_validated": True}
+                    logger.warning("[TONOSAMA VALIDATED] bypass generic gates symbol=%s %s", symbol, _tv_reason)
+                    scored_candidates.append(
+                        {
+                            "symbol": symbol,
+                            "entry": entry,
+                            "entry_row": entry_row,
+                            "entry_type": entry_type,
+                            "side": side,
+                            "ai": ai,
+                            "ai_msg": "TONOSAMA_VALIDATED",
+                            "priority_score": 1000.0 + _safe_float(entry.get("final_score"), 0.0),
+                            "confidence": 1.0,
+                            "score_buy": _safe_float(entry.get("score_buy"), 0.0),
+                            "score_sell": 0.0,
+                            "tonosama_validated": True,
+                        }
+                    )
+                    continue
+
             if side == "BUY" and tonosama_required:
                 try:
                     if not allow_tonosama_entry(symbol):
@@ -1069,7 +1885,7 @@ def _build_scored_candidates(
                     continue
 
             try:
-                if not atr_1m_filter(entry_row):
+                if not _ranking_final_rescue_atr(entry_row, atr_1m_filter(entry_row)):
                     _log_skip(symbol, "ATR_1M_FILTER_NG", side=side)
                     continue
             except Exception:
@@ -1084,9 +1900,57 @@ def _build_scored_candidates(
                 logger.exception("RANGE_5M_FILTER failed symbol=%s", symbol)
                 continue
 
-            ai = ai_final_entry_check(entry_row)
+            # 2026-09-15: 3 分足 / 5 分足の 5MA・25MA ゲート (全経路共通)。
+            #   SUMMARY 経路は 3m/5m の MA を見ていなかった (ランキング経路だけ
+            #   f864193 で入っていた)。ここは全 source が通る唯一の場所なので
+            #   ここで 1 回だけ判定する。データ無しは fail-closed。
+            #   詳細は trading/filters/mtf_ma_gate.py。
+            try:
+                _mtf_ok, _mtf_reason = mtf_ma_gate(symbol, side, entry_row)
+            except Exception:
+                logger.exception("MTF_MA_GATE failed symbol=%s (fail-closed)", symbol)
+                _mtf_ok, _mtf_reason = False, "MTF_MA_GATE_ERROR"
+            logger.info("[MTF MA GATE] symbol=%s side=%s ok=%s %s", symbol, side, _mtf_ok, _mtf_reason)
+            if not _mtf_ok:
+                _log_skip(symbol, "MTF_MA_GATE_NG", side=side, reason=_mtf_reason)
+                continue
 
-            ai_ok, ai_msg = _passes_ai_gate(entry_row, ai, side=side)
+            # 2026-09-15: score_config.ini の点数を 3 分足 / 5 分足の指標で計算し直す
+            #   ゲート。両方の足で MIN (SUMMARY_ENTRY_MIN_SCORE=3.0) 以上が必要。
+            #   詳細は trading/filters/mtf_score_gate.py。
+            try:
+                _mts_ok, _mts_reason = mtf_score_gate(symbol, side)
+            except Exception:
+                logger.exception("MTF_SCORE_GATE failed symbol=%s (fail-closed)", symbol)
+                _mts_ok, _mts_reason = False, "MTF_SCORE_GATE_ERROR"
+            logger.info("[MTF SCORE GATE] symbol=%s side=%s ok=%s %s", symbol, side, _mts_ok, _mts_reason)
+            if not _mts_ok:
+                _log_skip(symbol, "MTF_SCORE_GATE_NG", side=side, reason=_mts_reason)
+                continue
+            # 2026-09-16: AI ゲート (ai_final_entry_check) は 1 分足の score_buy/score_sell が
+            #   3.0 未満だと BUY_SCORE_LOW / BUY_COMPOSITE_LOW で落とす。RANKING 由来の行は
+            #   1 分足の ini 点数が小さい (5020: 0.74) ので、3m/5m ゲートを通っても AI ゲートで
+            #   止まっていた。判定の根拠を 3m/5m に揃えるため、3m と 5m の ini 点数の小さい方を
+            #   行の score_buy/score_sell (と score) に反映する (元の値より大きい時だけ)。
+            try:
+                from trading.filters.mtf_score_gate import last_scores as _mtf_last_scores
+                _sc = _mtf_last_scores(symbol, side)
+                if _sc:
+                    _mtf_min = float(min(_sc.values()))
+                    _key = "score_buy" if str(side).upper() == "BUY" else "score_sell"
+                    _cur = _safe_float(entry_row.get(_key), 0.0)
+                    if _mtf_min > _cur:
+                        entry_row[_key] = _mtf_min
+                        entry_row["score"] = max(_safe_float(entry_row.get("score"), 0.0), _mtf_min)
+                        entry_row["score_total"] = max(_safe_float(entry_row.get("score_total"), 0.0), _mtf_min)
+                        entry_row["mtf_ini_score"] = _mtf_min
+                        logger.info("[MTF SCORE GATE] row score lifted symbol=%s side=%s %s %.2f -> %.2f", symbol, side, _key, _cur, _mtf_min)
+            except Exception:
+                logger.debug("[MTF SCORE GATE] score lift failed symbol=%s", symbol, exc_info=True)
+
+            ai = _tonosama_bridge_ai_result(entry_row, ai_final_entry_check(entry_row))
+
+            ai_ok, ai_msg = _tonosama_bridge_pass_check(entry_row, ai, side=side)
             if not ai_ok:
                 _log_skip(
                     symbol,
@@ -1157,7 +2021,7 @@ def _build_scored_candidates(
 #  core/startup/final_entry_duplicate_cooldown_patch.py [重複発注クールダウン] +
 #  core/startup/entry_execute_timeout_guard_patch.py [経過候補ガード+タイムアウト実行] +
 #  trading/audit_logging/entry_controller_audit_patch.py [監査ログ] +
-#  core/startup/entry_summary_retry_rotation_runtime_patch.py [未約定キャンセル後の再queue用item記憶])
+#  trading/handlers/entry_retry_rotation.py [未約定キャンセル後の再queue用item記憶])
 #
 # 発見した不具合と対応:
 #   - entry_daily_risk_runtime_patch は final_entry_safety_guard_patch の
@@ -1167,7 +2031,7 @@ def _build_scored_candidates(
 #     (銘柄別上限・日次損失上限・連敗停止が常に無効)。本文化で修復し有効化する。
 #   - final_entry_duplicate_cooldown_patch はどこからも import されておらず
 #     完全なデッドコードだった。本文化して実際に機能させる。
-#   - entry_summary_retry_rotation_runtime_patch は対象の item を
+#   - entry_retry_rotation は対象の item を
 #     threading.local() 経由で受け渡していたが、entry_execute_timeout_guard_patch
 #     が別スレッドで発注本体を実行するため、そのスレッドからは空に見え
 #     再queue用の記憶が機能しないケースがあった。本文化で item を直接渡す形にして解消。
@@ -1227,7 +2091,7 @@ def _daily_risk_now_iso() -> str:
 def _daily_risk_db_path() -> str:
     base = os.getenv(
         "TRADE_GUARD_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\trade_guard",
+        nas_path(r"raw_data\trade_guard"),
     )
     return os.getenv("TRADE_GUARD_DB_PATH", str(Path(base) / f"trade_guard{_daily_risk_today()}.db"))
 
@@ -1438,7 +2302,8 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[st
         return False, "", {}
     symbol = normalize_symbol(symbol)
     side_u = str(side or "").upper()
-    if side_u == "BUY" and not _env_bool("ENTRY_BUY_ENABLED", True):
+    # 2026-10-19: 既定で新規買いを止める (ユーザー判断)。kabu_api/buy_sell_entry._buy_entry_disabled と同じ env。
+    if side_u == "BUY" and not _env_bool("ENTRY_BUY_ENABLED", False):
         return True, "BUY_DISABLED_BY_DAILY_RISK_PATCH", {"symbol": symbol, "side": side_u}
 
     try:
@@ -1448,10 +2313,12 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[st
         logger.exception("[ENTRY DAILY RISK] db read failed symbol=%s -> fail-open", symbol)
         return False, "", {}
 
-    max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 2)
-    winning_max_entries = _env_int("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES", 4)
-    symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -1500.0)
-    stop_after_first_loss = _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", True)
+    # 2026-10-14: 同じ銘柄の制限を緩和 (ユーザー判断)。回数 2->4 (勝ち銘柄 4->6)、1 回負けたら停止 -> 停止しない、
+    #   銘柄ごとの損失上限 -1,500 -> -5,000 円 (10/14 夜に -3,000 円 + 1 日 2 敗で停止へ締め直し)、発注回数 6->10。
+    max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 4)
+    winning_max_entries = _env_int("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES", 6)
+    symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -3000.0)
+    stop_after_first_loss = _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", False)
     stop_after_first_loss_only_net_negative = _env_bool("ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE", True)
     global_max_loss = _env_float("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", -50000.0)
     global_max_trades = _env_int("ENTRY_GLOBAL_MAX_DAILY_TRADES", 30)
@@ -1485,8 +2352,24 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[st
         if not (stop_after_first_loss_only_net_negative and winning_symbol and daily_pnl > 0):
             return True, "SYMBOL_STOP_AFTER_FIRST_LOSS", {"symbol": symbol, "side": side_u, "winning_symbol": winning_symbol, **srow}
 
+    # 2026-10-14 夜: 緩和初日に 593A が後場の入り直し 7 回で -3,530 円。1 日 2 敗でその銘柄を止める (0 で無効)。
+    max_symbol_losses = _env_int("ENTRY_SYMBOL_MAX_DAILY_LOSSES", 2)
+    if max_symbol_losses > 0 and loss_count >= max_symbol_losses:
+        return True, "SYMBOL_DAILY_LOSS_COUNT_LIMIT", {"symbol": symbol, "side": side_u, "max_losses": max_symbol_losses, **srow}
+
     if float(srow.get("daily_pnl") or 0.0) <= symbol_max_loss:
         return True, "SYMBOL_DAILY_LOSS_LIMIT", {"symbol": symbol, "side": side_u, "max_loss": symbol_max_loss, **srow}
+
+    # 2026-10-07: 約定しなかった (受け身指値が 4 秒で取消された) 発注まで回数に数えていて、
+    #   2 回出しただけでその銘柄は当日入れなくなっていた (485A / 3436、13 時台に 11 件)。
+    #   回数上限は「実際に約定して返済した回数」で見る。発注の連打だけは別の上限 (既定 6 回) で止める。
+    if _env_bool("ENTRY_DAILY_LIMIT_COUNT_FILLED_ONLY", True):
+        symbol_seen_entries = entry_count
+        max_sends = _env_int("ENTRY_MAX_DAILY_SENDS_PER_SYMBOL", 10)
+        if max_sends > 0 and entry_sent_count >= max_sends:
+            return True, "SYMBOL_DAILY_SEND_LIMIT", {
+                "symbol": symbol, "side": side_u, "max_sends": max_sends, **srow,
+            }
 
     if effective_max_entries > 0 and symbol_seen_entries >= effective_max_entries:
         return True, "SYMBOL_DAILY_ENTRY_LIMIT", {
@@ -1521,8 +2404,16 @@ def _final_guard_entry_time_ok(symbol: str, side: str) -> bool:
     now = dt.datetime.now().time()
     bh, bm = _final_guard_parse_hhmm(os.getenv("ENTRY_NO_NEW_BEFORE", "09:05"), 9, 5)
     ah, am = _final_guard_parse_hhmm(os.getenv("ENTRY_NO_NEW_AFTER", "15:20"), 15, 20)
-    if now < dt.time(bh, bm) or now >= dt.time(ah, am):
+    if now < dt.time(bh, bm):
         return False
+    if now >= dt.time(ah, am):
+        # 2026-10-19: ENTRY_NO_NEW_AFTER (15:00) 以降は制度信用なら新規してよい (ユーザー判断)。
+        #   信用区分は kabu_api/send_order.send_order_common が 15:00 以降の新規を制度 (MarginTradeType=1) に書き換える。
+        #   日計りの強制決済 (15:24:30) は MarginTradeType=3 だけが対象なので、制度の建玉は持ち越しになる。
+        if not _env_bool("ENTRY_AFTER_CUTOFF_SEIDO_ENABLED", True):
+            return False
+        sh2, sm2 = _final_guard_parse_hhmm(os.getenv("ENTRY_SEIDO_NO_NEW_AFTER", "15:24"), 15, 24)
+        return now < dt.time(sh2, sm2)
     if _env_bool("ENTRY_LUNCH_GUARD_ENABLED", True):
         sh, sm = _final_guard_parse_hhmm(os.getenv("ENTRY_LUNCH_BLOCK_START", "11:30"), 11, 30)
         eh, em = _final_guard_parse_hhmm(os.getenv("ENTRY_LUNCH_BLOCK_END", "12:30"), 12, 30)
@@ -1561,6 +2452,9 @@ def _final_guard_recent_reverse_ok(row: dict, symbol: str, side: str) -> bool:
 def _final_guard_extract_bid_ask(row: dict) -> tuple[float, float, float, float]:
     bid = _safe_float(_guard_first(row, ("bid", "best_bid", "BidPrice", "bid_price"), 0.0), 0.0)
     ask = _safe_float(_guard_first(row, ("ask", "best_ask", "AskPrice", "ask_price"), 0.0), 0.0)
+    # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+    if bid > 0 and ask > 0 and bid > ask:
+        bid, ask = ask, bid
     bid_qty = _safe_float(_guard_first(row, ("bid_qty", "best_bid_qty", "BidQty", "bid_volume"), 0.0), 0.0)
     ask_qty = _safe_float(_guard_first(row, ("ask_qty", "best_ask_qty", "AskQty", "ask_volume"), 0.0), 0.0)
     return bid, ask, bid_qty, ask_qty
@@ -1585,6 +2479,9 @@ def _final_guard_try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, fl
         if isinstance(res, dict):
             bid = _safe_float(res.get("bid") or res.get("best_bid") or res.get("BidPrice") or res.get("bid_price"), 0.0)
             ask = _safe_float(res.get("ask") or res.get("best_ask") or res.get("AskPrice") or res.get("ask_price"), 0.0)
+            # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+            if bid > 0 and ask > 0 and bid > ask:
+                bid, ask = ask, bid
             bid_qty = _safe_float(res.get("bid_qty") or res.get("BidQty") or res.get("bid_volume"), 0.0)
             ask_qty = _safe_float(res.get("ask_qty") or res.get("AskQty") or res.get("ask_volume"), 0.0)
         elif isinstance(res, (list, tuple)) and len(res) >= 2:
@@ -1811,7 +2708,7 @@ def _recent_liq_entry_row_values(row: dict) -> dict:
 def _recent_liq_summary_db_path() -> str:
     base = os.getenv(
         "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+        nas_path(r"raw_data\kabu_station\summary"),
     )
     return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{_daily_risk_today()}.db"))
 
@@ -1833,7 +2730,7 @@ def _recent_liq_recent_values(symbol: str, bars: int) -> dict:
     if not symbol or not Path(path).exists():
         return {}
     try:
-        with sqlite3.connect(path, timeout=1.0) as conn:
+        with committing_connect(path, timeout=1.0) as conn:
             conn.execute("PRAGMA busy_timeout=1000")
             sym = _recent_liq_col(conn, table, ["symbol", "code", "stock_code"])
             tm = _recent_liq_col(conn, table, ["datetime", "dt", "timestamp", "time"])
@@ -1961,6 +2858,42 @@ def _kabu_norm_code(v: Any) -> str:
         return ""
 
 
+def cleanup_stale_100368_sell_reject_cache() -> int:
+    """core/startup/entry_controller_runtime_reject_patch.py (V6) の native化。
+
+    古いバージョンや起動時パッチで 100368 (信用新規抑止) が sell_order_reject_cache に
+    入っていた場合、起動直後に削除する。100368 は銘柄個別SELL NGではなく、API側の
+    信用新規抑止応答として扱うため、キャッシュに残すと翌サイクル以降の候補が
+    不当に消える。main.py の起動シーケンスから1回だけ呼ばれる想定。
+    """
+    removed = 0
+    try:
+        from global_state import global_data
+
+        cache = getattr(global_data, "sell_order_reject_cache", None)
+        if not isinstance(cache, dict):
+            return 0
+
+        for sym, rec in list(cache.items()):
+            if not isinstance(rec, dict):
+                continue
+            code = _kabu_norm_code(rec.get("code"))
+            msg = str(rec.get("message") or "")
+            if code == KABU_CODE_CREDIT_NEW_ORDER_SUPPRESSED or ("信用新規" in msg and "抑止" in msg):
+                cache.pop(sym, None)
+                removed += 1
+
+        if removed:
+            logger.warning(
+                "[ENTRY REJECT PATCH] stale 100368 sell reject cache cleaned removed=%s",
+                removed,
+            )
+        return removed
+    except Exception:
+        logger.exception("[ENTRY REJECT PATCH] stale 100368 cache cleanup failed")
+        return removed
+
+
 def _kabu_last_send_error() -> dict:
     try:
         from kabu_api.send_order import get_last_send_order_error
@@ -1996,7 +2929,7 @@ def _kabu_is_100033_error(err: dict) -> bool:
 
 def _remember_order_for_summary_retry(order_id: str, symbol: str, side: str, entry: Any) -> None:
     try:
-        from core.startup.entry_summary_retry_rotation_runtime_patch import remember_order_for_retry
+        from trading.handlers.entry_retry_rotation import remember_order_for_retry
         remember_order_for_retry(order_id, symbol, side, entry)
     except Exception:
         logger.debug("[ENTRY CONTROLLER] summary retry remember failed order_id=%s symbol=%s", order_id, symbol, exc_info=True)
@@ -2075,20 +3008,77 @@ def _execute_is_summary_ai_candidate(item: dict, row: dict) -> bool:
         return False
 
 
-def _execute_item_age_sec(item: dict, row: dict) -> tuple[float | None, str]:
+def _entry_timeline_log(stage: str, item: dict, row: dict, **extra) -> None:
+    """候補生成からの経過を 1 行で残す (値は変えない)。"""
+    try:
+        if not isinstance(item, dict):
+            return
+        row = _guard_row_to_dict(row) if not isinstance(row, dict) else row
+        symbol = normalize_symbol(item.get("symbol"))
+        side = _guard_norm_side(item.get("side"))
+        cand_age = _execute_candidate_age_sec(item, row)
+        bar_age = _execute_bar_age_sec(item, row)
+        pca = item.get("pending_created_at") or item.get("created_at")
+        bar_dt = item.get("datetime") or (row.get("datetime") if isinstance(row, dict) else None)
+        tail = ""
+        if extra:
+            tail = " " + " ".join("%s=%s" % (k, v) for k, v in extra.items())
+        # P1: 同じ候補を 1 本の ID で追えるようにする
+        try:
+            from trading.entry import candidate_id as _cid
+            _cid.note_item(item, stage, symbol=symbol, side=side,
+                           candidate_age=cand_age, bar_age=bar_age)
+            _cid_s = _cid.of(item)
+        except Exception:
+            _cid_s = None
+        logger.warning(
+            "[ENTRY TIMELINE] stage=%s candidate_id=%s symbol=%s side=%s candidate_age=%s bar_age=%s "
+            "pending_created_at=%s bar_dt=%s%s",
+            stage, _cid_s, symbol, side,
+            "n/a" if cand_age is None else "%.1fs" % cand_age,
+            "n/a" if bar_age is None else "%.1fs" % bar_age,
+            pca, bar_dt, tail,
+        )
+    except Exception:
+        logger.exception("[ENTRY TIMELINE] log failed stage=%s", stage)
+
+
+def _execute_candidate_age_sec(item: dict, row: dict) -> float | None:
+    """候補をキューへ載せてからの経過秒 (足の時刻ではない)。"""
     ai = item.get("ai") if isinstance(item.get("ai"), dict) else {}
     now = dt.datetime.now()
     if _execute_is_summary_ai_candidate(item, row):
-        ts = _execute_first_dt(item.get("updated_at"), row.get("updated_at"), ai.get("updated_at"), item.get("created_at"), row.get("created_at"), item.get("pending_created_at"))
-        if ts is not None:
-            return max(0.0, (now - ts).total_seconds()), "created_at"
-        return 0.0, "summary_ai_now_fallback"
-    ts = _execute_first_dt(item.get("created_at"), item.get("pending_created_at"), ai.get("created_at"))
-    if ts is not None:
-        return max(0.0, (now - ts).total_seconds()), "created_at"
+        ts = _execute_first_dt(
+            item.get("pending_created_at"), item.get("updated_at"), row.get("updated_at"),
+            ai.get("updated_at"), item.get("created_at"), row.get("created_at"),
+        )
+    else:
+        ts = _execute_first_dt(
+            item.get("pending_created_at"), item.get("created_at"),
+            ai.get("pending_created_at"), ai.get("created_at"),
+        )
+    if ts is None:
+        return None
+    return max(0.0, (now - ts).total_seconds())
+
+
+def _execute_bar_age_sec(item: dict, row: dict) -> float | None:
+    """候補が参照している足の古さ (データ鮮度)。"""
+    now = dt.datetime.now()
     ts = _execute_first_dt(item.get("datetime"), row.get("datetime"), item.get("entry_time"), row.get("entry_time"))
-    if ts is not None:
-        return max(0.0, (now - ts).total_seconds()), "datetime"
+    if ts is None:
+        return None
+    return max(0.0, (now - ts).total_seconds())
+
+
+def _execute_item_age_sec(item: dict, row: dict) -> tuple[float | None, str]:
+    """後方互換。候補の古さを優先し、無ければ足の古さを返す。"""
+    age = _execute_candidate_age_sec(item, row)
+    if age is not None:
+        return age, "created_at"
+    age = _execute_bar_age_sec(item, row)
+    if age is not None:
+        return age, "datetime"
     return None, "missing"
 
 
@@ -2110,20 +3100,41 @@ def _execute_prune_pending_for_symbol(symbol: str, side: str, reason: str) -> in
 
 
 def _execute_candidate_stale_ok(item: dict, row: dict, symbol: str, side: str) -> bool:
+    """候補の古さ と 足の古さ を別々に見る。上限値はどちらも従来のまま。"""
     if not _env_bool("ENTRY_EXECUTE_STALE_CANDIDATE_GUARD_ENABLED", True):
         return True
-    age, source = _execute_item_age_sec(item, row)
-    if age is None:
+
+    cand_age = _execute_candidate_age_sec(item, row)
+    bar_age = _execute_bar_age_sec(item, row)
+    cand_max = _env_float("ENTRY_EXECUTE_MAX_CANDIDATE_AGE_SEC", 90.0)
+    bar_max = _env_float("ENTRY_EXECUTE_MAX_BAR_AGE_SEC", 180.0)
+
+    reason = ""
+    if cand_age is not None and cand_age > cand_max:
+        reason = "candidate_age"
+    elif bar_age is not None and bar_age > bar_max:
+        reason = "bar_age"
+
+    if not reason:
+        logger.info(
+            "[ENTRY EXEC TIMEOUT GUARD] freshness OK symbol=%s side=%s "
+            "candidate_age=%s/%.0fs bar_age=%s/%.0fs",
+            symbol, side,
+            "n/a" if cand_age is None else "%.1fs" % cand_age, cand_max,
+            "n/a" if bar_age is None else "%.1fs" % bar_age, bar_max,
+        )
         return True
-    max_age = _env_float("ENTRY_EXECUTE_MAX_CANDIDATE_AGE_SEC", 90.0)
-    if source == "datetime":
-        max_age = _env_float("ENTRY_EXECUTE_MAX_BAR_AGE_SEC", 180.0)
-    if source == "summary_ai_now_fallback":
-        return True
-    if age <= max_age:
-        return True
+
     removed = _execute_prune_pending_for_symbol(symbol, side, "execute_candidate_stale")
-    logger.warning("[ENTRY EXEC TIMEOUT GUARD] STALE_CANDIDATE_SKIP symbol=%s side=%s age=%.1fs max_age=%.1fs pruned=%s", symbol, side, age, max_age, removed)
+    logger.warning(
+        "[ENTRY EXEC TIMEOUT GUARD] STALE_CANDIDATE_SKIP symbol=%s side=%s reason=%s "
+        "candidate_age=%s/max=%.0fs bar_age=%s/max=%.0fs pruned=%s "
+        "(candidate_age=候補をキューへ載せてからの秒数 / bar_age=参照している足の古さ)",
+        symbol, side, reason,
+        "n/a" if cand_age is None else "%.1f" % cand_age, cand_max,
+        "n/a" if bar_age is None else "%.1f" % bar_age, bar_max,
+        removed,
+    )
     return False
 
 
@@ -2135,6 +3146,18 @@ def _execute_cleanup_inflight() -> None:
             started = float(info.get("started", now))
             if bool(info.get("done")) or now - started > ttl:
                 _EXECUTE_INFLIGHT.pop(key, None)
+
+
+def _is_summary_ai_item(item: dict, entry_row: Any, entry_type: Any) -> bool:
+    try:
+        vals = [entry_type, item.get("entry_type"), item.get("source")]
+        if isinstance(entry_row, dict):
+            vals += [entry_row.get("entry_type"), entry_row.get("source")]
+        elif entry_row is not None and hasattr(entry_row, "get"):
+            vals += [entry_row.get("entry_type"), entry_row.get("source")]
+        return any(str(v or "").upper().startswith("SUMMARY") for v in vals)
+    except Exception:
+        return False
 
 
 def _execute_best_candidate_core(item: dict, boost_active: bool) -> bool:
@@ -2152,14 +3175,29 @@ def _execute_best_candidate_core(item: dict, boost_active: bool) -> bool:
         _log_skip(symbol, reason, side=side)
         return False
 
+    # 2026-10-20: Summary AI の新規売りを止める (ユーザー判断)。ENTRY_SUMMARY_AI_SELL_ENABLED=1 で戻す。
+    #   9/07〜 の実売買で 19 回 ほぼ ±0 (プレミアム料前)。5MA 下抜けの何本目で売っても 6 か月でコスト負け
+    #   (ops/research/ma5_break_bar_scan.py)。売りは SURGE SHORT / OVEREXT_SHORT (別経路) だけ残す。
+    #   2026-10-20 午後: 売気配の 0.2% 上で待つ形 (ENTRY_SUMMARY_AI_SELL_WAIT_ENABLED) に限って再開 (ユーザー判断)。
+    #   形の確認は entry_handler.place_entry_sell が発注直前に行う。
+    if (str(side or "").upper() == "SELL" and _is_summary_ai_item(item, entry_row, entry_type)
+            and not _env_bool("ENTRY_SUMMARY_AI_SELL_ENABLED", False)
+            and not _env_bool("ENTRY_SUMMARY_AI_SELL_WAIT_ENABLED", True)):
+        _log_skip(symbol, "SUMMARY_AI_SELL_DISABLED", side=side)
+        return False
+
+    # 2026-10-13: 検証どおりの殿様イナゴは、検証に無い流動性/反転/ハードガードを通さない
+    #   (自前で直近 1 分足の売買代金 >= 2,000 万円を見ている)。時間帯・板・日次リスクは残す。
+    _tv_item = bool(item.get("tonosama_validated"))
+
     # 2. 時間帯/流動性/反転/板ガード
     if not _final_guard_entry_time_ok(symbol, side):
         _log_skip(symbol, "time_guard_ng", side=side)
         return False
-    if not _final_guard_liquidity_ok(entry_row, symbol, side):
+    if not _tv_item and not _final_guard_liquidity_ok(entry_row, symbol, side):
         _log_skip(symbol, "liquidity_guard_ng", side=side)
         return False
-    if not _final_guard_recent_reverse_ok(entry_row, symbol, side):
+    if not _tv_item and not _final_guard_recent_reverse_ok(entry_row, symbol, side):
         _log_skip(symbol, "recent_reverse_guard_ng", side=side)
         return False
     if not _final_guard_board_ok(entry_row, item, symbol, side):
@@ -2167,12 +3205,12 @@ def _execute_best_candidate_core(item: dict, boost_active: bool) -> bool:
         return False
 
     # 3. 出来高/値動きハードガード (SUMMARY_AI高スコア救済つき)
-    if not _hard_guard_ok(item):
+    if not _tv_item and not _hard_guard_ok(item):
         _log_skip(symbol, "liquidity_movement_hard_guard_ng", side=side)
         return False
 
     # 4. 直近summary DB流動性ガード
-    if not _recent_liq_ok(entry_row, symbol, side):
+    if not _tv_item and not _recent_liq_ok(entry_row, symbol, side):
         _log_skip(symbol, "recent_liquidity_guard_ng", side=side)
         return False
 
@@ -2238,10 +3276,14 @@ def _execute_best_candidate_dispatch(item: dict, boost_active: bool, *, symbol: 
         boost_active,
     )
 
+    # RANKING 候補は entry_type=None なので、実際の source を渡す。
+    # entry_order_builder 側で source は "SUMMARY_AI" との比較にしか
+    # 使われないため、RANKING の判定は従来 (空文字) と同じ。
+    order_source = entry_type or item.get("source") or entry_row.get("source") or ""
     order = build_entry_order(
         symbol=symbol,
         side=side,
-        source=entry_type,
+        source=order_source,
         entry_row=entry_row,
         qty_override=qty,
     )
@@ -2278,6 +3320,11 @@ def _execute_best_candidate_dispatch(item: dict, boost_active: bool, *, symbol: 
         order_type,
         order_price,
         "place_entry_buy" if side == "BUY" else "place_entry_sell",
+    )
+    # sendorder 直前。ここに到達していれば候補は発注処理まで届いている。
+    _entry_timeline_log(
+        "pre_sendorder", item, entry_row,
+        qty=order_qty, order_type=order_type, price=order_price,
     )
 
     order_id = (
@@ -2380,6 +3427,9 @@ def _execute_best_candidate(item: dict, boost_active: bool) -> bool:
     if not symbol or side not in {"BUY", "SELL"}:
         logger.warning("[ENTRY EXEC TIMEOUT GUARD] INVALID_SYMBOL_SIDE symbol=%s side=%s", symbol, side)
         return False
+    _entry_timeline_log("executor_reached", item, row,
+                        score=item.get("score") or item.get("score_buy"),
+                        source=item.get("source"))
     if not _execute_candidate_stale_ok(item, row, symbol, side):
         return False
 
@@ -2508,14 +3558,34 @@ def _pipeline_snapshot_pending_count() -> tuple[dict, int]:
     return {}, 0
 
 
-def _pipeline_inflight_count() -> int:
+def _pipeline_pending_candidate_ids() -> set:
+    """現在 pending にある candidate_id の集合 (P1)。
+
+    件数の差だけでは「どの候補が消費されたのか」が分からなかったため、
+    ID の集合そのものを取る。
+    """
+    out: set = set()
     try:
-        import core.startup.entry_execute_timeout_guard_patch as eg
-        inflight = getattr(eg, "_INFLIGHT", {})
-        if isinstance(inflight, dict):
-            return sum(1 for info in inflight.values() if isinstance(info, dict) and not bool(info.get("done")))
+        from trading.entry import candidate_id as _cid
+        from trading.entry.pending_manager import iter_entries
+        for _sym, entry in iter_entries():
+            c = _cid.of(entry)
+            if c:
+                out.add(c)
     except Exception:
-        pass
+        logger.debug("[ENTRY PIPELINE] pending candidate id snapshot failed", exc_info=True)
+    return out
+
+
+def _pipeline_inflight_count() -> int:
+    """実行中の候補数。
+
+    旧 core/startup/entry_execute_timeout_guard_patch が持っていた _INFLIGHT
+    レジストリを参照していたが、そのパッチの機能は _execute_best_candidate 本体
+    (timeout 付きで _execute_best_candidate_core を呼ぶ形) へインライン化され、
+    レジストリ自体が無くなった。以降この関数は常に 0 を返していたため、
+    その挙動を明示する。
+    """
     return 0
 
 
@@ -2694,6 +3764,7 @@ def _should_retry_run_entry_pipeline_after_no_order(*, is_summary: bool, before_
 def _normalize_run_entry_pipeline_result(
     result: Any, *, before_root: dict, before_pending: int, before_inflight: int,
     waited_sec: float, is_summary: bool, retry_count: int,
+    before_ids: Optional[set] = None,
 ) -> dict:
     after_root, after_pending = _pipeline_snapshot_pending_count()
     after_inflight = _pipeline_inflight_count()
@@ -2713,11 +3784,32 @@ def _normalize_run_entry_pipeline_result(
     else:
         skip_reason = "entry_controller_no_order"
 
+    # P1: pending が減ったのに発注していないとき、
+    # 「どの候補が、どこまで進んで消えたのか」を必ず出す。
+    vanished = ()
+    if pending_decreased and not executed and before_ids:
+        try:
+            from trading.entry import candidate_id as _cid
+            after_ids = _pipeline_pending_candidate_ids()
+            vanished = tuple(sorted(set(before_ids) - set(after_ids)))
+            if vanished:
+                _cid.log_vanished(vanished, reason=skip_reason or "pending_moved_without_order")
+            else:
+                logger.warning(
+                    "[CANDIDATE VANISHED] pending decreased %s->%s but no candidate_id "
+                    "disappeared (before_ids=%d after_ids=%d). "
+                    "候補に ID が付く前に消費された可能性がある。",
+                    before_pending, after_pending, len(before_ids), len(after_ids),
+                )
+        except Exception:
+            logger.debug("[ENTRY PIPELINE] vanished candidate report failed", exc_info=True)
+
     out = dict(result) if isinstance(result, dict) else {"result": result}
     out.update({
         "executed": executed,
         "approved_count": approved_count,
         "skip_reason": skip_reason,
+        "vanished_candidate_ids": list(vanished),
         "pending_moved_without_order": bool(pending_decreased and not executed),
         "pending_before": before_root,
         "pending_after": after_root,
@@ -2761,6 +3853,8 @@ def run_entry_pipeline(*, pipeline_source: str | None = None, interval: int | No
     is_summary = source_u == "SUMMARY"
     before_root, before_pending = _pipeline_snapshot_pending_count()
     before_inflight = _pipeline_inflight_count()
+    # P1: 実行前の candidate_id 集合。あとで「どの候補が消えたか」を出すのに使う。
+    before_ids = _pipeline_pending_candidate_ids()
 
     waited_ok, waited_sec = _wait_entry_pipeline_lock_if_needed(source_u, before_pending=before_pending)
     if not waited_ok:
@@ -2783,6 +3877,7 @@ def run_entry_pipeline(*, pipeline_source: str | None = None, interval: int | No
     out = _normalize_run_entry_pipeline_result(
         result, before_root=before_root, before_pending=before_pending, before_inflight=before_inflight,
         waited_sec=waited_sec, is_summary=is_summary, retry_count=retry_count,
+        before_ids=before_ids,
     )
     logger.info("[ENTRY CONTROLLER] run_entry_pipeline return normalized %s", out)
     return out
@@ -3042,3 +4137,952 @@ def _run_entry_pipeline_core(
 
     finally:
         _pipeline_lock.release()
+
+
+# ============================================================
+# RANKING final rescue の env 強制 (旧 install() 冒頭の
+# _force_ranking_zero_atr_defaults() + setdefault 群)
+# ------------------------------------------------------------
+# volatility_filter の range_5m_filter softpass など atr_1m_filter より
+# 前に走る経路もこれらのキーを読むため、モジュール import の時点で確定させる。
+# 定義順の都合でファイル末尾に置いてある (_env_bool がここより前に無いと
+# _ranking_rescue_scope_enabled() が NameError を握り潰して False になる)。
+# ============================================================
+if _ranking_rescue_scope_enabled():
+    _ranking_rescue_apply_env_defaults()
+
+
+# ============================================================
+# 最小単元フォールバック (発注数量)
+# ------------------------------------------------------------
+# 旧 core/startup/entry_qty_min_lot_runtime_patch.py の
+# calculate_entry_quantity ラップを本文化。
+#
+# lot_sizer が 0 株を返したとき、予算内で最小単元が買えるなら最小単元だけ
+# 発注する。買えない/価格レンジ外なら 0 のまま。
+# 無効化は従来どおり ENTRY_MIN_LOT_FALLBACK_WHEN_AFFORDABLE=0。
+#
+# 旧パッチは ec.calculate_entry_quantity (モジュール属性) を差し替えており、
+# :2849 の呼び出しがそれを見ていた。ここで公開名を定義するのは等価。
+# ヘルパは本ファイル既存の _safe_float / _safe_int / _env_bool と実装が
+# 異なるため、旧パッチのものを _qty_* として移植した (流用しない)。
+#
+# 適用スコープは旧 install 導線 (main.py:220) を再現する。
+# ============================================================
+
+def _qty_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _qty_safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or v == "":
+            return default
+        return int(float(v))
+    except Exception:
+        return default
+
+
+def _qty_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _qty_get_budget() -> float:
+    try:
+        from trading.entry.entry_budget import get_max_entry_oneshot_yen
+        v = float(get_max_entry_oneshot_yen())
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    return _qty_safe_float(os.getenv("MAX_ENTRY_ONESHOT_YEN"), 700000.0)
+
+
+def _qty_get_lot() -> int:
+    try:
+        from trading.entry.entry_budget import get_order_lot_size
+        v = int(get_order_lot_size())
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    return _qty_safe_int(os.getenv("ORDER_LOT_SIZE"), 100)
+
+
+def _qty_price_range_ok(price: float) -> bool:
+    try:
+        from trading.entry.entry_budget import can_afford_min_lot
+        ok, diag = can_afford_min_lot(price)
+        if not ok:
+            logger.warning("[ENTRY QTY MINLOT PATCH] affordability NG price=%s diag=%s", price, diag)
+        return bool(ok)
+    except Exception:
+        min_price = _qty_safe_float(os.getenv("ENTRY_MIN_PRICE"), 3000.0)
+        max_price = _qty_safe_float(os.getenv("ENTRY_MAX_PRICE"), 7000.0)
+        return bool(price >= min_price and price <= max_price)
+
+
+_QTY_MINLOT_SCOPE = None
+
+
+def _qty_minlot_enabled() -> bool:
+    global _QTY_MINLOT_SCOPE
+    if _QTY_MINLOT_SCOPE is not None:
+        return _QTY_MINLOT_SCOPE
+    enabled = False
+    try:
+        import sys as _sys
+
+        argv_text = " ".join(str(x) for x in _sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if not any(n in argv_text for n in db_names):
+            enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _QTY_MINLOT_SCOPE = enabled
+    return enabled
+
+
+def calculate_entry_quantity(*, symbol: str, price: float, confidence: float, lot_multiplier: float, atr=None) -> int:
+    qty = 0
+    try:
+        qty = int(_calculate_entry_quantity_base(
+            symbol=symbol, price=price, confidence=confidence, lot_multiplier=lot_multiplier, atr=atr
+        ))
+    except Exception:
+        logger.exception("[ENTRY QTY MINLOT PATCH] original lot_sizer failed symbol=%s", symbol)
+        qty = 0
+
+    if qty > 0:
+        return qty
+    if not _qty_minlot_enabled():
+        return 0
+    if not _qty_env_bool("ENTRY_MIN_LOT_FALLBACK_WHEN_AFFORDABLE", True):
+        return 0
+
+    p = _qty_safe_float(price, 0.0)
+    if p <= 0:
+        return 0
+
+    budget = _qty_get_budget()
+    lot = _qty_get_lot()
+    if lot <= 0:
+        lot = 100
+
+    if not _qty_price_range_ok(p):
+        return 0
+
+    max_qty = int((budget // p) // lot * lot)
+    if max_qty < lot:
+        logger.warning(
+            "[ENTRY QTY MINLOT PATCH] cannot afford min lot symbol=%s price=%.1f budget=%.0f lot=%s max_qty=%s",
+            symbol, p, budget, lot, max_qty,
+        )
+        return 0
+
+    logger.warning(
+        "[ENTRY QTY MINLOT PATCH] qty 0 -> min lot fallback symbol=%s price=%.1f qty=%s budget=%.0f lot=%s confidence=%s multiplier=%s atr=%s",
+        symbol, p, lot, budget, lot, confidence, lot_multiplier, atr,
+    )
+    return int(lot)
+
+
+# ============================================================
+# SUMMARY / TONOSAMA 経路の最終ゲート緩和
+# ------------------------------------------------------------
+# 旧 core/startup/entry_controller_final_gate_relax_patch.py を本文化。
+# SUMMARY / TONOSAMA 由来の行だけ、env で指定した閾値で再判定する。
+# それ以外の経路は従来の _passes_ai_gate_core をそのまま使う。
+#
+# 旧パッチが併せて上書きしていた MIN_SUMMARY_SCORE_* / MIN_COMPOSITE_SCORE_* の
+# 4定数は、同じ定数を core/startup/__init__.py / oneshot_limit_700k_patch /
+# tonosama_history_failclose_strict_patch も書いて**後勝ち**になるため、
+# 実行位置を変えないよう呼び出し元 (summary_ai_more_candidates_patch) に残した。
+# ============================================================
+
+def _fgr_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _fgr_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _fgr_src(row: dict) -> str:
+    try:
+        vals = [
+            row.get("source"),
+            row.get("entry_type"),
+            row.get("pipeline_source"),
+            row.get("reason"),
+            row.get("ai_reason"),
+        ]
+        return "|".join(str(v or "").upper() for v in vals)
+    except Exception:
+        return ""
+
+
+def _fgr_is_summary_or_tonosama(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    s = _fgr_src(row)
+    return "SUMMARY" in s or "SUMMARY_AI" in s or "TONOSAMA" in s
+
+
+def _passes_ai_gate(entry_row: dict, ai: dict, side: str):
+    try:
+        if not _fgr_is_summary_or_tonosama(entry_row):
+            return _passes_ai_gate_core(entry_row, ai, side)
+        if not isinstance(ai, dict):
+            return False, "AI_RESULT_INVALID"
+        allow = bool(ai.get("allow", False))
+        if not allow:
+            return False, f"AI_ALLOW_FALSE:{_safe_str(ai.get('reason'))}"
+        side_n = str(side or "").upper()
+        confidence = _safe_float(ai.get("confidence"), 0.0)
+        score_buy, score_sell = _resolve_entry_scores(entry_row, side=side_n)
+        src = _fgr_src(entry_row)
+        if "TONOSAMA" in src:
+            min_buy = _fgr_env_float("ENTRY_CONTROLLER_TONOSAMA_BUY_MIN_SCORE", 0.01)
+            min_sell = _fgr_env_float("ENTRY_CONTROLLER_TONOSAMA_SELL_MIN_SCORE", 0.01)
+            min_comp_buy = _fgr_env_float("ENTRY_CONTROLLER_TONOSAMA_BUY_MIN_COMPOSITE", min_buy)
+            min_comp_sell = _fgr_env_float("ENTRY_CONTROLLER_TONOSAMA_SELL_MIN_COMPOSITE", min_sell)
+        else:
+            # ここも同じ env を読むが未設定なので、
+            # 既定値を strict の正本値へ揃える (モジュール定数と一致させる)。
+            min_buy = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_SCORE", _strict_threshold("MIN_SUMMARY_SCORE_BUY", 3.0))
+            min_sell = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_SCORE", _strict_threshold("MIN_SUMMARY_SCORE_SELL", 3.0))
+            min_comp_buy = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_COMPOSITE", min_buy)
+            min_comp_sell = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_COMPOSITE", min_sell)
+
+        if side_n == "BUY":
+            if confidence < MIN_AI_CONFIDENCE_BUY:
+                return False, f"BUY_CONF_LOW:{confidence:.3f}"
+            composite = confidence * score_buy
+            if score_buy < min_buy:
+                return False, f"BUY_SCORE_LOW_RELAXED:{score_buy:.3f}<min={min_buy:.3f}"
+            if composite < min_comp_buy:
+                return False, f"BUY_COMPOSITE_LOW_RELAXED:{composite:.3f}<min={min_comp_buy:.3f}"
+            return True, f"BUY_OK_RELAXED conf={confidence:.3f} score_buy={score_buy:.3f} comp={composite:.3f} src={src}"
+
+        if side_n == "SELL":
+            if confidence < MIN_AI_CONFIDENCE_SELL:
+                return False, f"SELL_CONF_LOW:{confidence:.3f}"
+            composite = confidence * score_sell
+            if score_sell < min_sell:
+                return False, f"SELL_SCORE_LOW_RELAXED:{score_sell:.3f}<min={min_sell:.3f}"
+            if composite < min_comp_sell:
+                return False, f"SELL_COMPOSITE_LOW_RELAXED:{composite:.3f}<min={min_comp_sell:.3f}"
+            return True, f"SELL_OK_RELAXED conf={confidence:.3f} score_sell={score_sell:.3f} comp={composite:.3f} src={src}"
+
+        return False, f"SIDE_INVALID:{side}"
+    except Exception:
+        logger.exception("[ENTRY FINAL GATE RELAX] patched gate failed -> fallback original")
+        return _passes_ai_gate_core(entry_row, ai, side)
+
+
+# ============================================================
+# ai_final_entry_check の2層ガード (旧 core/startup の2パッチを本文化)
+# ------------------------------------------------------------
+# 実 install 順を実測した結果、実行時の合成は
+#   native <- summary_ai_entry_controller_bridge <- entry_volume_direction_guard
+# の2層 (main.py:265 の patches -> startup.py:991 の順) だった。同じ順で重ねる。
+#
+#   1層目 _bri_*: SUMMARY_AI 由来の行は事前承認済み AI 結果を再利用する
+#   2層目 _vdg_*: 出来高方向ガード (逆行時の warn-only / 強制 reject)
+#
+# 旧パッチは ec.ai_final_entry_check (モジュール属性) だけを差し替えており、
+# AI.entry_gate 側は素のままだった。ここでも entry_controller 内の名前だけを
+# 束ね直し、native は _ai_final_entry_check_core として import している。
+# 他モジュールは AI.entry_gate から直接 import しているので影響しない。
+#
+# ヘルパは2パッチのものを _bri_ / _vdg_ で名前空間を分けて移植した。
+# ============================================================
+
+_BRI_VERSION = "V15-SUMMARY-AI-ENTRY-BRIDGE"
+_VDG_VERSION = "V3-ENTRY-VOLUME-DIRECTION-GUARD"
+
+
+def _ai_final_entry_check_bridge(entry_row):
+    """1層目: SUMMARY_AI 事前承認結果の再利用 (旧 bridge patch)。"""
+    try:
+        if isinstance(entry_row, dict) and _bri_is_summary_ai_row(entry_row):
+            result = _bri_summary_ai_result(entry_row)
+            logger.info(
+                "[SUMMARY AI ENTRY BRIDGE] preapproved AI reused symbol=%s side=%s conf=%s score_buy=%s score_sell=%s source=%s interval=%s",
+                entry_row.get("symbol"),
+                entry_row.get("side") or entry_row.get("entry_decision"),
+                result.get("confidence"),
+                entry_row.get("score_buy", entry_row.get("buy_score")),
+                entry_row.get("score_sell", entry_row.get("sell_score")),
+                entry_row.get("source"),
+                entry_row.get("interval"),
+            )
+            return result
+    except Exception:
+        logger.exception("[SUMMARY AI ENTRY BRIDGE] preapproved check failed; fallback original")
+    return _ai_final_entry_check_core(entry_row)
+
+
+def _bri_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _bri_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return max(0.0, float(v))
+    except Exception:
+        return float(default)
+
+
+def _bri_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _bri_norm_source(v: Any) -> str:
+    try:
+        return str(v or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _bri_has_payload(v: Any) -> bool:
+    if isinstance(v, (list, tuple, set, dict)):
+        return len(v) > 0
+    return bool(v)
+
+
+def _bri_is_summary_ai_row(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    entry_type = _bri_norm_source(row.get("entry_type"))
+    source = _bri_norm_source(row.get("source"))
+    reason = _bri_norm_source(row.get("reason") or row.get("ai_reason"))
+    return entry_type == "SUMMARY_AI" or source == "SUMMARY" or "SRC=SUMMARY" in reason
+
+
+def _bri_summary_ai_result(row: dict) -> dict:
+    confidence = max(
+        _bri_safe_float(row.get("ai_confidence"), 0.0),
+        _bri_safe_float(row.get("confidence"), 0.0),
+        1.0,
+    )
+    lot_multiplier = max(_bri_safe_float(row.get("lot_multiplier"), 1.0), 1.0)
+    reason = str(row.get("ai_reason") or row.get("reason") or "SUMMARY_AI_PREAPPROVED")
+    return {
+        "allow": True,
+        "confidence": confidence,
+        "lot_multiplier": lot_multiplier,
+        "reason": "SUMMARY_AI_PREAPPROVED|" + reason,
+        "source": "SUMMARY_AI_PREAPPROVED_BRIDGE",
+    }
+
+
+def _vdg_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _vdg_safe_symbol(row: Any) -> str:
+    try:
+        if isinstance(row, dict):
+            return str(row.get("symbol") or row.get("Symbol") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _vdg_source(row: Any) -> str:
+    try:
+        if isinstance(row, dict):
+            return str(row.get("source") or row.get("pipeline_source") or row.get("entry_type") or "").strip().upper()
+    except Exception:
+        pass
+    return ""
+
+
+def _vdg_merge_reason(new_reason: Any, old_reason: Any) -> str:
+    nr = str(new_reason or "").strip()
+    old = str(old_reason or "").strip()
+    if nr and old and nr not in old:
+        return f"{nr};{old}"
+    return nr or old
+
+
+def _vdg_reason_text(ai: Any) -> str:
+    if not isinstance(ai, dict):
+        return ""
+    vals = []
+    for k in ("reason", "gate_reason", "ai_reason", "detail"):
+        v = ai.get(k)
+        if v is not None:
+            vals.append(str(v))
+    return ";".join(vals)
+
+
+def _vdg_is_tonosama_dedicated_ok(entry_row: Any, ai: Any) -> bool:
+    try:
+        if _vdg_source(entry_row) != "TONOSAMA":
+            return False
+        text = _vdg_reason_text(ai)
+        return "TONOSAMA_DEDICATED_GATE_OK" in text
+    except Exception:
+        return False
+
+
+def _vdg_is_tonosama_soft_candle_reason(reason: str) -> bool:
+    r = str(reason or "")
+    return r in {
+        "TONOSAMA_BUY_REJECT_NO_STRONG_3M5M_BULLISH_CANDLE",
+        "TONOSAMA_SELL_REJECT_NO_STRONG_3M5M_BEARISH_CANDLE",
+    }
+
+
+def _vdg_mark_warn_only(ai: Any, reason: str, vd: dict) -> dict:
+    out = dict(ai) if isinstance(ai, dict) else {}
+    # Original AI gate result is preserved.  Add visibility only.
+    out["volume_direction"] = vd
+    out["volume_direction_warn"] = True
+    out["volume_direction_warn_reason"] = reason
+    out["hard_reject"] = False
+    return out
+
+
+def _vdg_force_reject_ai(ai: Any, reason: str, vd: dict) -> dict:
+    if isinstance(ai, dict):
+        out = dict(ai)
+    else:
+        out = {}
+
+    for k in ("allow", "allowed", "is_allowed", "ai_allow", "passed", "ok"):
+        out[k] = False
+    for k in ("confidence", "ai_confidence", "conf"):
+        out[k] = 0.0
+    out["reason"] = _vdg_merge_reason(reason, out.get("reason"))
+    out["gate_reason"] = _vdg_merge_reason(reason, out.get("gate_reason"))
+    out["ai_reason"] = _vdg_merge_reason(reason, out.get("ai_reason"))
+    out["detail"] = _vdg_merge_reason(reason, out.get("detail"))
+    out["volume_direction"] = vd
+    out["volume_direction_reject"] = True
+    out["hard_reject"] = True
+    return out
+
+
+def ai_final_entry_check(entry_row: dict, *args: Any, **kwargs: Any):
+    ai = _ai_final_entry_check_bridge(entry_row, *args, **kwargs)
+    if not _vdg_env_bool("ENTRY_VOLUME_DIRECTION_GUARD", True):
+        return ai
+    try:
+        from trading.entry.volume_direction_guard import evaluate_volume_direction
+
+        vd = evaluate_volume_direction(entry_row if isinstance(entry_row, dict) else {})
+        if isinstance(ai, dict):
+            ai = dict(ai)
+            ai["volume_direction"] = vd
+        if not vd.get("ok", True):
+            symbol = _vdg_safe_symbol(entry_row)
+            reason = str(vd.get("reason") or "ENTRY_VOLUME_DIRECTION_REJECT")
+
+            if _vdg_env_bool("ENTRY_VOLUME_DIRECTION_TONOSAMA_DEDICATED_OK_WARN_ONLY", True) and _vdg_is_tonosama_dedicated_ok(entry_row, ai) and _vdg_is_tonosama_soft_candle_reason(reason):
+                logger.warning(
+                    "[ENTRY VOLUME DIRECTION GUARD] warn-only TONOSAMA dedicated-ok symbol=%s side=%s reason=%s vol=%.3f move=%.3f trend=%.3f dir=%s source=%s interval=%s",
+                    symbol,
+                    vd.get("side"),
+                    reason,
+                    float(vd.get("volume_surge_ratio") or 0.0),
+                    float(vd.get("price_change_pct") or 0.0),
+                    float(vd.get("trend_score") or 0.0),
+                    vd.get("trend_direction"),
+                    entry_row.get("source") if isinstance(entry_row, dict) else None,
+                    entry_row.get("interval") if isinstance(entry_row, dict) else None,
+                )
+                return _vdg_mark_warn_only(ai, reason, vd)
+
+            logger.warning(
+                "[ENTRY VOLUME DIRECTION GUARD] hard reject symbol=%s side=%s reason=%s vol=%.3f move=%.3f trend=%.3f dir=%s source=%s interval=%s",
+                symbol,
+                vd.get("side"),
+                reason,
+                float(vd.get("volume_surge_ratio") or 0.0),
+                float(vd.get("price_change_pct") or 0.0),
+                float(vd.get("trend_score") or 0.0),
+                vd.get("trend_direction"),
+                entry_row.get("source") if isinstance(entry_row, dict) else None,
+                entry_row.get("interval") if isinstance(entry_row, dict) else None,
+            )
+            return _vdg_force_reject_ai(ai, reason, vd)
+        if vd.get("action") == "WARN":
+            logger.warning(
+                "[ENTRY VOLUME DIRECTION GUARD] warn-only symbol=%s side=%s reason=%s vol=%.3f move=%.3f trend=%.3f dir=%s",
+                _vdg_safe_symbol(entry_row),
+                vd.get("side"),
+                vd.get("reason"),
+                float(vd.get("volume_surge_ratio") or 0.0),
+                float(vd.get("price_change_pct") or 0.0),
+                float(vd.get("trend_score") or 0.0),
+                vd.get("trend_direction"),
+            )
+        return ai
+    except Exception:
+        logger.exception("[ENTRY VOLUME DIRECTION GUARD] evaluation failed")
+        return ai
+
+
+# ============================================================
+# SUMMARY_AI ATR 1m リペア
+# (旧 core/startup/summary_ai_atr_1m_filter_repair_patch.py を本文化)
+# ------------------------------------------------------------
+# SUMMARY_AI 由来の行が ATR で NG になったとき、global_context / DF から
+# high/low/close を補って entry_row を作り直し、もう一度だけ判定する。
+#
+# 実 install 順を測定した結果、entry_controller.atr_1m_filter を包む
+# 6 パッチのうち最後まで生き残るのはこの層と
+# volatility_filter 側の TONOSAMA 救済層の 2 つだけで、合成は
+#   native <- tonosama(volatility_filter へ本文化済み) <- この層
+# だった。旧構成では tonosama が後から入って一度この層を捨て、
+# 本パッチの watcher (60 loops x 1s) が被せ直していた。
+# 本文化後は最初からこの順序になるので watcher は不要になり撤去した。
+#
+# volatility_filter.atr_1m_filter (= tonosama 込み) は
+# _atr_1m_filter_core として import している。
+# ============================================================
+
+_AR1_VERSION = "V1-SUMMARY-AI-ATR-1M-FILTER-REPAIR"
+_AR1__INSTALLED = False
+_AR1__WATCHER_STARTED = False
+_AR1__TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_AR1__FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
+
+
+def _ar1_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        s = str(raw).strip().lower()
+        if s in _AR1__TRUE:
+            return True
+        if s in _AR1__FALSE:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _ar1_env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        return float(str(raw).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _ar1_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(str(v).replace(",", ""))
+        if math.isnan(x) or math.isinf(x):
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def _ar1_row_dict(row: Any) -> dict[str, Any]:
+    try:
+        if isinstance(row, dict):
+            d = dict(row)
+        elif hasattr(row, "to_dict"):
+            vv = row.to_dict()
+            d = dict(vv) if isinstance(vv, dict) else {}
+        else:
+            d = {}
+        raw = d.get("_raw")
+        if hasattr(raw, "to_dict"):
+            try:
+                raw = raw.to_dict()
+            except Exception:
+                raw = None
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if k not in d or d.get(k) in (None, ""):
+                    d[k] = v
+        return d
+    except Exception:
+        return {}
+
+
+def _ar1_put(row: Any, key: str, value: Any) -> None:
+    try:
+        if isinstance(row, dict):
+            row[key] = value
+            return
+        if hasattr(row, "__setitem__"):
+            row[key] = value
+            return
+        setattr(row, key, value)
+    except Exception:
+        pass
+
+
+def _ar1_first_pos(d: dict[str, Any], keys: tuple[str, ...]) -> float:
+    for k in keys:
+        try:
+            x = _ar1_safe_float(d.get(k), 0.0)
+            if x > 0:
+                return x
+        except Exception:
+            continue
+    return 0.0
+
+
+def _ar1_norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip()
+        if s.endswith(".0") and s[:-2].isdigit():
+            return s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _ar1_source_is_summary_ai(row: dict[str, Any]) -> bool:
+    src = " ".join(str(row.get(k) or "") for k in (
+        "source", "entry_source", "pipeline_source", "entry_type", "type", "reason", "ai_reason", "model_used",
+    )).upper()
+    return (
+        "SUMMARY_AI" in src
+        or "SRC=SUMMARY" in src
+        or "SUMMARY" in src
+        or "PUSH" in src
+        or str(row.get("source") or "").upper() in {"SUMMARY", "PUSH", "PUSH_SUMMARY"}
+    )
+
+
+def _ar1_range_ratio(close: float, high: float, low: float) -> float:
+    try:
+        if close <= 0 or high <= 0 or low <= 0 or high < low:
+            return 0.0
+        return max(0.0, (high - low) / close)
+    except Exception:
+        return 0.0
+
+
+def _ar1_entry_min_atr_ratio() -> float:
+    try:
+        from trading.handlers import entry_order_builder as eob
+        return float(getattr(eob, "ENTRY_ORDER_MIN_ATR_RATIO", 0.0025) or 0.0025)
+    except Exception:
+        return _ar1_env_float("ENTRY_ORDER_MIN_ATR_RATIO", 0.0025)
+
+
+def _ar1_entry_min_range_pct() -> float:
+    try:
+        from trading.handlers import entry_order_builder as eob
+        return float(getattr(eob, "ENTRY_ORDER_MIN_RANGE_PCT", 0.003) or 0.003)
+    except Exception:
+        return _ar1_env_float("ENTRY_ORDER_MIN_RANGE_PCT", 0.003)
+
+
+def _ar1_best_from_dict(d: dict[str, Any]) -> tuple[float, float, float, float, str]:
+    close = _ar1_first_pos(d, ("close", "close_price", "current_price", "price", "last_price", "entry_price", "limit_price"))
+    atr = _ar1_first_pos(d, ("atr_1m", "atr", "ATR", "atr14", "atr_14"))
+    candidates = [
+        (("high", "high_price", "bar_high", "summary_high"), ("low", "low_price", "bar_low", "summary_low"), "row_high_low"),
+        (("day_high", "today_high", "intraday_high", "session_high", "range_high", "ranking_high", "snapshot_high", "high_price_day", "ai_disp_day_high", "ai_disp_high"),
+         ("day_low", "today_low", "intraday_low", "session_low", "range_low", "ranking_low", "snapshot_low", "low_price_day", "ai_disp_day_low", "ai_disp_low"), "row_day_high_low"),
+        (("high_1m_max", "recent_high", "recent_1m_high"), ("low_1m_min", "recent_low", "recent_1m_low"), "row_recent_high_low"),
+    ]
+    best = (close, 0.0, 0.0, atr, "missing")
+    best_ratio = 0.0
+    for hk, lk, label in candidates:
+        h = _ar1_first_pos(d, hk)
+        l = _ar1_first_pos(d, lk)
+        ratio = _ar1_range_ratio(close, h, l)
+        if ratio > best_ratio:
+            best = (close, h, l, atr, label)
+            best_ratio = ratio
+    return best
+
+
+def _ar1_latest_symbol_row_from_df(df: Any, symbol: str) -> dict[str, Any]:
+    try:
+        import pandas as pd
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
+            return {}
+        s = df[df["symbol"].astype(str) == str(symbol)]
+        if s.empty:
+            return {}
+        for col in ("datetime", "end_time", "updated_at", "last_update"):
+            if col in s.columns:
+                try:
+                    s = s.assign(_dt=pd.to_datetime(s[col], errors="coerce")).sort_values("_dt")
+                    break
+                except Exception:
+                    pass
+        return s.iloc[-1].to_dict()
+    except Exception:
+        return {}
+
+
+def _ar1_best_from_global_context(symbol: str) -> tuple[float, float, float, float, str]:
+    try:
+        from core.global_context.context import global_context
+    except Exception:
+        try:
+            from core.global_context import global_context  # type: ignore
+        except Exception:
+            return 0.0, 0.0, 0.0, 0.0, "gc_import_failed"
+
+    best = (0.0, 0.0, 0.0, 0.0, "gc_missing")
+    best_ratio = 0.0
+    for getter_name, label in (("get_summary_history", "summary_history_1m"), ("get_merged_summary", "merged_summary_1m")):
+        try:
+            getter = getattr(global_context, getter_name, None)
+            if not callable(getter):
+                continue
+            df = getter(1, source="push")
+            d = _ar1_latest_symbol_row_from_df(df, symbol)
+            if not d:
+                continue
+            c, h, l, atr, method = _ar1_best_from_dict(d)
+            ratio = _ar1_range_ratio(c, h, l)
+            if ratio > best_ratio or (ratio == best_ratio and atr > best[3]):
+                best = (c, h, l, atr, f"{label}:{method}")
+                best_ratio = ratio
+        except Exception:
+            logger.debug("[SUMMARY AI ATR 1M REPAIR] global lookup failed getter=%s symbol=%s", getter_name, symbol, exc_info=True)
+    return best
+
+
+def _ar1_repair_entry_row(entry_row: Any) -> tuple[Any, dict[str, Any]]:
+    row = _ar1_row_dict(entry_row)
+    symbol = _ar1_norm_symbol(row.get("symbol") or row.get("code") or row.get("stock_code"))
+    c1, h1, l1, atr1, m1 = _ar1_best_from_dict(row)
+    c2, h2, l2, atr2, m2 = _ar1_best_from_global_context(symbol) if symbol else (0.0, 0.0, 0.0, 0.0, "no_symbol")
+
+    r1 = _ar1_range_ratio(c1, h1, l1)
+    r2 = _ar1_range_ratio(c2, h2, l2)
+    if r2 > r1 or (r2 == r1 and atr2 > atr1):
+        close, high, low, atr, method = c2, h2, l2, max(atr1, atr2), m2
+        ratio = r2
+    else:
+        close, high, low, atr, method = c1, h1, l1, max(atr1, atr2), m1
+        ratio = r1
+
+    min_range = _ar1_entry_min_range_pct()
+    min_atr_ratio = _ar1_entry_min_atr_ratio()
+    required_atr = close * min_atr_ratio if close > 0 else 0.0
+    range_proxy = max(0.0, high - low) if high >= low else 0.0
+    old_atr = _ar1_first_pos(row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"))
+
+    repaired = dict(row)
+    atr_method = "missing"
+    if close > 0 and high > 0 and low > 0 and high >= low and ratio >= min_range:
+        repaired.update({
+            "close": close,
+            "close_price": close,
+            "current_price": close,
+            "price": close,
+            "high": high,
+            "low": low,
+            "high_price": high,
+            "low_price": low,
+            "day_high": max(_ar1_safe_float(repaired.get("day_high"), 0.0), high),
+            "day_low": low if _ar1_safe_float(repaired.get("day_low"), 0.0) <= 0 else min(_ar1_safe_float(repaired.get("day_low"), low), low),
+            "range_pct": ratio,
+            "intraday_range_pct": ratio,
+            "day_range_pct": ratio,
+        })
+        if atr > 0 and (atr / close) >= min_atr_ratio:
+            repaired.update({"atr": atr, "atr_1m": atr, "ATR": atr})
+            atr_method = "history_or_row_atr"
+        elif range_proxy >= required_atr > 0:
+            repaired.update({"atr": range_proxy, "atr_1m": range_proxy, "ATR": range_proxy})
+            atr = range_proxy
+            atr_method = "range_proxy"
+        elif atr > old_atr:
+            repaired.update({"atr": atr, "atr_1m": atr, "ATR": atr})
+            atr_method = "history_atr_below_threshold"
+
+    diag = {
+        "symbol": symbol,
+        "old_close": c1,
+        "old_high": h1,
+        "old_low": l1,
+        "old_atr": old_atr,
+        "gc_close": c2,
+        "gc_high": h2,
+        "gc_low": l2,
+        "gc_atr": atr2,
+        "new_close": close,
+        "new_high": high,
+        "new_low": low,
+        "new_range_pct": ratio,
+        "new_atr": _ar1_first_pos(repaired, ("atr_1m", "atr", "ATR")),
+        "min_range": min_range,
+        "min_atr_ratio": min_atr_ratio,
+        "required_atr": required_atr,
+        "range_proxy": range_proxy,
+        "method": method,
+        "atr_method": atr_method,
+        "repaired": repaired != row,
+    }
+    return repaired, diag
+
+
+def _ar1_call_original(original: Any, entry_row: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    return original(entry_row, *args, **kwargs)
+
+
+def atr_1m_filter(entry_row: Any = None, *args: Any, **kwargs: Any):
+    allow = _ar1_call_original(_atr_1m_filter_core, entry_row, args, kwargs)
+    if isinstance(allow, tuple):
+        return allow
+    if bool(allow):
+        return allow
+    row = _ar1_row_dict(entry_row)
+    if not _ar1_source_is_summary_ai(row):
+        return allow
+    repaired, diag = _ar1_repair_entry_row(entry_row)
+    if not diag.get("repaired"):
+        logger.warning("[SUMMARY AI ATR 1M REPAIR] original NG no repair possible detail=%s", diag)
+        return allow
+    retry = _ar1_call_original(_atr_1m_filter_core, repaired, args, kwargs)
+    logger.warning("[SUMMARY AI ATR 1M REPAIR] retry after repair original_ng=%s retry=%s detail=%s", allow, retry, diag)
+    if bool(retry):
+        try:
+            if isinstance(entry_row, dict):
+                entry_row.update(repaired)
+        except Exception:
+            pass
+    return retry
+
+
+# ============================================================
+# range_5m_filter の 2 層
+# (旧 core/startup/low_movement_entry_guard_patch と
+#  旧 core/startup/entry_final_filter_failopen_patch を本文化)
+# ------------------------------------------------------------
+# 実 install 順は main.py:248 (low_movement) -> :249 (failopen) で、
+# どちらも合成型だったので
+#   native <- low_movement (全ガード実行) <- failopen (NG の fail-open)
+# の順で本文へ入れた。
+#
+# 1層目は low_movement_entry_guard_patch._apply_all_entry_guards を呼ぶ。
+# 同パッチは他に 6 つのサブ install を持つため残っており、この関数だけを
+# 参照する (旧構成と同じ実装が動く)。
+#
+# 2層目は RANGE_5M_FILTER_NG_FAIL_OPEN が真なら False を True へ倒し、
+# RecursionError / 一般例外もそれぞれの env で fail-open する。
+# ============================================================
+
+
+def _r5m_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _range_5m_filter_low_move(entry_row=None, *args, **kwargs):
+    """1層目: 本体の判定が通ったら _apply_all_entry_guards へ渡す。"""
+    try:
+        allow = _range_5m_filter_core(entry_row, *args, **kwargs)
+        if isinstance(allow, tuple):
+            return allow
+        if not bool(allow):
+            return False
+        # 2026-09-17: ローカル 1 分足の厳格判定 (ATR/5分/当日レンジ) を通った行は、
+        #   1 分足 1 本の高安で見る low_movement_guard を重ねない (7014 が range_too_small 0.2%<0.6% で落ちた)。
+        try:
+            if isinstance(entry_row, dict) and entry_row.get("_vol_local_strict_ok"):
+                return True
+        except Exception:
+            pass
+        from trading.entry.low_movement_guard import _apply_all_entry_guards
+
+        return _apply_all_entry_guards(entry_row)
+    except RecursionError:
+        logger.error("[LOW MOVE GUARD] recursion detected in patched range filter. fail-safe NG. Check duplicate wrappers.", exc_info=False)
+        return False
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] patched range filter failed: %s", e, exc_info=False)
+        return False
+
+
+def range_5m_filter(entry_row=None, *args, **kwargs):
+    """2層目: NG を env に応じて fail-open する。"""
+    try:
+        ret = _range_5m_filter_low_move(entry_row, *args, **kwargs)
+        if isinstance(ret, tuple):
+            return ret
+        if ret is False and _r5m_env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True):
+            return True
+        return ret
+    except RecursionError:
+        return bool(_r5m_env_bool("RANGE_5M_FILTER_RECURSION_FAIL_OPEN", True))
+    except Exception:
+        return bool(_r5m_env_bool("RANGE_5M_FILTER_ERROR_FAIL_OPEN", True))

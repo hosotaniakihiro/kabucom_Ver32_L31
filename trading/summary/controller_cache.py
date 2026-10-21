@@ -36,12 +36,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from typing import Callable
 
 import pandas as pd
 
 from global_state import global_data
+from trading.summary.bool_series import na_false_bool, na_false_bool_count
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +183,7 @@ def _safe_ready_count(df: pd.DataFrame) -> int:
     try:
         if not isinstance(df, pd.DataFrame) or df.empty or "technical_ready" not in df.columns:
             return 0
-        s = pd.Series(df["technical_ready"]).fillna(False).astype(bool)
+        s = na_false_bool(df["technical_ready"])
         return int(s.sum())
     except Exception:
         return 0
@@ -196,7 +198,7 @@ def _safe_ready_symbol_count(df: pd.DataFrame) -> int:
             or "technical_ready" not in df.columns
         ):
             return 0
-        ready = pd.Series(df["technical_ready"]).fillna(False).astype(bool)
+        ready = na_false_bool(df["technical_ready"])
         return int(df.loc[ready, "symbol"].astype(str).nunique())
     except Exception:
         return 0
@@ -207,7 +209,7 @@ def _safe_display_ready_count(df: pd.DataFrame) -> int:
         if not isinstance(df, pd.DataFrame) or df.empty:
             return 0
         if "display_ready" in df.columns:
-            return int(pd.Series(df["display_ready"]).fillna(False).astype(bool).sum())
+            return na_false_bool_count(df["display_ready"])
         return int(_build_display_ready_mask(df).sum())
     except Exception:
         return 0
@@ -218,7 +220,7 @@ def _safe_display_ready_symbol_count(df: pd.DataFrame) -> int:
         if not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
             return 0
         if "display_ready" in df.columns:
-            ready = pd.Series(df["display_ready"]).fillna(False).astype(bool)
+            ready = na_false_bool(df["display_ready"])
         else:
             ready = _build_display_ready_mask(df)
         return int(df.loc[ready, "symbol"].astype(str).nunique())
@@ -330,7 +332,138 @@ def _build_display_ready_mask(df: pd.DataFrame) -> pd.Series:
         return pd.Series(False, index=idx)
 
 
-def attach_display_ready(df: pd.DataFrame) -> pd.DataFrame:
+_DUPCOL_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+
+def _dupcol_guard_enabled() -> bool:
+    """重複カラム一意化ガードをこのプロセスで使うか。
+
+    旧 core/startup/summary_controller_concat_duplicate_columns_patch は
+    sitecustomize の BACKGROUND_MAIN_PATCHES 経由 = main.py 専用で、
+    DB専用子プロセスでは適用されていなかった。本文化後も同じスコープを保つ。
+    SUMMARY_CONTROLLER_DUPCOL_GUARD_ENABLED=1/0 で明示的に上書きできる。
+    """
+    import os
+    import sys
+
+    try:
+        raw = os.getenv("SUMMARY_CONTROLLER_DUPCOL_GUARD_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "enable", "enabled"}
+        if str(os.getenv("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", "")).strip().lower() in {
+            "1", "true", "yes", "y", "on", "enable", "enabled",
+        }:
+            return True
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv_text for name in _DUPCOL_DB_PROCESS_NAMES)
+    except Exception:
+        return False
+
+
+def _dedupe_duplicate_columns(df: pd.DataFrame, *, context: str = "") -> pd.DataFrame:
+    """DataFrame.columns を一意にする。
+
+    (旧 core/startup/summary_controller_concat_duplicate_columns_patch.py から移設)
+
+    normalize_fn / MTF attach / daily MA attach の合成過程で close / close_price /
+    score / score_mtf / mtf / display_ready などが同名カラムとして重複することがあり、
+    pd.concat(axis=0) が
+      InvalidIndexError: Reindexing only valid with uniquely valued Index objects
+    で落ちる。重複時は先頭列を優先し、先頭が欠損の行だけ後続の同名列で補完する。
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    try:
+        if df.columns.is_unique:
+            return df
+    except Exception:
+        return df
+
+    try:
+        out = df.copy()
+        cols = list(out.columns)
+        seen: dict[str, list[int]] = {}
+        order: list[str] = []
+
+        for i, c in enumerate(cols):
+            name = str(c)
+            if name not in seen:
+                seen[name] = []
+                order.append(name)
+            seen[name].append(i)
+
+        dup_names = [name for name, idxs in seen.items() if len(idxs) > 1]
+
+        if dup_names:
+            logger.warning(
+                "[SUMMARY CONTROLLER DUPCOL] duplicate columns detected context=%s dup_count=%s dup_names=%s cols_before=%s",
+                context, len(dup_names), dup_names[:30], len(cols),
+            )
+
+        series_list = []
+        new_cols = []
+
+        for name in order:
+            idxs = seen[name]
+            if len(idxs) == 1:
+                s = out.iloc[:, idxs[0]]
+            else:
+                block = out.iloc[:, idxs]
+                try:
+                    s = block.bfill(axis=1).iloc[:, 0]
+                except Exception:
+                    s = block.iloc[:, 0]
+            series_list.append(pd.Series(s).reset_index(drop=True))
+            new_cols.append(name)
+
+        fixed = pd.concat(series_list, axis=1, ignore_index=True)
+        fixed.columns = new_cols
+        fixed.index = out.index
+
+        if dup_names:
+            logger.warning(
+                "[SUMMARY CONTROLLER DUPCOL] duplicate columns fixed context=%s cols_after=%s rows=%s",
+                context, len(fixed.columns), len(fixed),
+            )
+
+        return fixed
+
+    except Exception:
+        logger.exception("[SUMMARY CONTROLLER DUPCOL] failed to dedupe duplicate columns context=%s", context)
+        try:
+            return df.loc[:, ~df.columns.duplicated()].copy()
+        except Exception:
+            return df
+
+
+def _attach_display_ready_with_dedupe(df: pd.DataFrame) -> pd.DataFrame:
+    """display_ready 付与の前後で columns を一意化する。
+
+    旧 summary_controller_concat_duplicate_columns_patch がこの形で
+    attach_display_ready をラップしていたので本文へ取り込んだ。
+    concat_frames からはこちらを直接呼ぶ (外側 patch を経由させない)。
+    """
+    df = _dedupe_duplicate_columns(df, context="attach_display_ready:before")
+    out = _attach_display_ready_core(df)
+    return _dedupe_duplicate_columns(out, context="attach_display_ready:after")
+
+
+def _attach_display_ready_core(df: pd.DataFrame) -> pd.DataFrame:
+    if _dupcol_guard_enabled():
+        return _attach_display_ready_with_dedupe(df)
+    return _attach_display_ready_core(df)
+
+
+def _attach_display_ready_core(df: pd.DataFrame) -> pd.DataFrame:
     """
     display_ready 列を付与する。
     technical_ready は変更しない。
@@ -346,12 +479,12 @@ def attach_display_ready(df: pd.DataFrame) -> pd.DataFrame:
 
         if "technical_ready" in out.columns:
             try:
-                tech_ready = pd.Series(out["technical_ready"]).fillna(False).astype(bool)
+                tech_ready = na_false_bool(out["technical_ready"])
                 display_ready = display_ready | tech_ready
             except Exception:
                 pass
 
-        out["display_ready"] = display_ready.fillna(False).astype(bool)
+        out["display_ready"] = na_false_bool(display_ready)
 
         logger.info(
             "[summary_controller] attach_display_ready rows=%s cols=%s display_rows=%s display_symbols=%s score_nonzero=%s close_nonnull=%s",
@@ -381,23 +514,46 @@ def concat_frames(
     frames: list[pd.DataFrame],
     normalize_fn: Callable[[pd.DataFrame], pd.DataFrame],
 ) -> pd.DataFrame:
-    xs = []
-    for x in frames:
-        df = normalize_fn(x)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            df = attach_display_ready(df)
-            xs.append(df)
+    if not _dupcol_guard_enabled():
+        return _concat_frames_core(frames, normalize_fn)
+
+    # 旧 summary_controller_concat_duplicate_columns_patch から移設。
+    # 各段で columns を一意化し、InvalidIndexError を防ぐ。
+    # attach_display_ready は「この関数内で定義された版」を直接呼んでいたため、
+    # 後から attach_display_ready をラップする patch (summary_controller_ready_mtf 等)
+    # の効果はここには入らない。その関係を保つため
+    # _attach_display_ready_with_dedupe を直接呼ぶ。
+    xs: list[pd.DataFrame] = []
+
+    for i, x in enumerate(frames or []):
+        try:
+            df = normalize_fn(x)
+            df = _dedupe_duplicate_columns(df, context=f"concat:normalized:{i}")
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df = _attach_display_ready_with_dedupe(df)
+                df = _dedupe_duplicate_columns(df, context=f"concat:ready:{i}")
+                xs.append(df)
+        except Exception:
+            logger.exception("[SUMMARY CONTROLLER DUPCOL] normalize/ready failed frame_index=%s", i)
 
     if not xs:
         return pd.DataFrame()
 
     try:
+        xs = [
+            _dedupe_duplicate_columns(x, context=f"concat:pre:{i}")
+            for i, x in enumerate(xs)
+            if isinstance(x, pd.DataFrame) and not x.empty
+        ]
         out = pd.concat(xs, axis=0, ignore_index=True, sort=False)
+        out = _dedupe_duplicate_columns(out, context="concat:post_concat")
         out = normalize_fn(out)
-        out = attach_display_ready(out)
+        out = _dedupe_duplicate_columns(out, context="concat:post_normalize")
+        out = _attach_display_ready_with_dedupe(out)
+        out = _dedupe_duplicate_columns(out, context="concat:final")
         return out
     except Exception:
-        logger.exception("[summary_controller] concat frames failed")
+        logger.exception("[SUMMARY CONTROLLER DUPCOL] concat frames failed even after dupcol guard")
         return pd.DataFrame()
 
 
@@ -575,7 +731,28 @@ def safe_global_get_merged_summary(
     return pd.DataFrame()
 
 
+# ============================================================
+# SAFE SET (旧 trading/summary/controller_cache_safe_set_patch.py V2)
+# ------------------------------------------------------------
+# 既存の merged summary を、未成熟 / latest-only の候補で上書きしない。
+# 既存テクニカルの引き継ぎも行う。実装は
+# trading/summary/controller_cache_safe_set.py にあり、ここは束縛だけ。
+# ネイティブ実装は *_core へ改名した。
+# ============================================================
+
+_safe_set_patch_v2_installed = True
+_safe_set_patch_v1_installed = True
+
+
 def safe_global_set_merged_summary(interval: int, df: pd.DataFrame) -> None:
+    from trading.summary.controller_cache_safe_set import (
+        safe_global_set_merged_summary as _safe_set,
+    )
+
+    return _safe_set(safe_global_set_merged_summary_core, interval, df)
+
+
+def safe_global_set_merged_summary_core(interval: int, df: pd.DataFrame) -> None:
     """
     PUSH由来 summary_controller 用 merged cache 保存。
     GlobalContext が source 指定に対応している場合は source="push" を明示する。
@@ -961,7 +1138,7 @@ def candidate_is_immature(df: pd.DataFrame) -> bool:
         return False
 
 
-def choose_merged_cache_payload(
+def _choose_merged_cache_payload_core(
     interval: int,
     df_hist: pd.DataFrame,
     df_latest: pd.DataFrame,
@@ -1091,3 +1268,374 @@ __all__ = [
     "choose_merged_cache_payload",
     "should_overwrite_merged_summary",
 ]
+
+def _concat_frames_core(
+    frames: list[pd.DataFrame],
+    normalize_fn: Callable[[pd.DataFrame], pd.DataFrame],
+) -> pd.DataFrame:
+    """重複カラムガードを使わない従来実装。
+
+    旧 summary_controller_concat_duplicate_columns_patch が install されない
+    プロセス (DB専用子プロセス) ではこちらが使われていた。
+    """
+    xs = []
+    for x in frames:
+        df = normalize_fn(x)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            df = attach_display_ready(df)
+            xs.append(df)
+
+    if not xs:
+        return pd.DataFrame()
+
+    try:
+        out = pd.concat(xs, axis=0, ignore_index=True, sort=False)
+        out = normalize_fn(out)
+        out = attach_display_ready(out)
+        return out
+    except Exception:
+        logger.exception("[summary_controller] concat frames failed")
+        return pd.DataFrame()
+
+
+# ============================================================
+# SUMMARY LATEST PREFER (旧 core/startup/summary_latest_prefer_patch.py)
+# ------------------------------------------------------------
+# history が遅れているときに latest 側を優先して merged payload を作る層。
+#
+# 旧パッチは choose_merged_cache_payload を差し替えたうえで、
+# trading/summary/summary_controller.py の from-import 束縛
+# (38行) も明示的に上書きしていた。本文化して本体に組み込んだので
+# from-import が最初から合成後の関数を掴む = 上書きは不要になった。
+#
+# 実 install 順の実測:
+#   sitecustomize.py:555 _install_runtime_defaults()
+#     -> runtime_env/installer -> full_pipeline_stability_runtime_patch
+#     -> summary_latest_prefer_patch  (ここが先)
+#   sitecustomize.py:568 背景スレッド -> BACKGROUND_MAIN_PATCHES
+#     -> summary_mtf_early_ready_patch (後)
+# よって controller_cache 上の合成は
+#   native <- latest_prefer <- mtf_early_ready(history-first)
+# だった。
+#
+# ただし choose_merged_cache_payload の呼び出し元はリポジトリ全体で
+# trading/summary/summary_controller.py の 2 箇所だけで、そこは
+# latest_prefer が上書きした sc 側の束縛を使う。つまり
+# summary_mtf_early_ready_patch の history-first ラッパーは
+# **誰からも呼ばれない死んだラッパー**である。
+# そのため latest_prefer だけを単独で本文化しても層順は壊れない。
+# (mtf 側のラッパーは引き続き cc の属性を包むが、呼び手が居ないまま)
+# ============================================================
+
+_LP_REALTIME_TIME_COLS = (
+    "received_at", "recv_at", "recv_time", "last_recv", "last_recv_at", "last_received_at",
+    "push_received_at", "push_time", "tick_time", "quote_time", "current_price_time",
+    "CurrentPriceTime", "price_time", "event_time", "updated_at", "created_at",
+    "timestamp", "time_stamp",
+)
+
+
+def _lp_env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).strip()))
+    except Exception:
+        return int(default)
+
+
+def _lp_safe_symbol_count(df: pd.DataFrame) -> int:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
+            return 0
+        s = df["symbol"].fillna("").astype(str).str.strip()
+        s = s[(s != "") & (s.str.lower() != "nan") & (s.str.lower() != "none")]
+        return int(s.nunique())
+    except Exception:
+        return 0
+
+
+def _lp_to_naive_datetime_series(s) -> pd.Series:
+    try:
+        out = pd.to_datetime(s, errors="coerce")
+        try:
+            out = out.dt.tz_localize(None)
+        except Exception:
+            try:
+                out = out.dt.tz_convert(None)
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return pd.Series(dtype="datetime64[ns]")
+
+
+def _lp_safe_latest_dt(df: pd.DataFrame):
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        for c in ("datetime", "end_time", "snapshot_time", "tick_time"):
+            if c in df.columns:
+                s = _lp_to_naive_datetime_series(df[c]).dropna()
+                if not s.empty:
+                    return s.max()
+    except Exception:
+        return None
+    return None
+
+
+def _lp_safe_realtime_dt(df: pd.DataFrame):
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        best = None
+        for c in _LP_REALTIME_TIME_COLS:
+            if c not in df.columns:
+                continue
+            s = _lp_to_naive_datetime_series(df[c]).dropna()
+            if s.empty:
+                continue
+            mx = s.max()
+            if best is None or mx > best:
+                best = mx
+        return best
+    except Exception:
+        return None
+
+
+def _lp_floor_to_interval_min(s: pd.Series, interval: int) -> pd.Series:
+    try:
+        interval_i = max(1, int(interval))
+        return s.dt.floor(f"{interval_i}min")
+    except Exception:
+        try:
+            return s.dt.floor("min")
+        except Exception:
+            return s
+
+
+def _lp_numeric_nonzero(df: pd.DataFrame, cols: tuple[str, ...]) -> int:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return 0
+        best = 0
+        for c in cols:
+            if c in df.columns:
+                s = pd.to_numeric(df[c], errors="coerce").fillna(0)
+                best = max(best, int((s != 0).sum()))
+        return best
+    except Exception:
+        return 0
+
+
+def _lp_numeric_nonnull(df: pd.DataFrame, cols: tuple[str, ...]) -> int:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return 0
+        best = 0
+        for c in cols:
+            if c in df.columns:
+                s = pd.to_numeric(df[c], errors="coerce")
+                best = max(best, int(s.notna().sum()))
+        return best
+    except Exception:
+        return 0
+
+
+def _lp_latest_is_usable(df: pd.DataFrame, min_symbols: int) -> bool:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return False
+        symbols = _lp_safe_symbol_count(df)
+        close_nonnull = _lp_numeric_nonnull(df, ("close", "close_price", "price", "current_price", "last_price"))
+        score_nonzero = _lp_numeric_nonzero(df, ("score", "score_total", "final_score", "display_score", "score_buy", "score_sell"))
+        return symbols >= int(min_symbols) and close_nonnull >= max(1, min_symbols // 2) and (score_nonzero >= 0)
+    except Exception:
+        return False
+
+
+def _lp_promote_latest_datetime(latest: pd.DataFrame, interval: int, min_symbols: int) -> pd.DataFrame:
+    try:
+        if not _lp_latest_is_usable(latest, min_symbols) or "datetime" not in latest.columns:
+            return latest
+        max_future_sec = _lp_env_int("SUMMARY_REALTIME_PROMOTE_MAX_FUTURE_SEC", 60)
+        max_wall_lag_sec = _lp_env_int("SUMMARY_REALTIME_PROMOTE_MAX_WALL_LAG_SEC", 900)
+        min_promote_sec = _lp_env_int("SUMMARY_REALTIME_PROMOTE_MIN_SEC", 60)
+        now = pd.Timestamp.now().tz_localize(None)
+        base_dt = _lp_to_naive_datetime_series(latest["datetime"])
+        best_col = None
+        best_max = None
+        best_s = None
+        for c in _LP_REALTIME_TIME_COLS:
+            if c not in latest.columns:
+                continue
+            s = _lp_to_naive_datetime_series(latest[c])
+            valid = s.dropna()
+            if valid.empty:
+                continue
+            mx = valid.max()
+            if best_max is None or mx > best_max:
+                best_col = c
+                best_max = mx
+                best_s = s
+        if best_s is None or best_max is None:
+            return latest
+        if best_max > now + pd.Timedelta(seconds=max_future_sec):
+            return latest
+        if (now - best_max).total_seconds() > float(max_wall_lag_sec):
+            return latest
+        new_dt = _lp_floor_to_interval_min(best_s, interval)
+        delta = (new_dt - base_dt).dt.total_seconds()
+        mask = base_dt.notna() & new_dt.notna() & (delta >= float(min_promote_sec))
+        if not bool(mask.any()):
+            return latest
+        out = latest.copy()
+        before = base_dt.max()
+        out.loc[mask, "datetime"] = new_dt[mask]
+        for c in ("end_time", "snapshot_time"):
+            if c in out.columns:
+                try:
+                    out.loc[mask, c] = new_dt[mask]
+                except Exception:
+                    pass
+        after = _lp_safe_latest_dt(out)
+        logger.warning(
+            "[SUMMARY LATEST PREFER PATCH] promoted realtime datetime interval=%s col=%s rows=%s before=%s after=%s realtime_max=%s now=%s",
+            interval, best_col, int(mask.sum()), before, after, best_max, now,
+        )
+        return out
+    except Exception:
+        logger.exception("[SUMMARY LATEST PREFER PATCH] realtime promote failed interval=%s", interval)
+        return latest
+
+
+def _lp_merge_latest_over_history(interval: int, hist: pd.DataFrame, latest: pd.DataFrame, normalize_fn: Callable[[pd.DataFrame], pd.DataFrame]) -> pd.DataFrame:
+    frames = []
+    try:
+        h = normalize_fn(hist)
+        if isinstance(h, pd.DataFrame) and not h.empty:
+            frames.append(h)
+    except Exception:
+        pass
+    try:
+        l = normalize_fn(latest)
+        if isinstance(l, pd.DataFrame) and not l.empty:
+            frames.append(l)
+    except Exception:
+        pass
+    if not frames:
+        return pd.DataFrame()
+    out = concat_frames(frames, normalize_fn=normalize_fn)
+    out = dedupe_symbol_datetime(out, normalize_fn=normalize_fn)
+    out = limit_history_rows_per_symbol(out, interval, normalize_fn=normalize_fn)
+    out = attach_display_ready(out)
+    return out
+
+
+def choose_merged_cache_payload(
+    interval: int,
+    df_hist: pd.DataFrame,
+    df_latest: pd.DataFrame,
+    normalize_fn: Callable[[pd.DataFrame], pd.DataFrame],
+) -> pd.DataFrame:
+    if not _lp_enabled():
+        return _choose_merged_cache_payload_core(interval, df_hist, df_latest, normalize_fn)
+    try:
+        interval_i = int(interval)
+        intervals = {int(x) for x in str(os.environ.get("SUMMARY_FORCE_LATEST_INTERVALS", "1,3,5")).replace(";", ",").split(",") if str(x).strip().isdigit()}
+        if interval_i not in intervals:
+            return _choose_merged_cache_payload_core(interval, df_hist, df_latest, normalize_fn)
+        lag_sec = _lp_env_int("SUMMARY_FORCE_LATEST_WHEN_HISTORY_LAG_SEC", 120)
+        wall_lag_sec = _lp_env_int("SUMMARY_FORCE_LATEST_WALL_LAG_SEC", 180)
+        min_symbols = _lp_env_int("SUMMARY_FORCE_LATEST_MIN_SYMBOLS", 20)
+        hist = normalize_fn(df_hist)
+        latest = normalize_fn(df_latest)
+        latest = _lp_promote_latest_datetime(latest, interval_i, min_symbols)
+        hist_dt = _lp_safe_latest_dt(hist)
+        latest_dt = _lp_safe_latest_dt(latest)
+        realtime_dt = _lp_safe_realtime_dt(latest)
+        hist_symbols = _lp_safe_symbol_count(hist)
+        latest_symbols = _lp_safe_symbol_count(latest)
+        latest_usable = _lp_latest_is_usable(latest, min_symbols)
+        force_latest = False
+        reason = None
+        delta_sec = None
+        if hist_dt is not None and latest_dt is not None:
+            delta_sec = float((latest_dt - hist_dt).total_seconds())
+            force_latest = delta_sec >= float(lag_sec) and latest_usable
+            if force_latest:
+                reason = "latest_newer_than_history"
+        elif latest_dt is not None and latest_usable:
+            force_latest = True
+            reason = "latest_only"
+        if not force_latest and latest_dt is not None and latest_usable:
+            now = pd.Timestamp.now().tz_localize(None)
+            wall_lag = float((now - latest_dt).total_seconds())
+            realtime_lag = None if realtime_dt is None else float((now - realtime_dt).total_seconds())
+            if wall_lag >= float(wall_lag_sec) and (realtime_dt is None or realtime_lag <= float(max(wall_lag_sec, 300))):
+                force_latest = True
+                reason = "wall_lag_latest_usable"
+        if force_latest:
+            payload = _lp_merge_latest_over_history(interval_i, hist, latest, normalize_fn)
+            logger.warning(
+                "[SUMMARY LATEST PREFER PATCH] force latest interval=%s reason=%s hist_dt=%s latest_dt=%s realtime_dt=%s delta_sec=%s hist_symbols=%s latest_symbols=%s rows=%s payload_latest_dt=%s lag_sec=%s",
+                interval_i, reason, hist_dt, latest_dt, realtime_dt, delta_sec,
+                hist_symbols, latest_symbols,
+                len(payload) if isinstance(payload, pd.DataFrame) else 0,
+                _lp_safe_latest_dt(payload), lag_sec,
+            )
+            return payload
+        return _choose_merged_cache_payload_core(interval, df_hist, df_latest, normalize_fn)
+    except Exception:
+        logger.exception("[SUMMARY LATEST PREFER PATCH] patched choose failed interval=%s", interval)
+        return _choose_merged_cache_payload_core(interval, df_hist, df_latest, normalize_fn)
+
+
+def _lp_enabled() -> bool:
+    """旧 install 経路のキルスイッチを再現する。
+
+    summary_latest_prefer_patch は
+      runtime_env/installer -> full_pipeline_stability_runtime_patch
+      -> _install_summary_latest_prefer()
+    の順に入っていたので、その 2 つの DISABLE env をどちらも見る。
+    """
+    if str(os.environ.get("DISABLE_SUMMARY_LATEST_PREFER_PATCH", "")).strip() == "1":
+        return False
+    if str(os.environ.get("DISABLE_FULL_PIPELINE_STABILITY_PATCH", "")).strip() == "1":
+        return False
+    return True
+
+
+def _lp_apply_env_defaults() -> None:
+    """旧 install() の env setdefault を再現する。"""
+    os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_EMPTY", "1")
+    os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_OLD", "1")
+    os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_MAX_AGE_DAYS", "2")
+    os.environ.setdefault("PUSH_MTF_VOLUME_FALLBACK_ENABLED", "1")
+    os.environ.setdefault("PUSH_MTF_ZERO_VOLUME_FALLBACK_VOLUME", "30000")
+
+
+if _lp_enabled():
+    _lp_apply_env_defaults()
+
+
+# ============================================================
+# controller 層の 3 段ラッパー
+# (旧 core/startup の summary_controller_neutral_score_guard_patch /
+#  summary_controller_publish_mtf_merged_patch /
+#  summary_controller_ready_mtf_patch を本文化)
+# ------------------------------------------------------------
+# 各パッチの _ORIGINALS を実測した結果、合成は
+#   native <- neutral_score_guard <- publish_mtf_merged <- ready_mtf
+# の 3 層 (5 関数すべて同じ、捨てられている層は無い)。
+# その順序を trading/summary/controller_layers.apply_layers() が再現する。
+# ネイティブは *_core へ改名した。
+# ============================================================
+
+
+def attach_display_ready(*args, **kwargs):
+    from trading.summary.controller_layers import apply_layers as _apply_layers
+
+    return _apply_layers(_attach_display_ready_core, "attach_display_ready", "trading.summary.controller_cache.attach_display_ready", args, kwargs)

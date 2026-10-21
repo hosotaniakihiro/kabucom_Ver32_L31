@@ -14,9 +14,10 @@
 # ============================================================
 
 from __future__ import annotations
+from nas_root import nas_path, nas_root
 
 
-DEFAULT_PUSH_DB_DIR = r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\push"
+DEFAULT_PUSH_DB_DIR = nas_path(r"raw_data\kabu_station\push")
 
 DEFAULT_PUSH_TABLE_CANDIDATES = (
     "stream_data",

@@ -16,12 +16,14 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+from functools import wraps
 
 import pandas as pd
 
 from .config import VOLUME_AVG_LOOKBACK_BARS
 from .summary_loader import load_merged_summary, normalize_summary_base
 from .utils import safe_float
+from trading.summary.bool_series import na_false_bool
 
 logger = logging.getLogger(__name__)
 
@@ -184,18 +186,30 @@ def _first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
     return None
 
 
+def _nan_series(index) -> pd.Series:
+    """全NaNのfloat列を返す。
+
+    pd.Series(pd.NA, index=..., dtype="float64") は pandas 2.2.3 で
+    TypeError: float() argument must be ... not 'NAType' を送出するため使わない。
+    これを踏むと except 節側の同じ構文まで再送出して呼び出し元へ伝播してしまう。
+    """
+    if index is None:
+        index = pd.Index([])
+    return pd.Series(float("nan"), index=index, dtype="float64")
+
+
 def _intrabar_price_change_pct(df: pd.DataFrame, interval: int) -> pd.Series:
     try:
         close_col = _first_existing(df, [f"close_{interval}m", "close", "close_price", "current_price", "price"])
         open_col = _first_existing(df, [f"open_{interval}m", "open", "open_price"])
         if close_col is None or open_col is None:
-            return pd.Series(pd.NA, index=df.index, dtype="float64")
+            return _nan_series(df.index)
         close = pd.to_numeric(df[close_col], errors="coerce")
         open_ = pd.to_numeric(df[open_col], errors="coerce")
         return ((close - open_) / open_.replace(0, pd.NA) * 100.0).replace([float("inf"), -float("inf")], pd.NA)
     except Exception:
         logger.debug("[TONOSAMA SURGE] intrabar price change failed interval=%s", interval, exc_info=True)
-        return pd.Series(pd.NA, index=df.index if df is not None else None, dtype="float64")
+        return _nan_series(df.index if df is not None else None)
 
 
 def _consecutive_true_counts(values: pd.Series) -> pd.Series:
@@ -210,7 +224,7 @@ def _consecutive_true_counts(values: pd.Series) -> pd.Series:
     return pd.Series(out, index=values.index, dtype="int64")
 
 
-def add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
+def _add_volume_surge_features_core(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
     x = normalize_summary_base(df, interval=interval)
     x = _filter_recent_rows(x, interval=interval, label="feature_source")
     if x.empty:
@@ -269,7 +283,8 @@ def _fallback_price_change_from_1m(out: pd.DataFrame) -> pd.Series:
         x = _ensure_open_close_aliases(out)
         return _intrabar_price_change_pct(x, 1)
     except Exception:
-        return pd.Series(pd.NA, index=out.index if out is not None else None, dtype="float64")
+        logger.debug("[TONOSAMA SURGE] 1m price change fallback failed", exc_info=True)
+        return _nan_series(out.index if out is not None else None)
 
 
 def _force_failopen_enabled() -> bool:
@@ -385,8 +400,10 @@ def build_scalping_feature_df() -> pd.DataFrame:
     elif "volume_surge_ratio_5m" in out.columns:
         out["_surge_tf"] = "5m"
     try:
-        history_missing = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
-        failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+        # fillna(False).astype(bool) は object dtype のとき暗黙ダウンキャスト警告になる。
+        # プロジェクト既存の na_false_bool() は同じ結果を非推奨経路を通らずに返す。
+        history_missing = na_false_bool(out.get("_volume_surge_history_missing"), index=out.index)
+        failopen_col = na_false_bool(out.get("_volume_surge_failopen"), index=out.index)
         up3 = out.get("prev_3m_up_streak", pd.Series(0, index=out.index)).fillna(0)
         up5 = out.get("prev_5m_up_streak", pd.Series(0, index=out.index)).fillna(0)
         dn3 = out.get("prev_3m_down_streak", pd.Series(0, index=out.index)).fillna(0)
@@ -395,6 +412,101 @@ def build_scalping_feature_df() -> pd.DataFrame:
     except Exception:
         pass
     return out.reset_index(drop=True)
+
+
+# ============================================================
+# STRICT ENTRY DEFAULTS
+# (旧 core/startup/tonosama_history_failclose_strict_patch._patch_tonosama)
+# ------------------------------------------------------------
+# strict モードでは history_missing / failopen の行をエントリー候補から落とす。
+# core/startup/strict_entry_defaults.py が install 時と watcher から毎秒呼ぶ。
+#
+# 旧パッチと同じく「現在の build_scalping_feature_df の _original を取り出して
+# 包み直す」= 直前に掛かっていた外側ラッパーを 1 枚剥がす挙動をそのまま残す。
+# 実測では usercustomize の recent volume 表示ラッパーがこれで剥がされて
+# 定常状態になるため、剥がす挙動そのものが観測挙動になっている。
+#
+# 旧パッチはあわせて _force_failopen_enabled / _failopen_reason を定数関数へ
+# 差し替えていたが、strict の env (TONOSAMA_FORCE_SURGE_FAILOPEN=0 ほか) を
+# 適用したネイティブ実装が同じ値・同じ文字列を返すため移していない。
+# ============================================================
+
+
+def install_strict_history_failclose() -> bool:
+    """strict の history_missing/failopen 行ドロップを build_scalping_feature_df へ掛ける。"""
+    try:
+        cur = globals().get("build_scalping_feature_df")
+        if not callable(cur) or getattr(cur, "_strict_no_history_failopen_v4", False):
+            return True
+        orig = getattr(cur, "_original", cur)
+
+        @wraps(orig)
+        def wrapped(*args, **kwargs):
+            out = orig(*args, **kwargs)
+            try:
+                if out is None or not isinstance(out, pd.DataFrame) or out.empty:
+                    return out
+                hist_missing = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+                failopen = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+                bad = hist_missing | failopen
+                if bool(bad.any()):
+                    before = len(out)
+                    cols = [c for c in ["symbol", "symbolname", "_volume_surge_history_missing", "_volume_surge_failopen"] if c in out.columns]
+                    sample = out.loc[bad, cols].head(20).to_dict("records")
+                    out = out.loc[~bad].copy()
+                    logger.warning(
+                        "[STRICT ENTRY DEFAULTS] TONOSAMA drop history_missing/failopen rows before=%s after=%s dropped=%s sample=%s",
+                        before, len(out), int(bad.sum()), sample,
+                    )
+                return out
+            except Exception:
+                logger.exception("[STRICT ENTRY DEFAULTS] TONOSAMA strict drop failed; returning original output")
+                return out
+
+        wrapped._strict_no_history_failopen_v3 = True  # type: ignore[attr-defined]
+        wrapped._strict_no_history_failopen_v4 = True  # type: ignore[attr-defined]
+        wrapped._original = orig  # type: ignore[attr-defined]
+        globals()["build_scalping_feature_df"] = wrapped
+        logger.warning("[STRICT ENTRY DEFAULTS] TONOSAMA volume_surge strict wrapper installed")
+        return True
+    except Exception:
+        logger.debug("[STRICT ENTRY DEFAULTS] TONOSAMA volume_surge strict wrapper skipped", exc_info=True)
+        return False
+
+
+# ============================================================
+# RAW1 履歴 resample フォールバック
+# (旧 core/startup/tonosama_history_missing_guard_patch.py の
+#  _patch_volume_surge_rolling_before_recent を本文化)
+# ------------------------------------------------------------
+# 旧パッチは install 時に vs.add_volume_surge_features を 1 枚だけ包んで
+# いた (この属性を包む他パッチは無い)。ネイティブは *_core へ改名し、
+# ここが公開名を持つ。上の build_scalping_feature_df からの呼び出しも
+# モジュールグローバル経由なので、旧構成と同じくこの層を通る。
+#
+# 適用スコープは sitecustomize のパッチ一覧と同じで、
+# DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH=1 のときだけ素の実装に戻す。
+# (旧 install はこの差し替えを TONOSAMA_HISTORY_MISSING_GUARD_ENABLED の
+#  判定より前に行っていたので、そちらは見ない)
+# ============================================================
+
+
+def _hg_surge_guard_enabled() -> bool:
+    try:
+        return str(os.environ.get("DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH", "")).strip() != "1"
+    except Exception:
+        return True
+
+
+def add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
+    if not _hg_surge_guard_enabled():
+        return _add_volume_surge_features_core(df, interval=interval)
+    try:
+        from trading.entry.tonosama.history_missing_guard import add_volume_surge_features_guarded
+    except Exception:
+        logger.exception("[TONOSAMA SURGE ROLLING PATCH] guard import failed; use core")
+        return _add_volume_surge_features_core(df, interval=interval)
+    return add_volume_surge_features_guarded(df, interval=interval)
 
 
 __all__ = ["build_scalping_feature_df", "add_volume_surge_features"]

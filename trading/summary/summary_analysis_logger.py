@@ -36,6 +36,8 @@ import sqlite3
 from typing import Iterable, Optional
 
 import pandas as pd
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -110,8 +112,8 @@ _SYMBOLNAME_COL_CANDIDATES = [
 ]
 
 _SYMBOLNAME_DB_CANDIDATES = [
-    r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db",
-    r"\\192.168.0.22\AutoStockBuyAndSell\basic\symbol_flags.db",
+    nas_path(r"Basic\symbol_flags.db"),
+    nas_path(r"basic\symbol_flags.db"),
 ]
 
 
@@ -302,7 +304,7 @@ def _load_symbol_map_from_db() -> dict[str, str]:
         try:
             if not os.path.exists(db_path):
                 continue
-            with sqlite3.connect(db_path, timeout=15) as conn:
+            with committing_connect(db_path, timeout=15) as conn:
                 df = pd.read_sql(sql, conn)
 
             if df.empty:

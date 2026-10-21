@@ -4,7 +4,7 @@
 # ------------------------------------------------------------
 # 目的:
 #   日足分析DB:
-#     \\192.168.0.22\kabu\stock_data\daily_db\stock_analysis.db
+#     \\192.168.0.22\AutoStockBuyAndSell\daily_db\stock_analysis.db
 #
 #   の stock_analysis_latest を読み、
 #   自動売買のエントリー / EXIT 判定で使える日足情報を付与する。
@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, Iterable, List
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,24 @@ logger = logging.getLogger(__name__)
 # DB 設定
 # ============================================================
 
-DAILY_DB_PATH = r"\\192.168.0.22\kabu\stock_data\daily_db\stock_analysis.db"
+# 夜間バッチ NightYahooDailyFullSummary の書き込み先へ合わせる。
+# 旧パス \\192.168.0.22\kabu\stock_data\daily_db\ は
+# 2026-07-17 以降更新されていない (2026-08-25 実測)。
+# DAILY_DB_PATH env で上書きできる。
+_DAILY_DB_PATH_FALLBACK = nas_path(r"daily_db\stock_analysis.db")
+
+
+def _resolve_daily_db_path() -> str:
+    try:
+        v = os.getenv("DAILY_DB_PATH")
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    except Exception:
+        pass
+    return _DAILY_DB_PATH_FALLBACK
+
+
+DAILY_DB_PATH = _resolve_daily_db_path()
 
 DB_TABLE_LATEST = "stock_analysis_latest"
 DB_TABLE_HISTORY = "stock_analysis_history"

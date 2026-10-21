@@ -851,12 +851,10 @@ def _load_from_ranking_db() -> Optional[pd.DataFrame]:
     logger.info("[ATS RANKING] ranking DB path=%s", db_path)
 
     try:
-        with sqlite3.connect(db_path, timeout=5.0) as conn:
-            try:
-                conn.execute("PRAGMA busy_timeout=5000")
-            except Exception:
-                pass
-
+        # P0-1/P0-6: `with sqlite3.connect(...)` は close しないので使わない。
+        # reader なので read-only で開き、空 DB を新規作成しない。
+        from database.sqlite_util import readonly_connect
+        with readonly_connect(db_path, timeout=5.0, busy_timeout_ms=5000) as conn:
             tables = set(_list_tables(conn))
             logger.info(
                 "[ATS RANKING] db tables path=%s tables=%s",
@@ -900,6 +898,11 @@ def _load_from_ranking_db() -> Optional[pd.DataFrame]:
             )
             return None
 
+    except FileNotFoundError as e:
+        # reader は DB を作らない。存在しないことを明示して返す。
+        logger.warning("[ATS RANKING] ranking DB が存在しない (reader は作成しない) path=%s err=%s",
+                       db_path, e)
+        return None
     except Exception:
         logger.exception("[ATS RANKING] ranking DB load failed path=%s", db_path)
         return None

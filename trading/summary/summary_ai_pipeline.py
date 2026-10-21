@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import pandas as pd
-from typing import List, Dict
+from typing import Any, Dict, List
 
 from AI.entry_gate import ai_final_entry_check
 from AI.entry_row_builder import build_entry_row
@@ -139,6 +139,15 @@ def run_ai_entry_checks(
 # ==========================================================
 
 def register_pending_entries(entries: List[Dict[str, Any]]) -> int:
+    # 定数とヘルパを持たないまま参照していた (未定義)。実体は summary_entry 側の
+    # 同名定義なので、そこから借りる。二重定義にすると片方だけ直る事故になる。
+    from trading.summary.summary_entry import (
+        DEFAULT_ENTRY_TYPE,
+        DEFAULT_SOURCE,
+        _normalize_side,
+        _safe_symbol,
+    )
+
     registered = 0
 
     try:

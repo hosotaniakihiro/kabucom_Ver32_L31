@@ -23,6 +23,26 @@ from trading.summary.seed_loader import load_seed_summary as load_summary_seed
 
 logger = logging.getLogger(__name__)
 
+
+def _get_push_df() -> pd.DataFrame:
+    """現行の PUSH DataFrame を取得する。
+
+    以前は global_data.push_df を直接読んでいたが、現行の
+    GlobalDataCompat はこの属性を持たず AttributeError になる。
+    正規の取得口は core.global_context.context.get_push_df()。
+    互換のため旧属性が残っている環境ではそちらも見る。
+    """
+    try:
+        from core.global_context.context import get_push_df
+
+        df = get_push_df()
+        if isinstance(df, pd.DataFrame):
+            return df
+    except Exception:
+        logger.debug("[SUMMARY BULK] get_push_df unavailable", exc_info=True)
+    df = getattr(global_data, "push_df", None)
+    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
 # ★ 市場終了時刻（日本株）
 MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MIN = 30
@@ -55,7 +75,7 @@ def run_bulk_summary_rebuild():
 
     logger.info("🚀 [BULK] summary_bulk_rebuild START")
 
-    df_push = global_data.push_df
+    df_push = _get_push_df()
     if df_push is None or df_push.empty:
         logger.error("[BULK] push_df empty → abort")
         return
@@ -137,9 +157,10 @@ def run_initial_summary_rebuild():
     # --------------------------------------------------------
     # ① seed 読み込み（MA75 安定用）
     # --------------------------------------------------------
+    # seed_loader.load_seed_summary の本数指定は bars (limit ではない)。
     df_seed = load_summary_seed(
         interval=1,
-        limit=SEED_LIMIT,
+        bars=SEED_LIMIT,
     )
 
     if df_seed.empty:
@@ -148,7 +169,7 @@ def run_initial_summary_rebuild():
     # --------------------------------------------------------
     # ② 当日 push → confirmed 1min
     # --------------------------------------------------------
-    df_push = global_data.push_df
+    df_push = _get_push_df()
     if df_push is None or df_push.empty:
         logger.warning("[INIT] push_df empty")
         return None

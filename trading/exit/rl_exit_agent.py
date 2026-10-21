@@ -18,6 +18,7 @@ import random
 import sqlite3
 import threading
 from typing import Dict, Tuple
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ class RLExitAgent:
 
     def _init_db(self):
 
-        with sqlite3.connect(self.db_path) as conn:
+        with committing_connect(self.db_path) as conn:
             c = conn.cursor()
 
             c.execute("""
@@ -154,7 +155,7 @@ class RLExitAgent:
 
     def _get_q_values(self, state: str) -> Dict[str, float]:
 
-        with sqlite3.connect(self.db_path) as conn:
+        with committing_connect(self.db_path) as conn:
             c = conn.cursor()
             c.execute(
                 "SELECT action, value FROM rl_q_table WHERE state = ?",
@@ -166,7 +167,7 @@ class RLExitAgent:
 
     def _set_q_value(self, state: str, action: str, value: float):
 
-        with sqlite3.connect(self.db_path) as conn:
+        with committing_connect(self.db_path) as conn:
             c = conn.cursor()
 
             c.execute("""

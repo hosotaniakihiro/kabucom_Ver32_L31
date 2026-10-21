@@ -41,6 +41,8 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -134,7 +136,7 @@ def _display_executor() -> ThreadPoolExecutor:
 # save owner gate
 # ============================================================
 
-def _is_database_process() -> bool:
+def _is_database_process_core() -> bool:
     return any(
         _env_true(name)
         for name in (
@@ -145,7 +147,7 @@ def _is_database_process() -> bool:
     )
 
 
-def _summary_save_enabled() -> bool:
+def _summary_save_enabled_core() -> bool:
     mode = _env_flag_value("AUTOSTOCK_SUMMARY_SAVE_MODE")
     if mode in ("disabled", "disable", "calculate_only", "calc_only", "no_save", "skip", "off"):
         return False
@@ -164,7 +166,29 @@ def _summary_save_enabled() -> bool:
     return True
 
 
+def _main_light_tick_skip_sync_save(df: pd.DataFrame, interval: int, *, source: str) -> bool:
+    """main (entry-only) では 1m summary の同期保存を飛ばす。
+
+    旧 core/startup/summary_main_1m_light_tick_patch (現 .light_tick_1m) が
+    _save_summary_if_owner をラップして実現していたものを、
+    tier1/tier2 と同じ「呼び出し側から直接呼ぶ」形へ置き換えた。
+    """
+    try:
+        from .light_tick_1m import skip_sync_save_in_main
+    except Exception:
+        logger.debug("[summary.runners] light tick save-skip import failed", exc_info=True)
+        return False
+    try:
+        return bool(skip_sync_save_in_main(df, interval, source=source))
+    except Exception:
+        logger.exception("[summary.runners] light tick save-skip failed interval=%s", interval)
+        return False
+
+
 def _save_summary_if_owner(df: pd.DataFrame, interval: int, *, source: str) -> None:
+    if _main_light_tick_skip_sync_save(df, interval, source=source):
+        return
+
     if _summary_save_enabled():
         logger.info(
             "[summary.runners] DB save enabled interval=%s source=%s owner=%s db_process=%s",
@@ -190,7 +214,30 @@ def _save_summary_if_owner(df: pd.DataFrame, interval: int, *, source: str) -> N
 # AI before display
 # ============================================================
 
+def _main_light_tick_async_ai(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> bool:
+    """main (entry-only) では PUSH AI hook を同期実行せず非同期 submit へ回す。
+
+    旧 core/startup/summary_main_1m_light_tick_patch (現 .light_tick_1m) が
+    _run_push_ai_entry_before_display を「置換」して実現していたもの
+    (元実装は一切呼ばれなかった) を、tier1/tier2 と同じ形へ置き換えた。
+    True を返したら同期 hook は実行しない = 旧構成と同じ。
+    """
+    try:
+        from .light_tick_1m import handle_push_ai_entry_in_main
+    except Exception:
+        logger.debug("[summary.runners] light tick async-ai import failed", exc_info=True)
+        return False
+    try:
+        return bool(handle_push_ai_entry_in_main(df, interval, now, run_entry))
+    except Exception:
+        logger.exception("[summary.runners] light tick async-ai failed interval=%s now=%s", interval, now)
+        return False
+
+
 def _run_push_ai_entry_before_display(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> None:
+    if _main_light_tick_async_ai(df, interval, now, run_entry):
+        return
+
     if run_entry and interval in (1, 3, 5):
         logger.info("[summary.runners] push AI entry requested before display interval=%s now=%s source=SUMMARY hook=v20", interval, now)
         run_summary_ai_entry_safe(interval=interval, now=now, df=df, source="SUMMARY")
@@ -302,8 +349,9 @@ def job_ranking_5m(display: bool = True, now: Optional[dt.datetime] = None, run_
 # ============================================================
 #
 # job_summary/job_1m/run_push_summary_job は、以前は core/startup/ の3本の
-# runtime patch (summary_main_direct_push_force_patch.py /
-# summary_main_1m_light_tick_patch.py / summary_main_memory_latest_1m_patch.py)
+# runtime patch (summary_main_direct_push_force_patch.py
+#  = 現 scheduler_jobs/summary/direct_push_1m.py /
+# light_tick_1m.py / memory_latest_1m.py)
 # がそれぞれ total-overwrite 方式で奪い合っていた ("3-way race")。
 #
 # 発見した不具合: summary_main_direct_push_force_patch.py は再適用用の
@@ -311,13 +359,13 @@ def job_ranking_5m(display: bool = True, now: Optional[dt.datetime] = None, run_
 # 古い "original" 参照を使い回していたため、他の2本が後から重ね書きしても
 # 次の watcher tick (main.py 起動シーケンス中に確実に発生する) で古い原本を
 # 土台に自分自身を再インストールし、他の2本のロジックを毎回確実に奪っていた。
-# 結果、summary_main_1m_light_tick_patch.py の「本物のPUSH summary runner
+# 結果、light_tick_1m.py の「本物のPUSH summary runner
 # パイプラインを使う、より正確な高速経路」は事実上一度も選ばれなかった。
 #
 # 本文化により、tier1/tier2 として明示的に優先順位を固定した:
-#   tier1: summary_main_direct_push_force_patch.tier1_build_and_publish
+#   tier1: scheduler_jobs.summary.direct_push_1m.tier1_build_and_publish
 #          (memory直接ビルド + タイムアウト保護 + 保存 + AI投入のhardening)
-#   tier2: summary_main_1m_light_tick_patch.build_light_1m_summary
+#   tier2: scheduler_jobs.summary.light_tick_1m.build_light_1m_summary
 #          (本物のPUSH summary runnerパイプライン、保存/表示のみスキップ)
 #   tier3: _job_summary_original_heavy (このファイルの元来の重い実装)
 # いずれも interval==1 かつ各パッチ自身の実行コンテキスト判定
@@ -326,7 +374,7 @@ def job_ranking_5m(display: bool = True, now: Optional[dt.datetime] = None, run_
 
 def _job_summary_tier1_direct_memory(now: dt.datetime, *, run_entry: bool) -> pd.DataFrame:
     try:
-        from core.startup.summary_main_direct_push_force_patch import (
+        from .direct_push_1m import (
             _is_main_py as _tier1_is_main_py,
             _env_bool as _tier1_env_bool,
             tier1_build_and_publish,
@@ -345,7 +393,7 @@ def _job_summary_tier1_direct_memory(now: dt.datetime, *, run_entry: bool) -> pd
 
 def _job_summary_tier2_light_runner(interval: int, now: dt.datetime, *, display: bool, run_entry: bool, **kwargs) -> pd.DataFrame:
     try:
-        from core.startup.summary_main_1m_light_tick_patch import (
+        from .light_tick_1m import (
             _is_entry_only_context as _tier2_is_entry_only_context,
             _env_bool as _tier2_env_bool,
             build_light_1m_summary,
@@ -362,20 +410,434 @@ def _job_summary_tier2_light_runner(interval: int, now: dt.datetime, *, display:
         return pd.DataFrame()
 
 
+def _stage():
+    """P0-2: ステージ別 elapsed / 予算超過の協調停止。取得できなければ None。"""
+    try:
+        from scheduler_jobs.summary import stage_tracker as _st
+        return _st
+    except Exception:
+        logger.debug("[summary.runners] stage_tracker import failed", exc_info=True)
+        return None
+
+
+# ============================================================
+# P0-1: FAST_PATH_DECISION
+# ------------------------------------------------------------
+# 「なぜこの tick は高速経路に乗った / 外れたのか」を 1 行で分かるようにする。
+# 09:46 hit / 09:47 miss の差を後から追えるようにするのが目的。
+# hit 率も累積で出す。
+# ============================================================
+
+_FAST_PATH_HITS = 0
+_FAST_PATH_MISSES = 0
+_FAST_PATH_LOCK = threading.Lock()
+
+_FAST_PATH_REQUIRED_COLS = ("symbol", "datetime", "close")
+
+
+def fast_path_stats() -> dict:
+    with _FAST_PATH_LOCK:
+        total = _FAST_PATH_HITS + _FAST_PATH_MISSES
+        return {
+            "hits": _FAST_PATH_HITS,
+            "misses": _FAST_PATH_MISSES,
+            "total": total,
+            "hit_rate": (_FAST_PATH_HITS / total) if total else None,
+        }
+
+
+def reset_fast_path_stats() -> None:
+    global _FAST_PATH_HITS, _FAST_PATH_MISSES
+    with _FAST_PATH_LOCK:
+        _FAST_PATH_HITS = 0
+        _FAST_PATH_MISSES = 0
+
+
+def _log_fast_path_decision(now_i, *, hit: bool, rows: int, df, elapsed: float,
+                            reject_reason: str = "", fallback_reason: str = "") -> None:
+    global _FAST_PATH_HITS, _FAST_PATH_MISSES
+    try:
+        with _FAST_PATH_LOCK:
+            if hit:
+                _FAST_PATH_HITS += 1
+            else:
+                _FAST_PATH_MISSES += 1
+            hits, misses = _FAST_PATH_HITS, _FAST_PATH_MISSES
+        total = hits + misses
+        rate = (hits / total) if total else 0.0
+
+        symbols = -1
+        latest = None
+        age = None
+        tech_ready = None
+        missing = []
+        if df is not None and hasattr(df, "columns") and not df.empty:
+            try:
+                symbols = int(df["symbol"].nunique()) if "symbol" in df.columns else -1
+            except Exception:
+                symbols = -1
+            try:
+                if "datetime" in df.columns:
+                    ts = pd.to_datetime(df["datetime"], errors="coerce").max()
+                    if not pd.isna(ts):
+                        latest = ts
+                        age = (pd.Timestamp(now_i) - pd.Timestamp(ts)).total_seconds()
+            except Exception:
+                logger.debug("[FAST_PATH_DECISION] latest calc failed", exc_info=True)
+            try:
+                if "technical_ready" in df.columns:
+                    tech_ready = int(pd.to_numeric(df["technical_ready"], errors="coerce").fillna(0).astype(bool).sum())
+            except Exception:
+                tech_ready = None
+            missing = [c for c in _FAST_PATH_REQUIRED_COLS if c not in df.columns]
+
+        log = logger.warning if not hit else logger.info
+        log(
+            "[FAST_PATH_DECISION] tick=%s result=%s elapsed=%.3fs rows=%s symbols=%s "
+            "freshest_latest=%s age=%s technical_ready=%s required_cols_missing=%s "
+            "reject_reason=%s fallback_reason=%s hit=%d miss=%d hit_rate=%.2f",
+            now_i, "HIT" if hit else "MISS", elapsed, rows, symbols,
+            latest, None if age is None else round(age, 1), tech_ready, missing or "-",
+            reject_reason or "-", fallback_reason or "-", hits, misses, rate,
+        )
+    except Exception:
+        logger.debug("[FAST_PATH_DECISION] log failed", exc_info=True)
+
+
+# ============================================================
+# P0-2: main tick を heavy fallback で待たせない
+# ------------------------------------------------------------
+# 2026-08-28 の実測:
+#   09:46  FAST LANE hit   rows=200 latest=09:45 tier1=2.247s  worker total=2.414s
+#   09:47  FAST LANE miss  tier1=9.430s -> light_push_runner=123.077s
+#          worker total=132.739s / cancel_latency=72.60s
+#
+# 高速経路そのものは完成している (09:46 が証拠)。
+# miss の原因は判断ロジックではなく **同一プロセス内の CPU 競合**:
+# 09:47 時点で ranking_summary_bg (21,764 行 / 151.4s)、
+# light_push_runner (81.6s)、LONG TF 5m publish (25.3s)、
+# RANKING ENTRY build x2 が同時に走り、threads=76 / rss=1.7GB。
+# GIL を奪い合うので、09:46 に 2.2 秒で終わった同じ処理が
+# 09:47 には数十倍の壁時計時間になる。
+#
+# したがって「miss したら main tick で heavy を回す」設計自体が
+# 競合を増幅する。miss 時は:
+#   - main tick は待たない (空を返す)
+#   - 直近の fresh projection はそのまま維持される
+#     (呼び出し側は空で既存 merged を潰さない)
+#   - Entry は fresh が無いので fail-closed 側へ倒れる
+#   - heavy rebuild が要るなら background で 1 本だけ走らせる
+# とする。
+# SUMMARY_MAIN_SYNC_HEAVY_FALLBACK=1 で従来動作に戻せる。
+# ============================================================
+
+_HEAVY_BG_LOCK = threading.Lock()
+_HEAVY_BG_RUNNING = False
+_HEAVY_BG_LAST_AT = 0.0
+
+# P0-6: 「fresh input が絶対に無い」ことの安価な判定結果をキャッシュする
+_FRESH_PROBE_LOCK = threading.Lock()
+_FRESH_PROBE_AT = 0.0
+_FRESH_PROBE_RESULT = ""
+
+
+def _fresh_input_hopeless_max_age() -> float:
+    """この秒数より古い入力しか無いなら、重い探索をしても無駄と判断する。"""
+    try:
+        return max(60.0, float(os.getenv("SUMMARY_FRESH_INPUT_HOPELESS_AGE_SEC", "300")))
+    except Exception:
+        return 300.0
+
+
+def _fresh_input_hopeless(now_i) -> str:
+    """fresh input が無いと安価に断定できるなら理由文字列を返す。
+
+    PUSH owner (push_receiver_runner.py) が死ぬと push DB が止まる。
+    2026-08-28 は 11:13:04 で止まり、12:15 時点で db_stale=3748.7s だった。
+    その状態で毎 tick 9 秒かけて探すのは無駄なので、
+    push DB の最新時刻だけを見て即 MISS にする。
+
+    判定できないときは "" を返す (従来どおり探索する)。
+    閾値は緩めない。あくまで「明らかに古い」ときだけ早期に降りる。
+    """
+    if not _env_bool_rc("SUMMARY_FRESH_INPUT_PROBE", True):
+        return ""
+    now_m = time.monotonic()
+    with _FRESH_PROBE_LOCK:
+        if _FRESH_PROBE_AT > 0.0 and (now_m - _FRESH_PROBE_AT) < 5.0:
+            return _FRESH_PROBE_RESULT
+    reason = ""
+    try:
+        # 2026-09-02 P0: probe ごとに sqlite3.connect しない。
+        # NAS + WAL 196MB では connect だけで 2-4 秒かかり、
+        # fresh_input_probe が 15.397 秒になっていた。
+        # 共有接続を使う軽量 probe へ寄せる (閾値は変更しない)。
+        from scheduler_jobs.summary.memory_latest_1m import push_db_probe
+
+        _probe = push_db_probe(max_age_sec=1.0)
+        latest = _probe.get("latest_datetime")
+        if _probe.get("elapsed") is not None and float(_probe["elapsed"]) >= 1.0:
+            logger.warning(
+                "[summary.runners] fresh input probe が重い elapsed=%.3fs rowid=%s cached=%s error=%s "
+                "(probe は rowid DESC LIMIT 1 の 1 クエリだけ)",
+                float(_probe["elapsed"]), _probe.get("max_rowid"),
+                _probe.get("cached"), _probe.get("error"),
+            )
+        if latest:
+            ts = pd.to_datetime(latest, errors="coerce")
+            if ts is not None and not pd.isna(ts):
+                try:
+                    ts = ts.tz_localize(None)
+                except (TypeError, AttributeError):
+                    pass
+                age = (pd.Timestamp(now_i) - pd.Timestamp(ts)).total_seconds()
+                limit = _fresh_input_hopeless_max_age()
+                if age > limit:
+                    reason = "push_db_stale age=%.0fs > %.0fs latest=%s" % (age, limit, ts)
+    except Exception:
+        # 判定できなければ従来どおり探索する (fail-open ではなく "分からない")
+        logger.debug("[summary.runners] fresh input probe failed", exc_info=True)
+        reason = ""
+    with _FRESH_PROBE_LOCK:
+        globals()["_FRESH_PROBE_AT"] = now_m
+        globals()["_FRESH_PROBE_RESULT"] = reason
+    return reason
+
+
+def _env_bool_rc(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return bool(default)
+
+
+def _sync_heavy_fallback_allowed() -> bool:
+    """tier1 が MISS したとき、同期で重い再構築まで行ってよいか。
+
+    既定 False の意図は「main.py の tick を待たせない」こと。
+    tier1 / tier2 はどちらも main.py 専用の高速経路で、
+    DB writer プロセスでは必ず空を返す。
+
+    ところがこのゲートがプロセスを問わず効いていたため、
+    summary DB writer では interval=1 のとき
+        tier1 (main 専用) -> 空
+        -> _submit_heavy_rebuild_bg (tier2 = main 専用なので no-op)
+        -> return 空
+    となり、実際に再構築して保存する _job_summary_original_heavy に
+    一度も到達していなかった。
+    3分/5分は interval==1 の分岐に入らないため保存されており、
+    「1分足だけ stock_summary_1min が止まる」状態になっていた
+    (2026-09-01 実測: 1min が 10:42 で停止、3min/5min は増加継続)。
+
+    DB writer は「重い再構築をして保存する」のが役目なので、
+    ここで background の no-op に逃がしてはいけない。
+    main.py 側のレイテンシ最適化は従来どおり維持する。
+    """
+    v = os.getenv("SUMMARY_MAIN_SYNC_HEAVY_FALLBACK")
+    if v is not None and str(v).strip() != "":
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    try:
+        if _is_database_process():
+            return True
+    except Exception:
+        logger.debug("[summary.runners] database process check failed", exc_info=True)
+    return False
+
+
+def _heavy_bg_min_gap_sec() -> float:
+    try:
+        return max(30.0, float(os.getenv("SUMMARY_MAIN_HEAVY_BG_MIN_GAP_SEC", "60")))
+    except Exception:
+        return 60.0
+
+
+def _tier2_applicable_here() -> bool:
+    """tier2 (light 1m) がこのプロセスで実際に動くか。
+
+    動かない文脈で呼ぶと必ず空の DataFrame が返るため、
+    「再構築した」と記録してはいけない。
+    """
+    try:
+        from .light_tick_1m import _is_entry_only_context, _env_bool
+
+        return bool(
+            _is_entry_only_context()
+            and _env_bool("SUMMARY_MAIN_EARLY_RETURN_AFTER_AI_SUBMIT", True)
+        )
+    except Exception:
+        logger.debug("[summary.runners] tier2 applicability check failed", exc_info=True)
+        return False
+
+
+def _submit_heavy_rebuild_bg(interval_i: int, now_i, display: bool, run_entry: bool, kwargs: dict) -> bool:
+    """heavy rebuild を background で 1 本だけ走らせる。main tick は待たない。"""
+    global _HEAVY_BG_RUNNING, _HEAVY_BG_LAST_AT
+
+    with _HEAVY_BG_LOCK:
+        if _HEAVY_BG_RUNNING:
+            logger.warning(
+                "[summary.runners] heavy rebuild bg skipped reason=already_running interval=%s now=%s",
+                interval_i, now_i,
+            )
+            return False
+        gap = time.monotonic() - _HEAVY_BG_LAST_AT
+        if _HEAVY_BG_LAST_AT > 0.0 and gap < _heavy_bg_min_gap_sec():
+            logger.warning(
+                "[summary.runners] heavy rebuild bg skipped reason=min_gap interval=%s "
+                "since_last=%.1fs min_gap=%.1fs",
+                interval_i, gap, _heavy_bg_min_gap_sec(),
+            )
+            return False
+        _HEAVY_BG_RUNNING = True
+        _HEAVY_BG_LAST_AT = time.monotonic()
+
+    def _task() -> None:
+        global _HEAVY_BG_RUNNING
+        t0 = time.perf_counter()
+        rows = -1
+        applicable = _tier2_applicable_here()
+        try:
+            if not applicable:
+                # tier2 (light 1m) は main.py / entry-only 文脈でしか動かない。
+                # DB writer プロセスでは必ず空を返すので、これを "done" と
+                # 記録すると「再構築が終わった」という誤った記録になる。
+                # 2026-09-01 実測: summary_database_runner で
+                #   heavy rebuild bg done interval=1 elapsed=0.002s
+                #   job done ... rows=0 latest_dt=None
+                # が毎分続き、stock_summary_1min が 10:42 で止まっていた。
+                logger.error(
+                    "[summary.runners] heavy rebuild bg NOT APPLICABLE interval=%s now=%s "
+                    "reason=tier2_entry_only_context_required "
+                    "(このプロセスでは tier2 が動かないので再構築は行われていない。"
+                    "1分足 summary の更新元を確認すること)",
+                    interval_i, now_i,
+                )
+                return
+            logger.warning(
+                "[summary.runners] heavy rebuild bg start interval=%s now=%s "
+                "(main tick は待たない)", interval_i, now_i,
+            )
+            out = _job_summary_tier2_light_runner(
+                interval_i, now_i, display=display, run_entry=run_entry, **kwargs
+            )
+            try:
+                rows = 0 if out is None else len(out)
+            except Exception:
+                rows = -1
+        except BaseException:
+            logger.exception("[summary.runners] heavy rebuild bg failed interval=%s", interval_i)
+        finally:
+            with _HEAVY_BG_LOCK:
+                _HEAVY_BG_RUNNING = False
+            if applicable:
+                # 実際に何行できたのかを必ず残す。
+                # rows=0 を "done" とだけ書くと、動いたのか空だったのか判別できない。
+                log = logger.warning if rows > 0 else logger.error
+                log(
+                    "[summary.runners] heavy rebuild bg done interval=%s elapsed=%.3fs rows=%s%s",
+                    interval_i, time.perf_counter() - t0, rows,
+                    "" if rows > 0 else "  <- 再構築が 0 行。1分足 summary は更新されていない",
+                )
+
+    threading.Thread(target=_task, name="summary-heavy-rebuild-bg", daemon=True).start()
+    return True
+
+
 def job_summary(interval: int, display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True, **kwargs) -> pd.DataFrame:
     interval_i = int(interval)
     now_i = (now or now_naive()).replace(microsecond=0)
+    _st = _stage()
+    if _st is not None:
+        try:
+            _st.checkpoint("job_summary_begin")
+        except Exception:
+            logger.debug("[summary.runners] checkpoint failed", exc_info=True)
 
     if interval_i == 1:
-        df = _job_summary_tier1_direct_memory(now_i, run_entry=run_entry)
+        t_tier1 = time.perf_counter()
+
+        # ------------------------------------------------------------
+        # P0-6: fresh input が無いと分かっているなら 9 秒待たない。
+        #
+        # 2026-08-28 の実測では tier1 が MISS でも毎回 9.0〜9.4 秒
+        # (build timeout 6s + fallback budget 9s) かかっていた。
+        # だが PUSH owner が死んでいて push DB の最新が 56 分古い、
+        # というのは **数百ミリ秒で分かる**。
+        # その場合は重い探索をせず即 MISS にする。
+        # 判定はあくまで「入力が古い」ことだけ。閾値は緩めない。
+        # ------------------------------------------------------------
+        # <between stages> 対策 (R17)
+        # worker begin -> freshness check の区間が stage 化されておらず、
+        # stack sampling で "<between stages>" としか出なかった。
+        # probe 自体も stage にして、どこで待っているか名前で分かるようにする。
+        if _st is not None:
+            with _st.stage("fresh_input_probe"):
+                stale_reason = _fresh_input_hopeless(now_i)
+        else:
+            stale_reason = _fresh_input_hopeless(now_i)
+        if stale_reason:
+            el_tier1 = time.perf_counter() - t_tier1
+            _log_fast_path_decision(
+                now_i, hit=False, rows=0, df=None, elapsed=el_tier1,
+                reject_reason=stale_reason,
+                fallback_reason="skipped_heavy_probe",
+            )
+            logger.warning(
+                "[summary.runners] job_summary(PUSH) fresh input なし -> 即 MISS "
+                "elapsed=%.3fs reason=%s (重い fallback 探索をしない。"
+                "Entry は fresh 無しで fail-closed)",
+                el_tier1, stale_reason,
+            )
+            return pd.DataFrame()
+
+        if _st is not None:
+            with _st.stage("tier1_direct_memory"):
+                df = _job_summary_tier1_direct_memory(now_i, run_entry=run_entry)
+        else:
+            df = _job_summary_tier1_direct_memory(now_i, run_entry=run_entry)
+        el_tier1 = time.perf_counter() - t_tier1
+
         if isinstance(df, pd.DataFrame) and not df.empty:
+            _log_fast_path_decision(
+                now_i, hit=True, rows=len(df), df=df, elapsed=el_tier1,
+                reject_reason="", fallback_reason="",
+            )
             logger.info("[summary.runners] job_summary(PUSH) tier1 direct-memory hit rows=%s now=%s", len(df), now_i)
             return df
 
-        df = _job_summary_tier2_light_runner(interval_i, now_i, display=display, run_entry=run_entry, **kwargs)
+        if _st is not None and _st.should_stop("after_tier1"):
+            _log_fast_path_decision(now_i, hit=False, rows=0, df=None, elapsed=el_tier1,
+                                    reject_reason="tier1_empty", fallback_reason="worker_stopped")
+            return pd.DataFrame()
+
+        if not _sync_heavy_fallback_allowed():
+            submitted = _submit_heavy_rebuild_bg(interval_i, now_i, display, run_entry, kwargs)
+            _log_fast_path_decision(
+                now_i, hit=False, rows=0, df=None, elapsed=el_tier1,
+                reject_reason="tier1_empty_or_timeout",
+                fallback_reason="heavy_rebuild_bg_submitted" if submitted else "heavy_rebuild_bg_skipped",
+            )
+            logger.warning(
+                "[summary.runners] job_summary(PUSH) tier1 miss -> main tick は heavy fallback を待たない "
+                "(background=%s)。直近の fresh projection を維持し、Entry は fresh 無しで fail-closed。 "
+                "SUMMARY_MAIN_SYNC_HEAVY_FALLBACK=1 で従来動作",
+                submitted,
+            )
+            return pd.DataFrame()
+
+        if _st is not None:
+            with _st.stage("tier2_light_runner"):
+                df = _job_summary_tier2_light_runner(interval_i, now_i, display=display, run_entry=run_entry, **kwargs)
+        else:
+            df = _job_summary_tier2_light_runner(interval_i, now_i, display=display, run_entry=run_entry, **kwargs)
         if isinstance(df, pd.DataFrame) and not df.empty:
             logger.info("[summary.runners] job_summary(PUSH) tier2 light-runner hit rows=%s now=%s", len(df), now_i)
             return df
+        if _st is not None and _st.should_stop("after_tier2"):
+            return pd.DataFrame()
 
     return _job_summary_original_heavy(interval_i, display=display, now=now_i, run_entry=run_entry, **kwargs)
 
@@ -409,21 +871,35 @@ def _job_summary_original_heavy(interval: int, display: bool = True, now: Option
         log_job_result("job_summary(PUSH-CLOSED)", interval, df, {})
         return df
 
+    _st = _stage()
+
     runner = resolve_push_summary_runner()
     if not callable(runner):
         raise RuntimeError("push summary runner is not available")
 
     logger.info("[summary.runners] push runner resolved interval=%s runner=%s", interval, getattr(runner, "__name__", repr(runner)))
-    result = call_runner_with_optional_now(runner, interval=interval, now=now, **kwargs)
+    if _st is not None:
+        with _st.stage("push_runner"):
+            result = call_runner_with_optional_now(runner, interval=interval, now=now, **kwargs)
+    else:
+        result = call_runner_with_optional_now(runner, interval=interval, now=now, **kwargs)
 
     df, meta = normalize_runner_output(result)
     log_df_state("push_after_normalize_runner_output", interval, df)
 
-    df = normalize_df(df)
+    if _st is not None:
+        with _st.stage("normalize"):
+            df = normalize_df(df)
+    else:
+        df = normalize_df(df)
     log_df_state("push_after_normalize_df", interval, df)
 
     before_filter_rows = len(df)
-    df = filter_push_like_rows(df)
+    if _st is not None:
+        with _st.stage("filter_push_like"):
+            df = filter_push_like_rows(df)
+    else:
+        df = filter_push_like_rows(df)
     logger.info("[summary.runners] filter_push_like_rows interval=%s before=%d after=%d", interval, before_filter_rows, len(df))
     log_df_state("push_after_filter_push_like_rows", interval, df)
 
@@ -432,8 +908,19 @@ def _job_summary_original_heavy(interval: int, display: bool = True, now: Option
         df = pd.DataFrame()
 
     if df.empty:
+        # DB fallback は NAS を触るので、予算が尽きていたらここで降りる。
+        if _st is not None and _st.should_stop("before_db_fallback"):
+            logger.warning(
+                "[summary.runners] job_summary(PUSH) budget exhausted before db fallback interval=%s now=%s",
+                interval, now,
+            )
+            return pd.DataFrame()
         logger.warning("[summary.runners] runner returned empty PUSH interval=%s -> trying push-only fallback from db/cache", interval)
-        df = fallback_push_summary_df(interval, now=now)
+        if _st is not None:
+            with _st.stage("db_fallback"):
+                df = fallback_push_summary_df(interval, now=now)
+        else:
+            df = fallback_push_summary_df(interval, now=now)
         log_df_state("push_after_fallback_push_summary_df", interval, df)
 
     df = normalize_df(df)
@@ -449,10 +936,24 @@ def _job_summary_original_heavy(interval: int, display: bool = True, now: Option
         log_job_result("job_summary(PUSH-EMPTY)", interval, df, meta)
         return df
 
-    _save_summary_if_owner(df, interval, source="push")
+    if _st is not None:
+        with _st.stage("db_write"):
+            _save_summary_if_owner(df, interval, source="push")
+    else:
+        _save_summary_if_owner(df, interval, source="push")
     log_job_result("job_summary(PUSH)", interval, df, meta)
-    _run_push_ai_entry_before_display(df, interval, now, run_entry)
-    _display_push_sync_or_async(df, interval, now, display)
+    # Entry dispatch は予算切れでも実行する。ここを飛ばすと発注が消えるため、
+    # 降りるのは NAS I/O の手前まで。Entry 側は Entry 側の budget で守る。
+    if _st is not None:
+        with _st.stage("entry_dispatch"):
+            _run_push_ai_entry_before_display(df, interval, now, run_entry)
+    else:
+        _run_push_ai_entry_before_display(df, interval, now, run_entry)
+    if _st is not None:
+        with _st.stage("display"):
+            _display_push_sync_or_async(df, interval, now, display)
+    else:
+        _display_push_sync_or_async(df, interval, now, display)
     return df
 
 
@@ -544,3 +1045,35 @@ __all__ = [
     "run_push_summary_job",
     "run_ranking_summary_job",
 ]
+
+
+# ============================================================
+# DATABASE OWNER OVERRIDE
+# (旧 core/startup/database_owner_runtime_patch._patch_summary_runner_core)
+# ------------------------------------------------------------
+# 旧パッチは install 時にこの 2 つを**完全置換**していた。
+# 素の実装は *_core として残し、有効時だけ委譲する。
+# ============================================================
+
+
+def _dbo_owner():
+    try:
+        from data_collectors import database_owner as _m
+
+        return _m if _m.owner_override_enabled() else None
+    except Exception:
+        return None
+
+
+def _is_database_process() -> bool:
+    _m = _dbo_owner()
+    if _m is None:
+        return _is_database_process_core()
+    return _m.is_database_process_gate()
+
+
+def _summary_save_enabled() -> bool:
+    _m = _dbo_owner()
+    if _m is None:
+        return _summary_save_enabled_core()
+    return _m.summary_save_enabled()

@@ -48,10 +48,21 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from trading.yahoo.pipeline.complement.compute import compute_summary_frame
 from trading.yahoo.pipeline.complement.save import save_summary_df
+from trading.yahoo.pipeline.complement.db import get_summary_db_path
 from trading.yahoo.pipeline.complement.constants import DEFAULT_BASE_DIR
 
 LOG = logging.getLogger("night_yahoo_full_summary_batch")
-VERSION = "V2-NIGHT-YAHOO-FULL-SUMMARY-SAVE-BY-BAR-DATE"
+VERSION = "V3-NIGHT-YAHOO-FULL-SUMMARY-CATCHUP-RANGE"
+
+# ------------------------------------------------------------
+# Yahoo Finance の分足取得制限 (2026-08-06 実測)
+#   - 1m は約30日前までしか取得できない
+#     (それ以前は "1m data not available for startTime")
+#   - 1リクエストで取得できるのは最大8日分
+# ここでは安全側に倒して 7 日窓で分割し、30 日を上限とする。
+# ------------------------------------------------------------
+YAHOO_1M_MAX_LOOKBACK_DAYS = 30
+YAHOO_1M_MAX_SPAN_DAYS = 7
 
 
 # ============================================================
@@ -107,6 +118,171 @@ def latest_market_date(now: Optional[dt.datetime] = None) -> pd.Timestamp:
     while d.weekday() >= 5:
         d -= pd.Timedelta(days=1)
     return d
+
+
+# ============================================================
+# catch-up: summary DB に格納済みの最新データを調べる
+# ============================================================
+
+def latest_stored_bar_date(*, max_lookback_days: int = 60) -> Optional[pd.Timestamp]:
+    """summaryYYYYMMDD.db を新しい順に見て、実際に足が入っている最新日を返す。
+
+    ファイルが存在するだけ・中身が空、というケースがあるため
+    stock_summary_1min の件数まで確認する。
+    見つからなければ None。
+    """
+    today = pd.Timestamp.now().normalize()
+    for i in range(int(max_lookback_days) + 1):
+        d = today - pd.Timedelta(days=i)
+        path = get_summary_db_path(date_yyyymmdd=d.strftime("%Y%m%d"))
+        if not os.path.exists(path):
+            continue
+        conn = None
+        try:
+            # 稼働中プロセスが書き込み中でもロックしないよう read-only で開く。
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='stock_summary_1min'"
+            ).fetchone()
+            if not row:
+                continue
+            n = conn.execute("SELECT COUNT(*) FROM stock_summary_1min").fetchone()[0]
+            if int(n or 0) <= 0:
+                continue
+            LOG.info("[NIGHT YAHOO CATCHUP] latest stored summary date=%s rows=%s db=%s", d.date(), n, path)
+            return d
+        except Exception:
+            LOG.warning("[NIGHT YAHOO CATCHUP] summary db read failed db=%s", path, exc_info=True)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return None
+
+
+def _stored_volume(date: pd.Timestamp) -> Optional[int]:
+    """指定日の summaryYYYYMMDD.db の格納量を表す指標を返す。
+
+    完全な日と欠損した日を見分けるのが目的。
+
+    NAS上の 500MB 級DBに COUNT(DISTINCT symbol) を投げると全表スキャンで
+    1ファイル数十秒かかる。MAX(rowid) は速いが upsert の都合で日々の
+    ばらつきが大きく判定に使えなかった (実測 51万〜257万)。
+    ファイルサイズは os.stat だけで済むうえ分離がよい
+    (実測: 正常日 568〜658MB に対し、途中停止した 2026-08-05 は 115MB)。
+
+    DBが無ければ None (= 未取得)。
+    """
+    path = get_summary_db_path(date_yyyymmdd=pd.Timestamp(date).strftime("%Y%m%d"))
+    try:
+        if not os.path.exists(path):
+            return None
+        return int(os.path.getsize(path))
+    except Exception:
+        LOG.warning("[NIGHT YAHOO CATCHUP] size check failed db=%s", path, exc_info=True)
+        return None
+
+
+def find_incomplete_start(end: pd.Timestamp) -> Optional[pd.Timestamp]:
+    """Yahooの取得可能範囲内で、格納量が不足している最も古い日を返す。
+
+    「格納済みの最新日」だけを見ると、日中に停止して途中までしか
+    保存されていない日 (例: 通常の2割しか入っていない日) を取りこぼす。
+    取得可能範囲内の最大件数を基準に、その一定割合を下回る日を
+    未完了とみなして取り直し対象にする。
+    """
+    ratio = float(os.environ.get("NIGHT_YAHOO_CATCHUP_MIN_RATIO", "0.5"))
+    floor = pd.Timestamp.now().normalize() - pd.Timedelta(days=YAHOO_1M_MAX_LOOKBACK_DAYS)
+
+    counts: dict[pd.Timestamp, Optional[int]] = {}
+    d = floor
+    while d <= end:
+        if d.weekday() < 5:  # 土日は市場休みなので見ない
+            counts[d] = _stored_volume(d)
+        d += pd.Timedelta(days=1)
+
+    if not counts:
+        return None
+
+    known = [c for c in counts.values() if c]
+    if not known:
+        # 範囲内に1件も入っていない -> 取得可能な最古日から
+        LOG.warning("[NIGHT YAHOO CATCHUP] 取得可能範囲内に格納済みデータなし -> %s から取得する", floor.date())
+        return floor
+
+    reference = max(known)
+    threshold = int(reference * ratio)
+
+    incomplete = [d for d, c in sorted(counts.items()) if (c or 0) < threshold]
+    for d in incomplete:
+        LOG.warning(
+            "[NIGHT YAHOO CATCHUP] 未完了と判定 date=%s 件数=%s (基準=%s 閾値=%s)",
+            d.date(), counts[d] if counts[d] is not None else "DBなし", reference, threshold,
+        )
+    if not incomplete:
+        LOG.info("[NIGHT YAHOO CATCHUP] 未完了の日なし (基準銘柄数=%s)", reference)
+        return None
+    return incomplete[0]
+
+
+def resolve_catchup_range(
+    *,
+    explicit_start: Optional[pd.Timestamp] = None,
+    explicit_end: Optional[pd.Timestamp] = None,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """取得すべき期間 [start, end] (両端含む・日付単位) を決める。
+
+    start は「銘柄数が不足している最も古い日」。無ければ
+    「格納済みの最新日」。その日も部分的な可能性があるため含めて
+    取り直す (保存は upsert なので重複しない)。
+    Yahoo が 1m を約30日前までしか返さないため、それより古い場合は
+    30日前に切り上げ、切り捨てた期間をログに残す。
+    """
+    end = explicit_end or latest_market_date()
+
+    if explicit_start is not None:
+        start = explicit_start
+    else:
+        start = find_incomplete_start(end)
+        if start is None:
+            stored = latest_stored_bar_date()
+            if stored is None:
+                start = end
+                LOG.warning(
+                    "[NIGHT YAHOO CATCHUP] 格納済みsummaryが見つからないため最新営業日のみ対象にする end=%s",
+                    end.date(),
+                )
+            else:
+                start = stored
+
+    if start > end:
+        start = end
+
+    floor = pd.Timestamp.now().normalize() - pd.Timedelta(days=YAHOO_1M_MAX_LOOKBACK_DAYS)
+    if start < floor:
+        LOG.warning(
+            "[NIGHT YAHOO CATCHUP] Yahooの1m取得上限(%s日)により %s 〜 %s は取得できないためスキップする",
+            YAHOO_1M_MAX_LOOKBACK_DAYS,
+            start.date(),
+            (floor - pd.Timedelta(days=1)).date(),
+        )
+        start = floor
+
+    return start, end
+
+
+def _split_windows(start: pd.Timestamp, end: pd.Timestamp) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """[start, end] を Yahoo の1リクエスト上限に収まる窓へ分割する。"""
+    span = max(1, int(YAHOO_1M_MAX_SPAN_DAYS))
+    windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    cur = start
+    while cur <= end:
+        last = min(end, cur + pd.Timedelta(days=span - 1))
+        windows.append((cur, last))
+        cur = last + pd.Timedelta(days=1)
+    return windows
 
 
 # ============================================================
@@ -242,13 +418,23 @@ def _chunks(seq: list[str], size: int) -> Iterable[list[str]]:
         yield seq[i:i + max(1, int(size))]
 
 
-def _normalize_yfinance_frame(raw: pd.DataFrame, symbols: list[str], market_date: pd.Timestamp) -> pd.DataFrame:
+def _normalize_yfinance_frame(
+    raw: pd.DataFrame,
+    symbols: list[str],
+    market_date: pd.Timestamp,
+    end_date: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """market_date から end_date までの足を取り出す。
+
+    end_date 省略時は market_date 当日のみ (従来動作)。
+    """
     if raw is None or raw.empty:
         return pd.DataFrame()
 
     frames: list[pd.DataFrame] = []
     date0 = market_date.normalize()
-    date1 = date0 + pd.Timedelta(days=1)
+    last = (end_date or market_date).normalize()
+    date1 = last + pd.Timedelta(days=1)
 
     # yfinance download(group_by='ticker') は複数銘柄でMultiIndexになる。
     if isinstance(raw.columns, pd.MultiIndex):
@@ -333,38 +519,72 @@ def _standardize_ohlcv(df: pd.DataFrame, symbol: str, date0: pd.Timestamp, date1
     return work[["symbol", "datetime", "open", "high", "low", "close", "volume"]].copy()
 
 
-def fetch_1m_for_symbols(symbols: list[str], market_date: pd.Timestamp, *, batch_size: int, pause_sec: float) -> pd.DataFrame:
+def fetch_1m_for_symbols(
+    symbols: list[str],
+    market_date: pd.Timestamp,
+    *,
+    batch_size: int,
+    pause_sec: float,
+    end_date: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """market_date 〜 end_date の1分足を取得する。
+
+    end_date 省略時は market_date 当日のみ (従来動作)。
+    期間が Yahoo の1リクエスト上限を超える場合は窓に分割して取得する。
+    """
     if yf is None:
         raise RuntimeError("yfinance is not installed")
 
-    all_frames: list[pd.DataFrame] = []
-    period = os.environ.get("NIGHT_YAHOO_PERIOD", "5d")
+    start = pd.Timestamp(market_date).normalize()
+    last = pd.Timestamp(end_date or market_date).normalize()
+    windows = _split_windows(start, last)
 
+    all_frames: list[pd.DataFrame] = []
     total = len(symbols)
-    for idx, chunk in enumerate(_chunks(symbols, batch_size), start=1):
-        tickers = [_to_yahoo_ticker(s) for s in chunk if _to_yahoo_ticker(s)]
-        if not tickers:
-            continue
-        LOG.info("[NIGHT YAHOO] fetch batch %s symbols=%s/%s first=%s", idx, len(chunk), total, chunk[:5])
-        try:
-            raw = yf.download(
-                tickers=" ".join(tickers),
-                period=period,
-                interval="1m",
-                group_by="ticker",
-                auto_adjust=False,
-                prepost=False,
-                threads=True,
-                progress=False,
+
+    for w_idx, (w_start, w_end) in enumerate(windows, start=1):
+        # end は排他指定のため翌日を渡す。
+        yf_start = w_start.strftime("%Y-%m-%d")
+        yf_end = (w_end + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        LOG.warning(
+            "[NIGHT YAHOO] fetch window %s/%s %s .. %s",
+            w_idx, len(windows), w_start.date(), w_end.date(),
+        )
+
+        for idx, chunk in enumerate(_chunks(symbols, batch_size), start=1):
+            tickers = [_to_yahoo_ticker(s) for s in chunk if _to_yahoo_ticker(s)]
+            if not tickers:
+                continue
+            LOG.info(
+                "[NIGHT YAHOO] fetch window %s batch %s symbols=%s/%s first=%s",
+                w_idx, idx, len(chunk), total, chunk[:5],
             )
-            df = _normalize_yfinance_frame(raw, chunk, market_date)
-            LOG.info("[NIGHT YAHOO] fetch batch done %s rows=%s symbols=%s", idx, len(df), df["symbol"].nunique() if not df.empty else 0)
-            if not df.empty:
-                all_frames.append(df)
-        except Exception:
-            LOG.warning("[NIGHT YAHOO] fetch batch failed idx=%s size=%s", idx, len(chunk), exc_info=True)
-        if pause_sec > 0:
-            time.sleep(float(pause_sec))
+            try:
+                raw = yf.download(
+                    tickers=" ".join(tickers),
+                    start=yf_start,
+                    end=yf_end,
+                    interval="1m",
+                    group_by="ticker",
+                    auto_adjust=False,
+                    prepost=False,
+                    threads=True,
+                    progress=False,
+                )
+                df = _normalize_yfinance_frame(raw, chunk, w_start, w_end)
+                LOG.info(
+                    "[NIGHT YAHOO] fetch window %s batch %s done rows=%s symbols=%s",
+                    w_idx, idx, len(df), df["symbol"].nunique() if not df.empty else 0,
+                )
+                if not df.empty:
+                    all_frames.append(df)
+            except Exception:
+                LOG.warning(
+                    "[NIGHT YAHOO] fetch failed window=%s batch=%s size=%s",
+                    w_idx, idx, len(chunk), exc_info=True,
+                )
+            if pause_sec > 0:
+                time.sleep(float(pause_sec))
 
     if not all_frames:
         return pd.DataFrame()
@@ -518,22 +738,62 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--pause-sec", type=float, default=float(os.environ.get("NIGHT_YAHOO_PAUSE_SEC", "1.0")))
     parser.add_argument("--limit", type=int, default=int(os.environ.get("NIGHT_YAHOO_LIMIT", "0")), help="debug symbol limit")
     parser.add_argument("--intervals", default=os.environ.get("NIGHT_YAHOO_INTERVALS", "1,3,5"))
+    parser.add_argument(
+        "--start", dest="start", default=os.environ.get("NIGHT_YAHOO_START_DATE"),
+        help="取得開始日 YYYY-MM-DD (省略時は summary DB の最新日から)",
+    )
+    parser.add_argument(
+        "--no-catchup", dest="no_catchup", action="store_true",
+        default=_env_bool("NIGHT_YAHOO_DISABLE_CATCHUP", False),
+        help="catch-up を無効化し、最新営業日1日だけ取得する (従来動作)",
+    )
     args = parser.parse_args(argv)
 
-    market_date = _parse_date(args.date) or latest_market_date()
     intervals = tuple(int(x) for x in str(args.intervals).replace(" ", "").split(",") if x)
     intervals = tuple(x for x in intervals if x in {1, 3, 5}) or (1, 3, 5)
 
-    LOG.warning("[NIGHT YAHOO] START version=%s market_date=%s intervals=%s save_by_bar_date=%s", VERSION, market_date.date(), intervals, int(_env_bool("NIGHT_YAHOO_MINUTE_SAVE_BY_BAR_DATE", True)))
+    explicit_date = _parse_date(args.date)
+    explicit_start = _parse_date(args.start)
+
+    if args.no_catchup:
+        # 従来動作: 単日のみ
+        market_date = explicit_date or latest_market_date()
+        end_date = market_date
+    else:
+        market_date, end_date = resolve_catchup_range(
+            explicit_start=explicit_start or explicit_date,
+            explicit_end=None,
+        )
+
+    days = int((end_date - market_date).days) + 1
+    LOG.warning(
+        "[NIGHT YAHOO] START version=%s range=%s..%s (%s日) intervals=%s save_by_bar_date=%s catchup=%s",
+        VERSION,
+        market_date.date(),
+        end_date.date(),
+        days,
+        intervals,
+        int(_env_bool("NIGHT_YAHOO_MINUTE_SAVE_BY_BAR_DATE", True)),
+        int(not args.no_catchup),
+    )
 
     symbols = load_all_symbols()
     if args.limit and args.limit > 0:
         symbols = symbols[: int(args.limit)]
     LOG.warning("[NIGHT YAHOO] symbols loaded count=%s head=%s", len(symbols), symbols[:20])
 
-    df_1m = fetch_1m_for_symbols(symbols, market_date, batch_size=args.batch_size, pause_sec=args.pause_sec)
+    df_1m = fetch_1m_for_symbols(
+        symbols,
+        market_date,
+        batch_size=args.batch_size,
+        pause_sec=args.pause_sec,
+        end_date=end_date,
+    )
     if df_1m.empty:
-        LOG.error("[NIGHT YAHOO] no 1m data fetched market_date=%s symbols=%s", market_date.date(), len(symbols))
+        LOG.error(
+            "[NIGHT YAHOO] no 1m data fetched range=%s..%s symbols=%s",
+            market_date.date(), end_date.date(), len(symbols),
+        )
         return 2
 
     LOG.warning(

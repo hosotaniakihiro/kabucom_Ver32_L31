@@ -30,6 +30,7 @@ from datetime import datetime
 from typing import Any, Iterable, Optional
 
 import pandas as pd
+from sqlite_cm import committing_connect
 
 AUDIT_DIR = r'\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\trade_audit'
 RUNTIME_DIR = r'\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\runtime_state'
@@ -59,7 +60,7 @@ def _read_sqlite(path: str, table: str) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
     try:
-        with sqlite3.connect(path) as conn:
+        with committing_connect(path) as conn:
             return pd.read_sql_query(f'SELECT * FROM {table}', conn)
     except Exception:
         return pd.DataFrame()

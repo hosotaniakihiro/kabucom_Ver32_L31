@@ -25,6 +25,7 @@ from global_state import global_data
 
 from trading.summary.summary_entry import run_summary_entry_executor
 from trading.ai.blowoff_top_detector import detect_blowoff_top
+from trading.summary.pipeline import blowoff_prefilter as _blowoff_prefilter
 from trading.ai.liquidity_shock_detector import allow_liquidity_entry
 from AI.sell_credit_guard import can_sell_symbol
 
@@ -109,6 +110,16 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).replace(",", "")))
+    except Exception:
+        return int(default)
 
 
 def _truthy(v: Any) -> bool:
@@ -367,7 +378,123 @@ def _summary_ai_liquidity_rescue(row: dict, *, symbol: str, side: str, close: fl
     return False
 
 
+# ============================================================
+# SUMMARY_AI low-move prefilter
+# (旧 core/startup/final_board_guard_signature_compat_patch.py V7 の
+#  _install_summary_ai_low_move_prefilter_patch / _range_pct_from_row)
+# ------------------------------------------------------------
+# 旧パッチは _allow_summary_ai_liquidity を外から包んでいたが、
+# 同じ属性を奪い合う相手が居ないので本体末尾へ畳んだ。
+# 行の high/low が close へ潰れていても、日中レンジ/始値終値/
+# 今 AI へ渡している df の順にレンジを復元してから min_range と比べる。
+# 低変動ガードそのものは緩めない (復元後も足りなければ落とす)。
+# ============================================================
+
+_LOW_MOVE_PREFILTER_VERSION = "V7-SUMMARY-AI-LOW-MOVE-CURRENT-DF-RANGE-REPAIR"
+
+
+def _lmp_summary_ai_like_row(row: Any) -> bool:
+    try:
+        d = row if isinstance(row, dict) else row.to_dict() if hasattr(row, "to_dict") else {}
+        source = str(d.get("source") or "").upper()
+        entry_type = str(d.get("entry_type") or "").upper()
+        reason = str(d.get("reason") or d.get("ai_reason") or "").upper()
+        return source in {"SUMMARY", "SUMMARY_AI", "PUSH", "PUSH_SUMMARY"} or entry_type == "SUMMARY_AI" or "SRC=SUMMARY" in reason
+    except Exception:
+        return False
+
+
+def _lmp_pick_first_float(d: dict, keys: tuple[str, ...], default: float = 0.0) -> float:
+    for k in keys:
+        x = _safe_float(d.get(k), 0.0)
+        if x > 0:
+            return x
+    return default
+
+
+def _lmp_current_df_symbol_range(symbol: str) -> tuple[float, float, float, str]:
+    try:
+        from trading.entry.summary_ai.current_df_context import current_df_symbol_range
+
+        return current_df_symbol_range(symbol)
+    except Exception:
+        logger.debug("[entry_pipeline] current AI df range lookup failed symbol=%s", symbol, exc_info=True)
+        return 0.0, 0.0, 0.0, "none"
+
+
+def _lmp_range_pct_from_row(row: Any) -> tuple[float, float, float, float, str, str]:
+    try:
+        d = row if isinstance(row, dict) else row.to_dict() if hasattr(row, "to_dict") else {}
+        symbol = str(d.get("symbol") or d.get("Symbol") or "")
+        close = _lmp_pick_first_float(d, ("close", "close_price", "current_price", "price", "last_price"), 0.0)
+        high = _lmp_pick_first_float(d, ("high", "high_price"), 0.0)
+        low = _lmp_pick_first_float(d, ("low", "low_price"), 0.0)
+        method = "row_high_low"
+        if close <= 0:
+            close = max(high, low, 1.0)
+        row_range = ((high - low) / close) if close > 0 and high > 0 and low > 0 and high >= low else 0.0
+
+        if row_range <= 1e-9:
+            dh = _lmp_pick_first_float(d, ("day_high", "today_high", "intraday_high", "session_high", "high_price_day", "range_high"), 0.0)
+            dl = _lmp_pick_first_float(d, ("day_low", "today_low", "intraday_low", "session_low", "low_price_day", "range_low"), 0.0)
+            if dh > 0 and dl > 0 and dh >= dl and ((dh - dl) / max(close, 1.0)) > row_range:
+                high, low, method = dh, dl, "day_high_low"
+                row_range = (high - low) / max(close, 1.0)
+
+        if row_range <= 1e-9:
+            oh = _lmp_pick_first_float(d, ("opening_price", "open_price", "open", "day_open"), 0.0)
+            if oh > 0 and close > 0 and abs(close - oh) > 0:
+                high, low, method = max(close, oh), min(close, oh), "open_close"
+                row_range = (high - low) / max(close, 1.0)
+
+        if row_range <= 1e-9 and _env_bool("SUMMARY_AI_LOW_MOVE_RANGE_REPAIR_FROM_CURRENT_DF", True):
+            c2, h2, l2, m2 = _lmp_current_df_symbol_range(symbol)
+            if c2 > 0 and h2 > 0 and l2 > 0 and h2 >= l2 and h2 > l2:
+                old_close, old_high, old_low = close, high, low
+                close, high, low, method = c2, h2, l2, m2
+                row_range = (high - low) / max(close, 1.0)
+                logger.warning(
+                    "[entry_pipeline] SUMMARY_AI range repaired from current df symbol=%s old_close=%.2f old_high=%.2f old_low=%.2f new_close=%.2f new_high=%.2f new_low=%.2f range_pct=%.6f version=%s",
+                    symbol, old_close, old_high, old_low, close, high, low, row_range, _LOW_MOVE_PREFILTER_VERSION,
+                )
+
+        rp = _safe_float(d.get("range_pct") or d.get("intraday_range_pct") or d.get("day_range_pct"), 0.0)
+        if rp > 1.0:
+            rp = rp / 100.0
+        if rp > row_range:
+            high, low, method, row_range = max(high, close), max(0.01, close * (1.0 - rp)), "range_pct_col", rp
+        return float(max(row_range, 0.0)), close, high, low, symbol, method
+    except Exception:
+        return 0.0, 0.0, 0.0, 0.0, "", "error"
+
+
+def _lmp_low_move_ok(row: dict, *, symbol: str, interval: int) -> bool:
+    if not _env_bool("SUMMARY_AI_LOW_MOVE_PREFILTER_ENABLED", True):
+        return True
+    if not _lmp_summary_ai_like_row(row):
+        return True
+    range_pct, close, high, low, sym, method = _lmp_range_pct_from_row(row)
+    min_range = _env_float("ENTRY_ORDER_MIN_RANGE_PCT", _env_float("SUMMARY_AI_MIN_RANGE_PCT", 0.005))
+    if high <= 0 or low <= 0 or range_pct < min_range:
+        logger.warning(
+            "[entry_pipeline] SUMMARY_AI low-move prefilter skip symbol=%s interval=%s close=%.2f high=%.2f low=%.2f range_pct=%.6f min=%.6f method=%s version=%s",
+            sym or symbol, interval, close, high, low, range_pct, min_range, method, _LOW_MOVE_PREFILTER_VERSION,
+        )
+        return False
+    logger.warning(
+        "[entry_pipeline] SUMMARY_AI low-move prefilter pass symbol=%s interval=%s close=%.2f high=%.2f low=%.2f range_pct=%.6f min=%.6f method=%s version=%s",
+        sym or symbol, interval, close, high, low, range_pct, min_range, method, _LOW_MOVE_PREFILTER_VERSION,
+    )
+    return True
+
+
 def _allow_summary_ai_liquidity(row: dict, *, symbol: str, interval: int) -> bool:
+    if not _allow_summary_ai_liquidity_core(row, symbol=symbol, interval=interval):
+        return False
+    return _lmp_low_move_ok(row, symbol=symbol, interval=interval)
+
+
+def _allow_summary_ai_liquidity_core(row: dict, *, symbol: str, interval: int) -> bool:
     close = _safe_float(_first(row, ["close", "close_price", "price", "current_price"], 0.0), 0.0)
     volume = _safe_float(_first(row, ["volume", "trading_volume", "出来高"], 0.0), 0.0)
     turnover = _safe_float(_first(row, ["turnover", "trading_value", "売買代金"], 0.0), 0.0)
@@ -465,6 +592,20 @@ def _allow_summary_ai_blowoff_rescue(row: dict, *, symbol: str) -> bool:
 
 
 def _filter_blowoff(rows: List[Any], df_summary: pd.DataFrame | None) -> List[Any]:
+    """blowoff (吹き上げ天井) 候補を除外する。
+
+    旧 core/startup/summary_ai_blowoff_prefilter_patch V10 がこの関数を
+    「RSI過熱 + 値幅 + 高値圏 + 方向」の複合条件で判定する厳格版へ
+    差し替えていたので、その実装を trading/summary/pipeline/blowoff_prefilter.py
+    へ移設し、有効時はそちらを使う。
+    無効時 (DB専用子プロセス等) は従来の symbol 一致 + rescue 版を使う。
+    """
+    if _blowoff_prefilter.blowoff_prefilter_enabled():
+        return _blowoff_prefilter.filter_blowoff_strict(rows, df_summary)
+    return _filter_blowoff_legacy(rows, df_summary)
+
+
+def _filter_blowoff_legacy(rows: List[Any], df_summary: pd.DataFrame | None) -> List[Any]:
     try:
         if df_summary is None or not isinstance(df_summary, pd.DataFrame) or df_summary.empty:
             return rows
@@ -525,35 +666,83 @@ def _build_exec_dataframe(rows: List[Any], interval: int) -> pd.DataFrame:
             df_exec["interval"] = df_exec["interval"].apply(lambda x: interval if _safe_interval(x) is None else _safe_interval(x))
         if "symbol" in df_exec.columns:
             df_exec["symbol"] = df_exec["symbol"].astype(str).str.replace(r"\.0$", "", regex=True)
-        return df_exec
+        return _cap_summary_ai_exec_rows(df_exec)
     except Exception:
         logger.exception("[entry_pipeline] build exec dataframe failed interval=%s", interval)
         return pd.DataFrame()
 
 
+def _cap_summary_ai_exec_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """旧 final_board_guard_signature_compat_patch._install_entry_pipeline_exec_cap_patch()。
+
+    SUMMARY / PUSH 由来の実行可能行を SUMMARY_AI_MAX_REAL_ENTRIES
+    (既定は ENTRY_MAX_CONCURRENT_ORDERS、さらに既定 3) 件まで切る。
+    旧パッチは _build_exec_dataframe を外から包んでいたが、同じ属性を
+    奪い合う相手が居ないので本体末尾へ畳んだ。
+    """
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        cap = max(1, _env_int("SUMMARY_AI_MAX_REAL_ENTRIES", _env_int("ENTRY_MAX_CONCURRENT_ORDERS", 3)))
+        source_s = "|".join(df.get("source", pd.Series([], dtype=str)).astype(str).str.upper().head(20).tolist()) if "source" in df.columns else ""
+        entry_s = "|".join(df.get("entry_type", pd.Series([], dtype=str)).astype(str).str.upper().head(20).tolist()) if "entry_type" in df.columns else ""
+        if ("SUMMARY" in source_s or "PUSH" in source_s or "SUMMARY_AI" in entry_s) and len(df) > cap:
+            before = len(df)
+            df = df.head(cap).copy()
+            logger.warning(
+                "[entry_pipeline] capped SUMMARY_AI executable rows before=%s after=%s cap=%s version=%s",
+                before, len(df), cap, _LOW_MOVE_PREFILTER_VERSION,
+            )
+    except Exception:
+        logger.exception("[entry_pipeline] executable cap failed; use uncapped df")
+    return df
+
+
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_entry_controller_bridge_patch.py の
+# _strict_order_executed をここへ本文化 (V1.5)。
+# 旧パッチは install 時にこの関数をまるごと差し替えていた (合成ではない)。
+# approved/registered/entries や executed フラグだけでは成功扱いせず、
+# 実注文の根拠 (件数キー / order 系キー) が取れたときだけ True を返す。
+# ------------------------------------------------------------
+_STRICT_ORDER_KEYS = ("order_id", "OrderId", "orders", "order_ids", "sent_orders", "executed_symbols")
+_STRICT_EXECUTED_COUNT_KEYS = ("executed_count", "order_count", "submitted_count", "sent_count")
+
+
+def _strict_has_payload(v: Any) -> bool:
+    if isinstance(v, (list, tuple, set, dict)):
+        return len(v) > 0
+    return bool(v)
+
+
 def _result_executed(result: Any) -> bool:
+    """実注文が確認できた場合だけ True。approved/registered/entries/pending減少だけでは成功扱いしない。"""
     try:
         if result is None:
             return False
         if isinstance(result, bool):
-            return result
+            # 既存の真偽戻り値は尊重。ただし wrapper が作った dict の executed は下で order根拠付きだけを見る。
+            return bool(result)
         if isinstance(result, dict):
-            if bool(result.get("executed")):
-                return True
-            for key in ("executed_count", "approved_count", "registered"):
+            for key in _STRICT_EXECUTED_COUNT_KEYS:
                 try:
                     if int(result.get(key) or 0) > 0:
                         return True
                 except Exception:
                     pass
-            entries = result.get("entries")
-            if isinstance(entries, list) and entries:
-                return True
+            for key in _STRICT_ORDER_KEYS:
+                if _strict_has_payload(result.get(key)):
+                    return True
+            for key in ("result", "pipeline_result", "order_result"):
+                child = result.get(key)
+                if child is not result and _result_executed(child):
+                    return True
             return False
         if isinstance(result, (list, tuple, set)):
-            return len(result) > 0
-        return bool(result)
+            return any(_result_executed(x) for x in result)
+        return False
     except Exception:
+        logger.exception("[SUMMARY AI ENTRY BRIDGE] strict order result judgement failed result=%s", result)
         return False
 
 

@@ -19,29 +19,53 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import datetime as dt
 import os
+import sqlite3
+import sys
+import threading
 import time
 from collections import Counter
 from typing import Dict, Any, Optional, Tuple, List
 
+import numpy as np
 import pandas as pd
 
 from global_state import global_data
 from trading.entry.pending_manager import add_pending
 from trading.ranking.side_infer import infer_side_from_rank_type
-from AI.entry_row_builder import build_entry_row
+from AI.entry_row_builder import build_entry_row as _build_entry_row_base
+from trading.ranking import ranking_entry_high_low as _ranking_hl
+
+
+def build_entry_row(row, *args, **kwargs):
+    """ランキング由来のエントリー行を組み立てる。
+
+    旧 core/startup/ranking_entry_high_low_from_snapshot_patch がこの
+    モジュールの build_entry_row エイリアスを差し替えて、high/low が欠損した
+    行を ranking_snapshot から補完していた。その処理を
+    trading/ranking/ranking_entry_high_low.py へ移設し、ここから呼ぶ。
+
+    AI.entry_row_builder.build_entry_row 自体は他モジュールからも使われるため
+    そちらは変更せず、ランキング経路だけに補完がかかる形を保っている。
+    """
+    entry_row = _build_entry_row_base(row, *args, **kwargs)
+    return _ranking_hl.fill_high_low_from_snapshot(entry_row, row)
 from config.ranking_entry_config import RANKING_ENTRY_CONFIG, is_time_allowed
 
 try:
     from trading.ranking.ranking_technical_store import (
-        save_ranking_pseudo_technicals,
+        save_ranking_pseudo_technicals as _save_ranking_pseudo_technicals_core,
         attach_ranking_technicals,
     )
 except Exception:  # pragma: no cover
-    save_ranking_pseudo_technicals = None
+    _save_ranking_pseudo_technicals_core = None
     attach_ranking_technicals = None
+
+# P0-2/P0-9: `with sqlite3.connect(...)` は close しないため必ずこちらを使う。
+from database.sqlite_util import readonly_connect
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +237,7 @@ def _clip(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-def _get_ranking_source_df() -> Optional[pd.DataFrame]:
+def _get_ranking_source_df_core() -> Optional[pd.DataFrame]:
     snapshot = getattr(global_data, "latest_ranking_snapshot", None)
     if isinstance(snapshot, list) and snapshot:
         logger.info("[RANKING ENTRY LOOP] source=latest_ranking_snapshot rows=%s", len(snapshot))
@@ -227,6 +251,940 @@ def _get_ranking_source_df() -> Optional[pd.DataFrame]:
 
     logger.warning("[RANKING ENTRY LOOP] ranking source dataframe not found")
     return None
+
+
+# ============================================================
+# ランキング入力の DB フォールバック
+#   旧 core/startup/ranking_entry_source_db_fallback_patch.py (V4)
+# ------------------------------------------------------------
+# global_data.latest_ranking_* が空、または古いときに、当日の
+# rankingYYYYMMDD.db を rowid DESC で安く読み直す。DB 自体が遅延して
+# いても同日行があれば fail-open で返し、最終 entry/liquidity/board
+# ガードに判断を委ねる。
+#
+# 旧パッチは _get_ranking_source_df を「完全置換」していた (元関数を
+# 一度も呼ばない) ので、本文化でも置換のまま _rsrc_* 側へ移した。
+# 元の実装は _get_ranking_source_df_core() として残してあり、
+# パッチが install されないプロセス (DB / helper) ではそちらが動く。
+# ============================================================
+_RSRC_LAST_DB_DF: Optional[pd.DataFrame] = None
+_RSRC_LAST_DB_TS: float = 0.0
+_RSRC_LAST_DB_KEY: Optional[Tuple[str, str]] = None
+_RSRC_ENV_APPLIED = False
+
+# sitecustomize._is_database_process() 相当
+_RSRC_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+_RSRC_DB_PROCESS_ENVS = (
+    "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+    "AUTOSTOCK_SUMMARY_DB_WRITER",
+    "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+    "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+)
+
+_RSRC_DATETIME_COLS = ("datetime", "snapshot_time", "time", "created_at", "received_at", "inserted_at", "date")
+
+
+def _rsrc_scope_enabled() -> bool:
+    """このプロセスで DB フォールバックを使うか。
+
+    旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由で install
+    されていた = main lite の background loop か
+    SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1 のときだけ。そのスコープと
+    disabled_env ("1" 完全一致) をそのまま再現する。
+    RANKING_ENTRY_SOURCE_DB_FALLBACK_SCOPE_ENABLED=1/0 で明示上書きできる。
+    """
+    try:
+        raw = os.getenv("RANKING_ENTRY_SOURCE_DB_FALLBACK_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool("RANKING_ENTRY_SOURCE_DB_FALLBACK_SCOPE_ENABLED", False)
+        if str(os.environ.get("DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH", "")).strip() == "1":
+            return False
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_list)
+        if any(name in argv for name in _RSRC_DB_PROCESS_NAMES):
+            return False
+        if any(_env_bool(name, False) for name in _RSRC_DB_PROCESS_ENVS):
+            return False
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv_list) and _env_bool("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _rsrc_apply_env_defaults() -> None:
+    """旧 install() の env setdefault 10 件を、有効なときだけ 1 度だけ再現する。
+
+    これらのキーの読み手は本節と tonosama_history_failclose_strict_patch
+    だけで、後者は os.environ[k]=v のハード代入なので順序に依存しない。
+    """
+    global _RSRC_ENV_APPLIED
+    if _RSRC_ENV_APPLIED:
+        return
+    _RSRC_ENV_APPLIED = True
+    try:
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", "1")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_MAX_AGE_SEC", "300")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_MAX_AGE_SEC", "300")
+        # P0-4: strict_entry_defaults.STRICT_ENV が owner (値は "0")。
+        # ここで "1" を seed すると install 順で fail-open になりうるので入れない。
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FAILOPEN_STALE", "0")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FAILOPEN_MAX_AGE_SEC", "1800")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_FAILOPEN_STALE_GLOBAL", "0")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_FAILOPEN_GLOBAL_MAX_AGE_SEC", "1800")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN", "30")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_MAX_ROWS", "900")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_SCAN_ROWS", "1500")
+    except Exception:
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] env defaults failed", exc_info=False)
+
+
+def _rsrc_quote(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _rsrc_resolve_db_path() -> Optional[str]:
+    """読みに行く ranking DB を決める。
+
+    2026-09-08: ここが **ずっと NAS を直読みしていた**。
+    `ats.ats_ranking.db_path` に `resolve_ranking_db_path` は存在せず
+    (実在するのは `get_usable_ranking_db_path`)、ImportError が debug で
+    握り潰されて末尾のハードコード UNC パスへ落ちていた。
+    そのため 09-07 に `RANKING_DB_ROOT` をローカルへ向けても、この読み手
+    だけは NAS を読み続け、`db read empty` -> `no_ranking_df` になっていた。
+
+    置き場所の判断は ranking_db_location に集約してあるので、まずそれを使う。
+    """
+    try:
+        from trading.ranking import ranking_db_location
+
+        for cand in ranking_db_location.ranking_db_candidates():
+            if cand and os.path.exists(cand):
+                return cand
+    except Exception as e:
+        logger.warning(
+            "[RANKING ENTRY SOURCE DB FALLBACK] ranking_db_location を使えない: %s", e
+        )
+
+    for key in ("RANKING_DB_PATH", "ATS_RANKING_DB_PATH", "KABU_RANKING_DB_PATH"):
+        try:
+            p = os.environ.get(key, "").strip()
+            if p:
+                return p
+        except Exception:
+            pass
+
+    # ATS 側のリゾルバ (場中は当日 DB を優先し、古い DB へ逃げない)
+    try:
+        from ats.ats_ranking.db_path import get_usable_ranking_db_path
+
+        p = get_usable_ranking_db_path()
+        if p:
+            return str(p)
+    except Exception as e:
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] ats resolve failed: %s", e)
+
+    try:
+        today = dt.datetime.now().strftime("%Y%m%d")
+        p = rf"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking\ranking{today}.db"
+        if os.path.exists(p):
+            logger.warning(
+                "[RANKING ENTRY SOURCE DB FALLBACK] ローカルを解決できず NAS へ落ちた path=%s "
+                "(複製なので最大 30 分古い)", p,
+            )
+            return p
+    except Exception:
+        pass
+    return None
+
+
+# P0-9: NAS 越しの metadata 往復を減らすためのスキーマキャッシュ。
+# 実測で probe_elapsed 253.9 秒のうち 232.9 秒が SQL ではなく
+# connect / sqlite_master / PRAGMA table_info の往復だった。
+# スキーマは日中変わらないので TTL 付きで覚える (恒久 skip にはしない)。
+_RSRC_SCHEMA_CACHE: Dict[str, Dict[str, Any]] = {}
+_RSRC_SCHEMA_LOCK = threading.Lock()
+
+# どの DB を読んでいるかは thread-local で持つ。
+# id(conn) をキーにすると、return / 例外で pop を取りこぼしたときに
+# id が再利用されて **別の接続に古い db_path が紐づく**。
+_RSRC_TLS = threading.local()
+
+
+def _rsrc_schema_ttl() -> float:
+    return max(0.0, _env_float("RANKING_ENTRY_SOURCE_DB_SCHEMA_TTL_SEC", 300.0))
+
+
+def _rsrc_schema_entry(db_path: str) -> Optional[Dict[str, Any]]:
+    ttl = _rsrc_schema_ttl()
+    if ttl <= 0 or not db_path:
+        return None
+    with _RSRC_SCHEMA_LOCK:
+        ent = _RSRC_SCHEMA_CACHE.get(db_path)
+        if not ent:
+            return None
+        if time.time() - float(ent.get("ts") or 0.0) > ttl:
+            # TTL 切れ。次回は実際に問い合わせ直す
+            _RSRC_SCHEMA_CACHE.pop(db_path, None)
+            return None
+        return ent
+
+
+def _rsrc_schema_store(db_path: str, *, tables=None, table=None, cols=None) -> None:
+    if _rsrc_schema_ttl() <= 0 or not db_path:
+        return
+    with _RSRC_SCHEMA_LOCK:
+        ent = _RSRC_SCHEMA_CACHE.get(db_path)
+        if not ent:
+            ent = {"ts": time.time(), "tables": None, "cols": {}}
+            _RSRC_SCHEMA_CACHE[db_path] = ent
+        if tables is not None:
+            ent["tables"] = list(tables)
+        if table is not None and cols is not None:
+            ent["cols"][str(table)] = list(cols)
+
+
+def _rsrc_current_db_path() -> str:
+    """いま読んでいる db_path。sqlite3.Connection には属性を付けられない。"""
+    return str(getattr(_RSRC_TLS, "db_path", "") or "")
+
+
+@contextlib.contextmanager
+def _rsrc_bind_db_path(db_path: str):
+    """db_path をこのスレッドに束ねる。return でも例外でも必ず元に戻す。"""
+    prev = getattr(_RSRC_TLS, "db_path", "")
+    _RSRC_TLS.db_path = str(db_path or "")
+    try:
+        yield
+    finally:
+        _RSRC_TLS.db_path = prev
+
+
+def _rsrc_conn_db_path(conn) -> str:
+    """後方互換。conn は使わない (thread-local から取る)。"""
+    return _rsrc_current_db_path()
+
+
+def _rsrc_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    db_path = _rsrc_current_db_path()
+    ent = _rsrc_schema_entry(db_path)
+    if ent is not None:
+        hit = (ent.get("cols") or {}).get(str(table))
+        if hit:
+            return list(hit)
+    try:
+        cols = [str(r[1]) for r in conn.execute(f"PRAGMA table_info({_rsrc_quote(table)})").fetchall()]
+    except Exception:
+        return []
+    if cols:
+        _rsrc_schema_store(db_path, table=table, cols=cols)
+    return cols
+
+
+def _rsrc_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (table,)).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _rsrc_find_col(cols: List[str], candidates: Tuple[str, ...]) -> Optional[str]:
+    lower = {c.lower(): c for c in cols}
+    for cand in candidates:
+        if cand in cols:
+            return cand
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    return None
+
+
+def _rsrc_first_datetime_col(df: pd.DataFrame) -> Optional[str]:
+    for c in _RSRC_DATETIME_COLS:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _rsrc_latest_info(df: pd.DataFrame) -> Tuple[Optional[dt.datetime], Optional[float], str]:
+    try:
+        if df is None or df.empty:
+            return None, None, "empty"
+        col = _rsrc_first_datetime_col(df)
+        if not col:
+            return None, None, "no_datetime_col"
+        s = pd.to_datetime(df[col], errors="coerce").dropna()
+        if s.empty:
+            return None, None, f"bad_datetime_col={col}"
+        latest = s.max().to_pydatetime().replace(tzinfo=None)
+        age = max(0.0, (dt.datetime.now() - latest).total_seconds())
+        return latest, age, col
+    except Exception:
+        return None, None, "latest_error"
+
+
+def _rsrc_fresh_enough(df: pd.DataFrame, *, label: str) -> bool:
+    latest, age, col = _rsrc_latest_info(df)
+    max_age = max(30.0, _env_float("RANKING_ENTRY_SOURCE_MAX_AGE_SEC", 300.0))
+    if age is not None and age <= max_age:
+        logger.info("[RANKING ENTRY SOURCE DB FALLBACK] fresh source=%s rows=%s latest=%s age=%.1fs col=%s max_age=%.1fs", label, len(df), latest, age, col, max_age)
+        return True
+    logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] stale/unknown source=%s rows=%s latest=%s age=%s col=%s max_age=%.1fs -> try DB refresh", label, 0 if df is None else len(df), latest, None if age is None else round(age, 1), col, max_age)
+    return False
+
+
+def _rsrc_read_global_data_source() -> pd.DataFrame:
+    try:
+        snapshot = getattr(global_data, "latest_ranking_snapshot", None)
+        if isinstance(snapshot, list) and snapshot:
+            df = pd.DataFrame(snapshot)
+            if not df.empty:
+                df.attrs["_ranking_source_name"] = "latest_ranking_snapshot"
+                return df
+    except Exception as e:
+        logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] direct snapshot read failed: %s", e, exc_info=False)
+
+    for name in (
+        "latest_ranking_raw",
+        "latest_ranking_df",
+        "ranking_raw_df",
+        "ranking_snapshot_df",
+        "ranking_df",
+    ):
+        try:
+            df = getattr(global_data, name, None)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                out = df.copy()
+                out.attrs["_ranking_source_name"] = name
+                return out
+        except Exception as e:
+            logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] direct attr read failed name=%s err=%s", name, e, exc_info=False)
+    return pd.DataFrame()
+
+
+def _rsrc_cache_get(db_path: str, table: str) -> pd.DataFrame:
+    ttl = _env_float("RANKING_ENTRY_SOURCE_DB_CACHE_TTL_SEC", 10.0)
+    if _RSRC_LAST_DB_DF is not None and _RSRC_LAST_DB_KEY == (db_path, table) and (time.time() - _RSRC_LAST_DB_TS) <= ttl:
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] cache hit table=%s rows=%s age=%.1fs", table, len(_RSRC_LAST_DB_DF), time.time() - _RSRC_LAST_DB_TS)
+        return _RSRC_LAST_DB_DF.copy()
+    return pd.DataFrame()
+
+
+def _rsrc_cache_put(db_path: str, table: str, df: pd.DataFrame) -> None:
+    global _RSRC_LAST_DB_DF, _RSRC_LAST_DB_TS, _RSRC_LAST_DB_KEY
+    try:
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            _RSRC_LAST_DB_DF = df.copy()
+            _RSRC_LAST_DB_TS = time.time()
+            _RSRC_LAST_DB_KEY = (db_path, table)
+    except Exception:
+        pass
+
+
+def _rsrc_trim_recent(df: pd.DataFrame, dt_col: Optional[str], lookback_min: int, max_rows: int) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if dt_col and dt_col in df.columns:
+        tmp = df.copy()
+        tmp[dt_col] = pd.to_datetime(tmp[dt_col], errors="coerce")
+        tmp = tmp.dropna(subset=[dt_col])
+        if not tmp.empty:
+            latest = tmp[dt_col].max()
+            cutoff = latest - pd.Timedelta(minutes=max(1, lookback_min))
+            recent = tmp[tmp[dt_col] >= cutoff]
+            if not recent.empty:
+                return recent.sort_values(dt_col, ascending=False, kind="stable").head(max_rows).copy()
+            return tmp.sort_values(dt_col, ascending=False, kind="stable").head(max_rows).copy()
+    return df.head(max_rows).copy()
+
+
+def _rsrc_candidate_tables(conn: sqlite3.Connection) -> List[str]:
+    configured = [x.strip() for x in os.environ.get("RANKING_ENTRY_SOURCE_DB_TABLES", "").split(",") if x.strip()]
+    base = configured or [
+        os.environ.get("RANKING_ENTRY_SOURCE_DB_TABLE", "ranking_snapshot_1min").strip() or "ranking_snapshot_1min",
+        "ranking_snapshot",
+        "ranking_raw_1min",
+        "ranking_raw",
+        "ranking_summary_1min",
+        "ranking_summary_5min",
+    ]
+    db_path = _rsrc_current_db_path()
+    ent = _rsrc_schema_entry(db_path)
+    if ent is not None and ent.get("tables") is not None:
+        cached = [t for t in ent["tables"] if t in base]
+        # 候補リスト (env) が変わっていなければキャッシュを使う
+        if cached and len(cached) == len(ent["tables"]):
+            return list(cached)
+
+    _t0 = time.perf_counter()
+    out: List[str] = []
+    for t in base:
+        if t and t not in out and _rsrc_table_exists(conn, t):
+            out.append(t)
+    logger.info(
+        "[RANKING ENTRY SOURCE DB FALLBACK] candidate_tables probed n=%d/%d elapsed=%.3fs",
+        len(out), len(base), time.perf_counter() - _t0,
+    )
+    _rsrc_schema_store(db_path, tables=out)
+    return out
+
+
+def _rsrc_last_good_df():
+    """TTL を無視して直近の成功結果を返す (df, age_sec)。"""
+    try:
+        if _RSRC_LAST_DB_DF is None:
+            return None, None
+        age = time.time() - float(_RSRC_LAST_DB_TS or 0.0)
+        return _RSRC_LAST_DB_DF, age
+    except Exception:
+        return None, None
+
+
+def _worker_guard_mod():
+    try:
+        from trading.entry_exit import worker_guard
+        return worker_guard
+    except Exception:
+        return None
+
+
+_RSRC_BG_LOCK = threading.Lock()
+_RSRC_BG_THREAD: list = [None]
+_RSRC_BG_SKIPPED: list = [0]
+
+
+def _rsrc_singleflight_enabled() -> bool:
+    return (os.environ.get("RANKING_ENTRY_DB_SINGLEFLIGHT", "1").strip().lower()
+            not in {"0", "false", "no", "off"})
+
+
+def _rsrc_db_deadline_sec() -> float:
+    """NAS ranking DB 読みに許す壁時計上限。
+
+    entry loop の budget (既定 30秒) を食いつぶさない値にする。
+    """
+    try:
+        return max(0.5, _env_float("RANKING_ENTRY_SOURCE_DB_DEADLINE_SEC", 8.0))
+    except Exception:
+        return 5.0
+
+
+def _rsrc_load_from_ranking_db() -> pd.DataFrame:
+    """deadline 付きの DB fallback。
+
+    sqlite の timeout / busy_timeout はロック待ちの上限だけで、
+    SMB の I/O 時間には効かない。実測で 174 秒かかったので、
+    別スレッド + join(deadline) で呼び出し側を必ず戻す。
+    """
+    if not _env_bool("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", True):
+        return pd.DataFrame()
+
+    deadline = _rsrc_db_deadline_sec()
+    box: Dict[str, Any] = {"df": pd.DataFrame()}
+    t0 = time.perf_counter()
+
+    # 見捨てた背景リーダーが積み上がると NAS を潰す (実測 70〜170 秒の読みが並走)。
+    # 走っているものが 1 本でもあれば新しく起こさない。
+    if _rsrc_singleflight_enabled():
+        with _RSRC_BG_LOCK:
+            alive = _RSRC_BG_THREAD[0] is not None and _RSRC_BG_THREAD[0].is_alive()
+        if alive:
+            last, age = _rsrc_last_good_df()
+            _RSRC_BG_SKIPPED[0] += 1
+            logger.warning(
+                "[RANKING ENTRY SOURCE DB FALLBACK] background read already running "
+                "thread=%s -> 新しい読みは起こさない (skipped=%d) last-good rows=%s age=%s",
+                _RSRC_BG_THREAD[0].name if _RSRC_BG_THREAD[0] is not None else None,
+                _RSRC_BG_SKIPPED[0],
+                0 if last is None or last.empty else len(last),
+                "n/a" if age is None else ("%.1fs" % age),
+            )
+            return last if isinstance(last, pd.DataFrame) else pd.DataFrame()
+
+    def _target() -> None:
+        try:
+            box["df"] = _rsrc_load_from_ranking_db_core(deadline_at=t0 + deadline)
+        except Exception:
+            logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] core read failed", exc_info=True)
+        finally:
+            with _RSRC_BG_LOCK:
+                if _RSRC_BG_THREAD[0] is threading.current_thread():
+                    _RSRC_BG_THREAD[0] = None
+
+    th = threading.Thread(target=_target, name="ranking-entry-db-fallback", daemon=True)
+    with _RSRC_BG_LOCK:
+        _RSRC_BG_THREAD[0] = th
+    th.start()
+    th.join(deadline)
+    if th.is_alive():
+        # 空を返すとランキング経路が丸ごと死むので、
+        # 直近の成功結果 (last-good) を返す。
+        # 見捨てたスレッドは後から完走して _rsrc_cache_put で埋めるので、
+        # 2 回目以降のループは即座に使える。
+        # 古さの可否は下流の既存ガードが判断する。
+        last, age = _rsrc_last_good_df()
+        logger.warning(
+            "[RANKING ENTRY SOURCE DB FALLBACK] deadline exceeded deadline=%.1fs elapsed=%.1fs -> use last-good rows=%s age=%s (entry budget protected; background read continues)",
+            deadline, time.perf_counter() - t0,
+            0 if last is None or last.empty else len(last),
+            "n/a" if age is None else ("%.1fs" % age),
+        )
+        return last if isinstance(last, pd.DataFrame) else pd.DataFrame()
+    return box.get("df") if isinstance(box.get("df"), pd.DataFrame) else pd.DataFrame()
+
+
+def _rsrc_pick_latest_table_enabled() -> bool:
+    return _env_bool("RANKING_ENTRY_SOURCE_DB_PICK_LATEST_TABLE", True)
+
+
+def _rsrc_query_budget_sec() -> float:
+    return max(0.2, _env_float("RANKING_ENTRY_SOURCE_DB_QUERY_BUDGET_SEC", 2.0))
+
+
+def _rsrc_budget_guard(conn: sqlite3.Connection, sec: float):
+    """SQLite クエリに実時間の上限を掛ける。
+
+    progress handler が 1 を返すと SQLite はそのクエリを中断し
+    OperationalError('interrupted') を投げる。
+    NAS が詰まったときに 120 秒待たされないための保険。
+    """
+    deadline = time.perf_counter() + max(0.05, float(sec))
+
+    def _h() -> int:
+        return 1 if time.perf_counter() > deadline else 0
+
+    try:
+        conn.set_progress_handler(_h, 2000)
+        return True
+    except Exception:
+        logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] progress handler unavailable", exc_info=True)
+        return False
+
+
+def _rsrc_clear_budget_guard(conn: sqlite3.Connection) -> None:
+    try:
+        conn.set_progress_handler(None, 0)
+    except Exception:
+        pass
+
+
+def _rsrc_latest_per_table(conn: sqlite3.Connection, tables: List[str], *, budget_sec: float):
+    """各テーブルの MAX(datetime) だけを取る。
+
+    これは datetime index の covering scan なので極めて安い
+    (実測 0.004〜0.059 秒/テーブル)。
+    ここで最新テーブルを 1 本に絞ってから本体を読む。
+    """
+    out = []
+    for table in tables:
+        cols = _rsrc_table_columns(conn, table)
+        if not cols:
+            continue
+        dt_col = _rsrc_find_col(cols, _RSRC_DATETIME_COLS)
+        if not dt_col:
+            # datetime 列が無いテーブルは最新判定できない。従来経路に任せる。
+            out.append((table, None, None, cols))
+            continue
+        t0 = time.perf_counter()
+        guarded = _rsrc_budget_guard(conn, budget_sec)
+        try:
+            row = conn.execute(
+                'SELECT MAX(%s) FROM %s' % (_rsrc_quote(dt_col), _rsrc_quote(table))
+            ).fetchone()
+            mx = row[0] if row else None
+        except Exception as e:
+            logger.warning(
+                "[RANKING ENTRY SOURCE DB FALLBACK] latest probe failed table=%s err=%s elapsed=%.3fs",
+                table, e, time.perf_counter() - t0,
+            )
+            continue
+        finally:
+            if guarded:
+                _rsrc_clear_budget_guard(conn)
+        parsed = pd.to_datetime(mx, errors="coerce") if mx is not None else None
+        if parsed is not None and pd.isna(parsed):
+            parsed = None
+        logger.info(
+            "[RANKING ENTRY SOURCE DB FALLBACK] latest probe table=%s latest=%s elapsed=%.3fs cols=%d",
+            table, mx, time.perf_counter() - t0, len(cols),
+        )
+        out.append((table, parsed, dt_col, cols))
+    return out
+
+
+def _rsrc_read_one_table(conn: sqlite3.Connection, table: str, dt_col, cols, *,
+                         lookback_min: int, max_rows: int, budget_sec: float,
+                         latest=None):
+    """テーブル 1 本だけを読む。index 経路を先に試し、予算超過なら安い経路へ落とす。
+
+    「WHERE datetime>=? が常に速い」わけではない。
+    index が covering でないテーブルでは 1 行ごとのランダム参照になり、
+    SMB 越しでは rowid 順の連続読みより遅い。
+    なので予算を掛けて、超えたら rowid 経路へ落とす。
+    """
+    if dt_col:
+        cutoff = None
+        try:
+            # probe 済みなら引き直さない (NAS 往復を 1 回減らす)。
+            mx = latest
+            if mx is None:
+                latest_row = conn.execute(
+                    'SELECT MAX(%s) FROM %s' % (_rsrc_quote(dt_col), _rsrc_quote(table))
+                ).fetchone()
+                mx = pd.to_datetime(latest_row[0], errors="coerce") if latest_row else None
+            if mx is not None and not pd.isna(mx):
+                cutoff = (mx - pd.Timedelta(minutes=max(1, lookback_min))).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] cutoff calc failed table=%s", table, exc_info=True)
+
+        if cutoff is not None:
+            t0 = time.perf_counter()
+            guarded = _rsrc_budget_guard(conn, budget_sec)
+            try:
+                raw = pd.read_sql_query(
+                    'SELECT * FROM %s WHERE %s >= ? ORDER BY %s DESC LIMIT ?'
+                    % (_rsrc_quote(table), _rsrc_quote(dt_col), _rsrc_quote(dt_col)),
+                    conn, params=(cutoff, int(max_rows)),
+                )
+                logger.info(
+                    "[RANKING ENTRY SOURCE DB FALLBACK] indexed read table=%s rows=%s cutoff=%s elapsed=%.3fs",
+                    table, len(raw), cutoff, time.perf_counter() - t0,
+                )
+                return raw
+            except Exception as e:
+                # interrupted = 予算超過。握り潰さず理由を出して安い経路へ。
+                logger.warning(
+                    "[RANKING ENTRY SOURCE DB FALLBACK] indexed read aborted table=%s "
+                    "elapsed=%.3fs budget=%.1fs err=%s -> fallback to rowid scan",
+                    table, time.perf_counter() - t0, budget_sec, e,
+                )
+            finally:
+                if guarded:
+                    _rsrc_clear_budget_guard(conn)
+
+    scan_rows = max(max_rows, _env_int("RANKING_ENTRY_SOURCE_DB_SCAN_ROWS", 1500))
+    t0 = time.perf_counter()
+    guarded = _rsrc_budget_guard(conn, budget_sec)
+    try:
+        raw = pd.read_sql_query(
+            'SELECT * FROM %s ORDER BY rowid DESC LIMIT ?' % _rsrc_quote(table),
+            conn, params=(scan_rows,),
+        )
+        logger.info(
+            "[RANKING ENTRY SOURCE DB FALLBACK] rowid read table=%s rows=%s elapsed=%.3fs",
+            table, len(raw), time.perf_counter() - t0,
+        )
+        return raw
+    except Exception as e:
+        logger.warning(
+            "[RANKING ENTRY SOURCE DB FALLBACK] rowid read failed table=%s elapsed=%.3fs err=%s",
+            table, time.perf_counter() - t0, e,
+        )
+        return pd.DataFrame()
+    finally:
+        if guarded:
+            _rsrc_clear_budget_guard(conn)
+
+
+def _rsrc_load_pick_latest(conn: sqlite3.Connection, tables: List[str], *,
+                           lookback_min: int, max_rows: int, t0: float,
+                           db_path: str = ""):
+    """MAX(datetime) で最新テーブルを 1 本決め、それだけ読む (P0-4)。
+
+    戻り値: (df, table_name)
+    """
+    budget = _rsrc_query_budget_sec()
+    probes = _rsrc_latest_per_table(conn, tables, budget_sec=budget)
+    if not probes:
+        return pd.DataFrame(), ""
+
+    dated = [x for x in probes if x[1] is not None]
+    if dated:
+        dated.sort(key=lambda x: x[1], reverse=True)
+        table, latest, dt_col, cols = dated[0]
+    else:
+        table, latest, dt_col, cols = probes[0]
+
+    logger.warning(
+        "[RANKING ENTRY SOURCE DB FALLBACK] picked latest table=%s latest=%s "
+        "candidates=%s probe_elapsed=%.3fs",
+        table, latest,
+        [(t, str(l)) for t, l, _d, _c in probes],
+        time.perf_counter() - t0,
+    )
+
+    cached = _rsrc_cache_get(db_path or _rsrc_current_db_path(), table)
+    if isinstance(cached, pd.DataFrame) and not cached.empty:
+        return cached, table
+
+    raw = _rsrc_read_one_table(
+        conn, table, dt_col, cols,
+        lookback_min=lookback_min, max_rows=max_rows, budget_sec=budget,
+        latest=latest,
+    )
+    if raw is None or raw.empty:
+        return pd.DataFrame(), table
+    df = _rsrc_trim_recent(raw, dt_col, lookback_min, max_rows)
+    return df, table
+
+
+def _rsrc_load_from_ranking_db_core(*, deadline_at: float | None = None) -> pd.DataFrame:
+    if not _env_bool("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", True):
+        return pd.DataFrame()
+
+    db_path = _rsrc_resolve_db_path()
+    if not db_path or not os.path.exists(db_path):
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] db missing path=%s", db_path)
+        return pd.DataFrame()
+
+    lookback_min = max(1, _env_int("RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN", 30))
+    max_rows = max(100, _env_int("RANKING_ENTRY_SOURCE_DB_MAX_ROWS", 900))
+    scan_rows = max(max_rows, _env_int("RANKING_ENTRY_SOURCE_DB_SCAN_ROWS", 1500))
+    sqlite_timeout = max(0.2, _env_float("RANKING_ENTRY_SOURCE_DB_SQLITE_TIMEOUT_SEC", 1.2))
+    busy_timeout_ms = max(200, int(_env_float("RANKING_ENTRY_SOURCE_DB_BUSY_TIMEOUT_MS", 900.0)))
+
+    t0 = time.perf_counter()
+    best = pd.DataFrame()
+    best_table = ""
+    try:
+        # `with sqlite3.connect(...)` は close しない (transaction の CM)。
+        # ここは Entry hot path なので必ず closing 側を使う。
+        _t_conn = time.perf_counter()
+        with readonly_connect(str(db_path), timeout=sqlite_timeout,
+                              busy_timeout_ms=busy_timeout_ms) as conn, \
+                _rsrc_bind_db_path(str(db_path)):
+            _el_conn = time.perf_counter() - _t_conn
+
+            _t_tab = time.perf_counter()
+            tables = _rsrc_candidate_tables(conn)
+            logger.info(
+                "[RANKING ENTRY SOURCE DB FALLBACK] phase connect=%.3fs candidate_tables=%.3fs tables=%s",
+                _el_conn, time.perf_counter() - _t_tab, tables,
+            )
+            if not tables:
+                logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] no candidate table db=%s", db_path)
+                return pd.DataFrame()
+
+            if _rsrc_pick_latest_table_enabled():
+                # P0-4: 全テーブルを SELECT * で読まない。
+                # MAX(datetime) で最新の 1 本を決めてから、それだけ読む。
+                best, best_table = _rsrc_load_pick_latest(
+                    conn, tables, lookback_min=lookback_min, max_rows=max_rows, t0=t0,
+                    db_path=str(db_path),
+                )
+                tables = []
+
+            for table in tables:
+                if deadline_at is not None and time.perf_counter() >= deadline_at:
+                    logger.warning(
+                        "[RANKING ENTRY SOURCE DB FALLBACK] deadline hit while scanning tables next_table=%s scanned_rows=%s elapsed=%.1fs",
+                        table, len(best), time.perf_counter() - t0,
+                    )
+                    break
+                cached = _rsrc_cache_get(str(db_path), table)
+                if isinstance(cached, pd.DataFrame) and not cached.empty:
+                    return cached
+                cols = _rsrc_table_columns(conn, table)
+                if not cols:
+                    continue
+                dt_col = _rsrc_find_col(cols, _RSRC_DATETIME_COLS)
+                try:
+                    raw = pd.read_sql_query(f"SELECT * FROM {_rsrc_quote(table)} ORDER BY rowid DESC LIMIT ?", conn, params=(scan_rows,))
+                except Exception as e:
+                    logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] table read failed table=%s err=%s", table, e, exc_info=False)
+                    continue
+                if raw is None or raw.empty:
+                    continue
+                df = _rsrc_trim_recent(raw, dt_col, lookback_min, max_rows)
+                if df.empty:
+                    continue
+                latest, age, col = _rsrc_latest_info(df)
+                logger.warning(
+                    "[RANKING ENTRY SOURCE DB FALLBACK] table candidate db=%s table=%s raw_rows=%s rows=%s latest=%s age=%s col=%s lookback_min=%s scan_rows=%s",
+                    db_path, table, len(raw), len(df), latest, None if age is None else round(age, 1), col, lookback_min, scan_rows,
+                )
+                if best.empty:
+                    best = df
+                    best_table = table
+                else:
+                    b_latest, _b_age, _ = _rsrc_latest_info(best)
+                    if latest is not None and (b_latest is None or latest > b_latest):
+                        best = df
+                        best_table = table
+
+        if best is None or best.empty:
+            logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] db read empty db=%s", db_path)
+            return pd.DataFrame()
+
+        latest, age, col = _rsrc_latest_info(best)
+        elapsed = time.perf_counter() - t0
+        max_age = max(30.0, _env_float("RANKING_ENTRY_SOURCE_DB_MAX_AGE_SEC", 300.0))
+        failopen_max_age = max(max_age, _env_float("RANKING_ENTRY_SOURCE_DB_FAILOPEN_MAX_AGE_SEC", 1800.0))
+        same_day = bool(latest is not None and latest.date() == dt.datetime.now().date())
+        stale = bool(age is None or age > max_age)
+        allow_stale = bool(stale and same_day and age is not None and age <= failopen_max_age and _env_bool("RANKING_ENTRY_SOURCE_DB_FAILOPEN_STALE", False))
+
+        if stale and not allow_stale:
+            logger.warning(
+                "[RANKING ENTRY SOURCE DB FALLBACK] db latest stale and not allowed table=%s rows=%s latest=%s age=%s max_age=%.1fs failopen_max=%.1fs same_day=%s",
+                best_table, len(best), latest, None if age is None else round(age, 1), max_age, failopen_max_age, same_day,
+            )
+            return pd.DataFrame()
+
+        logger.warning(
+            "[RANKING ENTRY SOURCE DB FALLBACK] loaded v4 db=%s table=%s rows=%s latest=%s age=%s stale=%s allow_stale=%s elapsed=%.3fs cols=%s",
+            db_path, best_table, len(best), latest, None if age is None else round(age, 1), stale, allow_stale, elapsed, list(best.columns)[:20],
+        )
+        _rsrc_cache_put(str(db_path), best_table, best)
+        return best
+    except Exception as e:
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] db load failed db=%s err=%s", db_path, e, exc_info=False)
+        return pd.DataFrame()
+
+
+def _rsrc_publish_to_global_data(df: pd.DataFrame, *, source: str) -> None:
+    try:
+        out = df.copy()
+        setattr(global_data, "latest_ranking_df", out)
+        setattr(global_data, "ranking_snapshot_df", out)
+        try:
+            setattr(global_data, "latest_ranking_snapshot", out.to_dict("records"))
+        except Exception:
+            pass
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] published source=%s rows=%s latest=%s", source, len(out), _rsrc_latest_info(out)[0])
+    except Exception:
+        pass
+
+
+def _get_ranking_source_df_with_db_fallback() -> Optional[pd.DataFrame]:
+    direct = _rsrc_read_global_data_source()
+    direct_name = str(getattr(direct, "attrs", {}).get("_ranking_source_name", "global_data")) if isinstance(direct, pd.DataFrame) else "global_data"
+
+    if isinstance(direct, pd.DataFrame) and not direct.empty and _rsrc_fresh_enough(direct, label=direct_name):
+        return direct
+
+    fb = _rsrc_load_from_ranking_db()
+    if isinstance(fb, pd.DataFrame) and not fb.empty:
+        _rsrc_publish_to_global_data(fb, source="db_fallback_v4")
+        return fb
+
+    if isinstance(direct, pd.DataFrame) and not direct.empty and _env_bool("RANKING_ENTRY_SOURCE_FAILOPEN_STALE_GLOBAL", False):
+        latest, age, col = _rsrc_latest_info(direct)
+        max_age = _env_float("RANKING_ENTRY_SOURCE_FAILOPEN_GLOBAL_MAX_AGE_SEC", 1800.0)
+        same_day = latest is not None and latest.date() == dt.datetime.now().date()
+        if same_day and age is not None and age <= max_age:
+            logger.warning(
+                "[RANKING ENTRY SOURCE DB FALLBACK] fail-open stale global source=%s rows=%s latest=%s age=%.1fs col=%s max_age=%.1fs",
+                direct_name, len(direct), latest, age, col, max_age,
+            )
+            return direct
+
+    logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] ranking source dataframe not found after direct+db fallback")
+    return None
+
+
+# ------------------------------------------------------------
+# 入力行数の prefilter (旧 core/startup/ranking_entry_source_prefilter_patch_v2.py)
+# ------------------------------------------------------------
+# 旧構成では core/startup/__init__.py が _get_ranking_source_df をこの prefilter で
+# 包んでいたが、その後 ranking_entry_source_db_fallback_patch が同じ属性を
+# 「完全置換」していたため、main.py では prefilter は捨てられていた。
+# 残っていたのは DB フォールバックが install されないプロセス
+# (= 非DB かつ非main のヘルパー) だけ。その条件をそのまま再現する。
+# ------------------------------------------------------------
+_RSRC_PREFILTER_RANK_COLS = ("rank_position", "No", "Rank", "rank")
+_RSRC_PREFILTER_PRICE_COLS = ("price", "current_price", "CurrentPrice", "close")
+_RSRC_PREFILTER_SCORE_COLS = ("ranking_score_total", "score", "entry_score", "total_score", "final_score")
+_RSRC_PREFILTER_VOLUME_COLS = ("volume", "trading_volume", "TradingVolume")
+_RSRC_PREFILTER_TURNOVER_COLS = ("turnover", "trading_value", "TradingValue")
+_RSRC_PREFILTER_SYMBOL_COLS = ("symbol", "Symbol", "code", "stock_code")
+
+
+def _rsrc_prefilter_bool(name: str, default: bool = True) -> bool:
+    """旧 prefilter の _b(): 真値集合が runner 側の _env_bool より狭い ({'1','true','yes','on'})。"""
+    v = os.getenv(name)
+    return default if v is None or str(v).strip() == "" else str(v).lower() in {"1", "true", "yes", "on"}
+
+
+def _rsrc_prefilter_num(df: pd.DataFrame, names: Tuple[str, ...], default: float = 0.0) -> pd.Series:
+    for n in names:
+        if n in df.columns:
+            return pd.to_numeric(df[n], errors="coerce").fillna(default)
+    return pd.Series(default, index=df.index)
+
+
+def _rsrc_prefilter_col(df: pd.DataFrame, names: Tuple[str, ...]) -> Optional[str]:
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
+def _rsrc_prefilter(df):
+    if not isinstance(df, pd.DataFrame) or df.empty or not _rsrc_prefilter_bool("RANKING_ENTRY_SOURCE_PREFILTER_ENABLED", True):
+        return df
+    if len(df) <= _env_int("RANKING_ENTRY_SOURCE_PREFILTER_SKIP_UNDER_ROWS", 300):
+        return df
+    before = len(df)
+    rank = _rsrc_prefilter_num(df, _RSRC_PREFILTER_RANK_COLS, 999999)
+    price = _rsrc_prefilter_num(df, _RSRC_PREFILTER_PRICE_COLS, 0)
+    score = _rsrc_prefilter_num(df, _RSRC_PREFILTER_SCORE_COLS, 0)
+    vol = _rsrc_prefilter_num(df, _RSRC_PREFILTER_VOLUME_COLS, 0)
+    turn = _rsrc_prefilter_num(df, _RSRC_PREFILTER_TURNOVER_COLS, 0)
+    minv = _env_float("RANKING_ENTRY_PREFILTER_MIN_VOLUME", 15000)
+    fixedv = vol.where(~((vol > 0) & (vol < minv)), vol * 1000.0)
+    fixedt = turn.where(turn >= price * fixedv, price * fixedv)
+    mask = (rank <= _env_int("RANKING_ENTRY_PREFILTER_MAX_RANK", 25)) | (score >= _env_float("RANKING_ENTRY_PREFILTER_MIN_SCORE", 55))
+    mask &= (price >= _env_float("RANKING_ENTRY_PREFILTER_MIN_PRICE", 300)) & (price <= _env_float("RANKING_ENTRY_PREFILTER_MAX_PRICE", 12000))
+    mask &= (fixedv >= minv) | (fixedt >= _env_float("RANKING_ENTRY_PREFILTER_MIN_TURNOVER", 5000000)) | (rank <= _env_int("RANKING_ENTRY_PREFILTER_KEEP_RANK", 20))
+    out = df.loc[mask].copy()
+    if out.empty:
+        return df
+    out["_pf_rank"] = rank.loc[out.index]
+    out["_pf_score"] = score.loc[out.index]
+    out = out.sort_values(["_pf_score", "_pf_rank"], ascending=[False, True])
+    sc = _rsrc_prefilter_col(out, _RSRC_PREFILTER_SYMBOL_COLS)
+    if sc:
+        out = out.drop_duplicates(subset=[sc], keep="first")
+    out = out.head(_env_int("RANKING_ENTRY_PREFILTER_MAX_ROWS", 250)).drop(columns=["_pf_rank", "_pf_score"], errors="ignore")
+    logger.warning("[RANKING ENTRY PREFILTER] before=%s after=%s", before, len(out))
+    return out.reset_index(drop=True)
+
+
+def _rsrc_prefilter_scope_enabled() -> bool:
+    """prefilter を適用するプロセスか。
+
+    旧 prefilter は core/startup/__init__.py の
+    _install_entry_runtime_init_patches() から install されていた
+    (= DB コンテキストではスキップ)。さらに main.py では後から
+    db_fallback に属性ごと置換されて無効化されていた。
+    """
+    try:
+        if _rsrc_scope_enabled():
+            return False
+        if _env_bool("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", False):
+            return True
+        argv = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv for name in _RSRC_DB_PROCESS_NAMES)
+    except Exception:
+        return False
+
+
+def _get_ranking_source_df_pre_push_fallback() -> Optional[pd.DataFrame]:
+    if _rsrc_scope_enabled():
+        _rsrc_apply_env_defaults()
+        return _get_ranking_source_df_with_db_fallback()
+    df = _get_ranking_source_df_core()
+    if _rsrc_prefilter_scope_enabled():
+        return _rsrc_prefilter(df)
+    return df
 
 
 def _normalize_rank_type(v: Any) -> str:
@@ -258,7 +1216,243 @@ def _extract_day_change_pct(row: Dict[str, Any]) -> float:
     return 0.0
 
 
-def _normalize_ranking_row_for_entry(row: Dict[str, Any]) -> Dict[str, Any]:
+# ============================================================
+# ランキング由来エントリーの volume / turnover 単位補正
+# (旧 core/startup/ranking_entry_volume_unit_patch.py V4.5 から移設)
+# ------------------------------------------------------------
+# ランキングの出来高/売買代金は表示単位 (千株・百万円) のまま来ることがあり、
+# そのままだと MIN_VOLUME / MIN_TURNOVER に届かず VOLUME_NG になる。
+# 同一銘柄が type x market で多数出るため、同じ入力値はキャッシュして
+# entry loop が重くならないようにする。
+#
+# 旧パッチは core/startup/__init__.py 経由でのみ install されていたため、
+# DB専用子プロセスでは適用されなかった。本文化後も
+# _ranking_unit_fix_enabled() で同じスコープを保つ。
+# ============================================================
+
+_UNIT_FIX_TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled"}
+_UNIT_FIX_FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
+
+_UNIT_FIX_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+_UNIT_FIX_CACHE: Dict[Tuple[str, float, float, float], Dict[str, Any]] = {}
+_UNIT_FIX_LOGGED_KEYS: set = set()
+_UNIT_FIX_CACHE_MAX = 20000
+_UNIT_FIX_LOG_FIRST_N = 0
+_UNIT_FIX_LOG_COUNT = 0
+
+
+def _unit_fix_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in _UNIT_FIX_TRUE:
+            return True
+        if s in _UNIT_FIX_FALSE:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _unit_fix_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return float(v)
+    except Exception:
+        pass
+    return float(default)
+
+
+def _ranking_unit_fix_enabled() -> bool:
+    """このプロセスで単位補正を適用するか。
+
+    RANKING_ENTRY_UNIT_FIX_ENABLED=1/0 で明示的に上書きできる。
+    CORE_STARTUP_FORCE_FULL_INIT_PATCHES=1 のときは DB プロセスでも適用する。
+    """
+    try:
+        override = os.getenv("RANKING_ENTRY_UNIT_FIX_ENABLED")
+        if override is not None and str(override).strip() != "":
+            return _unit_fix_env_bool("RANKING_ENTRY_UNIT_FIX_ENABLED", True)
+        if _unit_fix_env_bool("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", False):
+            return True
+        import sys
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv_text for name in _UNIT_FIX_DB_PROCESS_NAMES)
+    except Exception:
+        return True
+
+
+def _unit_fix_flag_on(v: Any) -> bool:
+    try:
+        return str(v).strip().lower() in _UNIT_FIX_TRUE
+    except Exception:
+        return False
+
+
+def _unit_fix_key(symbol: Any, price: float, raw_volume: float, raw_turnover: float) -> Tuple[str, float, float, float]:
+    return (
+        str(symbol or "").strip(),
+        round(float(price), 4),
+        round(float(raw_volume), 4),
+        round(float(raw_turnover), 4),
+    )
+
+
+def _unit_fix_should_log_once(base_key: Tuple[str, float, float, float], kind: str) -> bool:
+    global _UNIT_FIX_LOG_COUNT
+    if _unit_fix_env_bool("RANKING_ENTRY_UNIT_FIX_LOG_EACH", False):
+        return True
+    limit = int(_unit_fix_env_float("RANKING_ENTRY_UNIT_FIX_LOG_FIRST_N", _UNIT_FIX_LOG_FIRST_N))
+    if limit <= 0:
+        return False
+    k = (base_key[0], base_key[1], base_key[2], base_key[3], kind)
+    if k in _UNIT_FIX_LOGGED_KEYS:
+        return False
+    _UNIT_FIX_LOGGED_KEYS.add(k)
+    _UNIT_FIX_LOG_COUNT += 1
+    return _UNIT_FIX_LOG_COUNT <= limit
+
+
+def _ranking_entry_volume_thresholds() -> Tuple[float, float]:
+    """MIN_VOLUME / MIN_TURNOVER を config + env から解決する。"""
+    try:
+        from config.ranking_entry_config import RANKING_ENTRY_CONFIG
+
+        vol_cfg = RANKING_ENTRY_CONFIG.get("VOLUME", {}) or {}
+    except Exception:
+        vol_cfg = {}
+    min_volume = _unit_fix_env_float("RANKING_ENTRY_MIN_VOLUME", float(vol_cfg.get("MIN_VOLUME", 30000)))
+    min_turnover = _unit_fix_env_float("RANKING_ENTRY_MIN_TURNOVER", float(vol_cfg.get("MIN_TURNOVER", 10000000)))
+    return min_volume, min_turnover
+
+
+def _normalize_ranking_entry_units(row: Dict[str, Any]) -> Dict[str, Any]:
+    if not _unit_fix_env_bool("RANKING_ENTRY_NORMALIZE_VOLUME_UNITS", True):
+        return row
+
+    min_volume, min_turnover = _ranking_entry_volume_thresholds()
+
+    try:
+        if _unit_fix_flag_on(row.get("ranking_entry_units_finalized")):
+            return row
+
+        symbol = row.get("symbol")
+        price = _safe_float(row.get("price") or row.get("current_price") or row.get("close_price") or row.get("close"), 0.0)
+        raw_volume = _safe_float(row.get("volume") if row.get("volume") is not None else row.get("trading_volume"), 0.0)
+        raw_turnover = _safe_float(row.get("turnover") if row.get("turnover") is not None else row.get("trading_value"), 0.0)
+        base_key = _unit_fix_key(symbol, price, raw_volume, raw_turnover)
+
+        cached = _UNIT_FIX_CACHE.get(base_key)
+        if cached is not None:
+            try:
+                for k, v in cached.items():
+                    row[k] = v
+            except Exception:
+                pass
+            return row
+
+        volume_multiplier = _unit_fix_env_float("RANKING_ENTRY_VOLUME_UNIT_MULTIPLIER", 1000.0)
+        turnover_multiplier = _unit_fix_env_float("RANKING_ENTRY_TURNOVER_UNIT_MULTIPLIER", 1000000.0)
+        implied_max_ratio = max(1.0, _unit_fix_env_float("RANKING_ENTRY_TURNOVER_IMPLIED_MAX_RATIO", 20.0))
+        yen_floor = _unit_fix_env_float("RANKING_ENTRY_TURNOVER_YEN_FLOOR", 100000.0)
+
+        volume = raw_volume
+        turnover = raw_turnover
+        volume_unit_fixed = False
+        turnover_unit_fixed = False
+        volume_unit_multiplier = 1.0
+        turnover_unit_multiplier = 1.0
+        zero_volume_turnover_ignored = False
+
+        if 0.0 < raw_volume < min_volume and volume_multiplier > 1:
+            candidate_volume = raw_volume * volume_multiplier
+            if candidate_volume >= min_volume:
+                volume = candidate_volume
+                volume_unit_fixed = True
+                volume_unit_multiplier = volume_multiplier
+
+        implied_turnover = price * volume if price > 0 and volume > 0 else 0.0
+        can_fix_turnover = volume > 0 and implied_turnover > 0
+
+        if can_fix_turnover:
+            if 0.0 < raw_turnover < min_turnover and raw_turnover < yen_floor and turnover_multiplier > 1:
+                candidate_turnover = raw_turnover * turnover_multiplier
+                upper = max(min_turnover, implied_turnover * implied_max_ratio)
+                if candidate_turnover >= min_turnover and candidate_turnover <= upper:
+                    turnover = candidate_turnover
+                    turnover_unit_fixed = True
+                    turnover_unit_multiplier = turnover_multiplier
+
+            if turnover <= 0:
+                turnover = implied_turnover
+            elif turnover < min_turnover <= implied_turnover:
+                turnover = implied_turnover
+            elif turnover > implied_turnover * implied_max_ratio:
+                if _unit_fix_should_log_once(base_key, "turnover_clamped"):
+                    logger.warning(
+                        "[RANKING ENTRY UNIT FIX] turnover clamped symbol=%s price=%s volume=%s turnover=%s implied=%s",
+                        symbol, price, volume, turnover, implied_turnover,
+                    )
+                turnover = implied_turnover
+        else:
+            if raw_turnover > 0:
+                zero_volume_turnover_ignored = True
+                if _unit_fix_should_log_once(base_key, "zero_volume"):
+                    logger.info(
+                        "[RANKING ENTRY UNIT FIX] zero-volume turnover ignored symbol=%s price=%s raw_volume=%.3f raw_turnover=%.3f",
+                        symbol, price, raw_volume, raw_turnover,
+                    )
+            turnover = 0.0
+
+        updates = {
+            "ranking_raw_volume": raw_volume,
+            "ranking_raw_turnover": raw_turnover,
+            "ranking_volume_unit_fixed": int(volume_unit_fixed),
+            "ranking_turnover_unit_fixed": int(turnover_unit_fixed),
+            "ranking_volume_unit_multiplier": volume_unit_multiplier,
+            "ranking_turnover_unit_multiplier": turnover_unit_multiplier,
+            "ranking_entry_units_finalized": 1,
+            "ranking_zero_volume_turnover_ignored": int(zero_volume_turnover_ignored),
+            "volume": volume,
+            "trading_volume": volume,
+            "turnover": turnover,
+            "trading_value": turnover,
+        }
+        row.update(updates)
+
+        if len(_UNIT_FIX_CACHE) >= int(_unit_fix_env_float("RANKING_ENTRY_UNIT_FIX_CACHE_MAX", _UNIT_FIX_CACHE_MAX)):
+            _UNIT_FIX_CACHE.clear()
+            _UNIT_FIX_LOGGED_KEYS.clear()
+        _UNIT_FIX_CACHE[base_key] = dict(updates)
+
+        changed = volume_unit_fixed or turnover_unit_fixed or raw_turnover != turnover or raw_volume != volume
+        if changed and _unit_fix_should_log_once(base_key, "finalized"):
+            logger.info(
+                "[RANKING ENTRY UNIT FIX] finalized symbol=%s price=%s volume %.3f->%.3f turnover %.3f->%.3f "
+                "vol_mul=%.0f turn_mul=%.0f implied=%.3f can_fix_turnover=%s zero_volume_ignored=%s",
+                symbol, price, raw_volume, volume, raw_turnover, turnover,
+                volume_unit_multiplier, turnover_unit_multiplier, implied_turnover,
+                can_fix_turnover, zero_volume_turnover_ignored,
+            )
+    except Exception:
+        logger.exception("[RANKING ENTRY UNIT FIX] normalize failed symbol=%s", row.get("symbol"))
+
+    return row
+
+
+def _normalize_ranking_row_for_entry_core(row: Dict[str, Any]) -> Dict[str, Any]:
     row = dict(row)
     symbol = str(_first(row, ("symbol", "Symbol", "code", "コード", "銘柄コード"), "")).strip()
     if symbol.endswith(".0") and symbol[:-2].isdigit():
@@ -300,7 +1494,289 @@ def _normalize_ranking_row_for_entry(row: Dict[str, Any]) -> Dict[str, Any]:
     row["day_change_pct"] = day_change_pct
     if not row.get("datetime"):
         row["datetime"] = row.get("snapshot_time") or row.get("time") or row.get("created_at")
+
+    # 旧 ranking_entry_volume_unit_patch から移設。本体の正規化の後に単位補正をかける。
+    if _ranking_unit_fix_enabled():
+        row = _normalize_ranking_entry_units(row)
+
     return row
+
+
+# --- ranking_entry_runtime_fix_patch (native化, 元 core/startup/ranking_entry_runtime_fix_patch.py V1.3) ---
+# ranking_technical attached symbols=0 や、出来高ランキング値が表示単位のままでMIN_VOLUMEに
+# 届かずVOLUME_NGになる問題への対処。V1.3時点で残っていたのは (a) 単位補正が二重適用されない
+# ようにする再補正抑止フラグと、(b) technical不足銘柄をsummary historyから補うfallbackの2点。
+# (旧パッチが持っていた ranking_entry_flat_price_guard_patch 再installロジックは、
+# 差し替え対象が既に entry_from_ranking.py へ直接本文化されており当時から no-op だった)
+def _ranking_entry_fix_env_bool(name: str, default: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _ranking_entry_fix_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _ranking_entry_fix_flag_on(v: Any) -> bool:
+    try:
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return False
+
+
+def _ranking_entry_fix_looks_already_yen_turnover(turnover: float, *, min_turnover: float) -> bool:
+    if turnover <= 0:
+        return False
+    yen_floor = _ranking_entry_fix_env_float("RANKING_ENTRY_TURNOVER_YEN_FLOOR", 100000.0)
+    if turnover >= yen_floor:
+        return True
+    if turnover >= min_turnover:
+        return True
+    return False
+
+
+def _normalize_ranking_row_for_entry(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = _normalize_ranking_row_for_entry_core(row)
+    try:
+        if not _ranking_entry_fix_env_bool("RANKING_ENTRY_NORMALIZE_VOLUME_UNITS", True):
+            return out
+
+        if _ranking_entry_fix_flag_on(out.get("ranking_entry_units_finalized")):
+            return out
+
+        # NOTE: _normalize_ranking_row_for_entry_core は _ranking_unit_fix_enabled()
+        # (DBプロセス除外) を満たす限り常に ranking_entry_units_finalized=1 を設定して
+        # 完了する (旧 ranking_entry_volume_unit_patch 由来、既に本文化済み) ため、
+        # ここに到達するのは DBプロセス等でスコープ外だったケースのみ。
+        # 旧パッチ自身のフォールバック補正ロジックをそのまま保持する。
+        min_volume, min_turnover = _ranking_entry_volume_thresholds()
+        volume_mul = _ranking_entry_fix_env_float("RANKING_ENTRY_VOLUME_UNIT_MULTIPLIER", 1000.0)
+        turnover_mul = _ranking_entry_fix_env_float("RANKING_ENTRY_TURNOVER_UNIT_MULTIPLIER", 1000000.0)
+
+        price = _safe_float(out.get("price") or out.get("current_price") or out.get("close_price"), 0.0)
+        volume = _safe_float(out.get("volume") if out.get("volume") is not None else out.get("trading_volume"), 0.0)
+        turnover = _safe_float(out.get("turnover") if out.get("turnover") is not None else out.get("trading_value"), 0.0)
+        raw_volume = volume
+        raw_turnover = turnover
+
+        already_volume_fixed = _ranking_entry_fix_flag_on(out.get("ranking_volume_unit_fixed")) or _safe_float(out.get("ranking_volume_unit_multiplier"), 0.0) > 1
+        already_turnover_fixed = _ranking_entry_fix_flag_on(out.get("ranking_turnover_unit_fixed")) or _safe_float(out.get("ranking_turnover_unit_multiplier"), 0.0) > 1
+
+        if (not already_volume_fixed) and volume > 0 and volume < min_volume and volume_mul > 1:
+            candidate_volume = volume * volume_mul
+            if candidate_volume >= min_volume:
+                volume = candidate_volume
+                out["volume"] = volume
+                out["trading_volume"] = volume
+                out["ranking_volume_raw"] = raw_volume
+                out["ranking_volume_unit_multiplier"] = volume_mul
+                out["ranking_volume_unit_fixed"] = 1
+
+        implied_turnover = price * volume if price > 0 and volume > 0 else 0.0
+
+        if not already_turnover_fixed:
+            if turnover > 0 and turnover < min_turnover and turnover_mul > 1:
+                if (not _ranking_entry_fix_looks_already_yen_turnover(turnover, min_turnover=min_turnover)) and implied_turnover > 0:
+                    candidate_turnover = turnover * turnover_mul
+                    upper = implied_turnover * _ranking_entry_fix_env_float("RANKING_ENTRY_TURNOVER_IMPLIED_MAX_RATIO", 20.0)
+                    if candidate_turnover >= min_turnover and candidate_turnover <= max(upper, min_turnover):
+                        turnover = max(candidate_turnover, implied_turnover)
+                        out["ranking_turnover_raw"] = raw_turnover
+                        out["ranking_turnover_unit_multiplier"] = turnover_mul
+                        out["ranking_turnover_unit_fixed"] = 1
+                elif implied_turnover > turnover:
+                    turnover = implied_turnover
+            elif implied_turnover > turnover:
+                turnover = implied_turnover
+
+        if turnover > 0:
+            out["turnover"] = turnover
+            out["trading_value"] = turnover
+
+        if raw_volume != volume or raw_turnover != turnover:
+            logger.info(
+                "[RANKING ENTRY FIX] normalized units symbol=%s price=%s volume %s->%s turnover %s->%s min_volume=%s min_turnover=%s already_vol=%s already_turn=%s",
+                out.get("symbol"), price, raw_volume, volume, raw_turnover, turnover, min_volume, min_turnover,
+                already_volume_fixed, already_turnover_fixed,
+            )
+    except Exception:
+        logger.exception("[RANKING ENTRY FIX] normalize row wrapper failed")
+    return out
+
+
+# P0-9: symbol -> latest technical row の memory cache。
+# 7 銘柄のために tf=1/3/5 の全履歴を毎回引き直して 30 秒かかっていた。
+_RANKING_TECH_CACHE: Dict[int, Any] = {}
+_RANKING_TECH_CACHE_LOCK = threading.Lock()
+
+
+def _ranking_tech_cache_ttl() -> float:
+    """summary history fallback キャッシュの TTL。
+
+    RANKING_ENTRY_TECH_CACHE_TTL_SEC (既定 90 秒) は
+    ranking_technical_store の DB lookup キャッシュ用で別物。
+    こちらは Entry へ実際に渡る technical なので、既定は短い 30 秒にする。
+    """
+    try:
+        return max(0.0, _env_float("RANKING_ENTRY_TECH_FALLBACK_CACHE_TTL_SEC", 30.0))
+    except Exception:
+        return 30.0
+
+
+def _ranking_entry_fix_get_gc_history(tf: int, symbols: Optional[set] = None) -> pd.DataFrame:
+    """summary history を引く。
+
+    symbols が渡されたら **絞ってから copy** する。
+    全フレームを copy すると tf=1/3/5 ぶんで重い。
+    """
+    try:
+        from core.global_context.context import global_context as GC
+        try:
+            df = GC.get_summary_history(tf, source="push")
+        except TypeError:
+            df = GC.get_summary_history(tf)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        if symbols and "symbol" in df.columns:
+            try:
+                sym = df["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+                hit = df[sym.isin(symbols)]
+                return hit.copy()
+            except Exception:
+                logger.debug("[RANKING ENTRY FIX] symbol filter failed tf=%s", tf, exc_info=True)
+        return df.copy()
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+_RANKING_ENTRY_FIX_TECH_COLS = (
+    "ma5", "ma25", "ma75", "rsi", "macd", "signal", "macd_hist", "hist",
+    "atr", "slope", "slope_atr_scaled", "vwap", "score_buy", "score_sell",
+    "score_total", "ranking_tech_score", "technical_ready", "symbol_hist_len",
+)
+
+
+def _ranking_entry_fix_nonzero(v: Any) -> bool:
+    try:
+        return abs(float(v)) > 1e-12
+    except Exception:
+        return False
+
+
+def _ranking_entry_fix_latest_summary_tech_map(symbols: set) -> Dict[str, Dict[str, Any]]:
+    # cache が効くなら history を引かない。
+    ttl = _ranking_tech_cache_ttl()
+    if ttl > 0 and symbols:
+        with _RANKING_TECH_CACHE_LOCK:
+            ent = _RANKING_TECH_CACHE.get(0)
+        if ent is not None:
+            ts, cached = ent
+            age = time.time() - ts
+            if age <= ttl:
+                hit = {s: cached[s] for s in symbols if s in cached}
+                # 部分ヒットで返すと欠けた銘柄の technical を捨てることになる。
+                # 全銘柄そろっている時だけ cache を使う。
+                if len(hit) == len(symbols):
+                    logger.info(
+                        "[RANKING ENTRY FIX] tech cache hit symbols=%d age=%.1fs "
+                        "(history を引き直さない)",
+                        len(hit), age,
+                    )
+                    return hit
+                logger.info(
+                    "[RANKING ENTRY FIX] tech cache partial hit=%d/%d age=%.1fs "
+                    "(欠けている銘柄があるので history から作り直す)",
+                    len(hit), len(symbols), age,
+                )
+
+    _t_tech = time.perf_counter()
+    result: Dict[str, Dict[str, Any]] = {}
+    for tf in (1, 3, 5):
+        # 必要銘柄だけに絞ってから copy する
+        df = _ranking_entry_fix_get_gc_history(tf, symbols=symbols)
+        if df.empty or "symbol" not in df.columns:
+            continue
+        work = df.copy()
+        work["symbol"] = work["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        work = work[work["symbol"].isin(symbols)].copy()
+        if work.empty:
+            continue
+        if "datetime" in work.columns:
+            work["datetime"] = pd.to_datetime(work["datetime"], errors="coerce")
+            work = work.sort_values(["symbol", "datetime"], kind="stable")
+        latest = work.groupby("symbol", as_index=False).tail(1)
+        for _, r in latest.iterrows():
+            sym = str(r.get("symbol") or "").strip()
+            if not sym or sym in result:
+                continue
+            tech: Dict[str, Any] = {}
+            for c in _RANKING_ENTRY_FIX_TECH_COLS:
+                if c in r.index:
+                    tech[c] = r.get(c)
+            if "hist" in tech and "macd_hist" not in tech:
+                tech["macd_hist"] = tech.get("hist")
+            if "ranking_tech_score" not in tech:
+                tech["ranking_tech_score"] = _safe_float(tech.get("score_total"), 0.0)
+            ready = any(_ranking_entry_fix_nonzero(tech.get(c)) for c in ("macd", "signal", "rsi", "slope", "slope_atr_scaled", "score_total"))
+            tech["ranking_tech_ready"] = 1 if ready else 0
+            tech["ranking_tech_reason"] = f"SUMMARY_HISTORY_FALLBACK_TF{tf}" if ready else f"SUMMARY_HISTORY_FALLBACK_WEAK_TF{tf}"
+            tech["ranking_tech_datetime"] = r.get("datetime") if "datetime" in r.index else None
+            tech["ranking_tech_db"] = "summary_history_cache"
+            result[sym] = tech
+
+    # 次回のために symbol -> latest technical をキャッシュする。
+    # 7 銘柄のたびに tf=1/3/5 の history を引き直さないための対策。
+    if _ranking_tech_cache_ttl() > 0 and result:
+        with _RANKING_TECH_CACHE_LOCK:
+            prev = _RANKING_TECH_CACHE.get(0)
+            merged = dict(prev[1]) if prev else {}
+            merged.update(result)
+            _RANKING_TECH_CACHE[0] = (time.time(), merged)
+    logger.info(
+        "[RANKING ENTRY FIX] tech map built symbols=%d/%d elapsed=%.3fs",
+        len(result), len(symbols or ()), time.perf_counter() - _t_tech,
+    )
+    return result
+
+
+def save_ranking_pseudo_technicals(rows: List[Dict[str, Any]], *args, **kwargs) -> Dict[str, Dict[str, Any]]:
+    base: Dict[str, Dict[str, Any]] = {}
+    try:
+        if callable(_save_ranking_pseudo_technicals_core):
+            base = _save_ranking_pseudo_technicals_core(rows, *args, **kwargs) or {}
+    except Exception:
+        logger.exception("[RANKING ENTRY FIX] original save_ranking_pseudo_technicals failed")
+        base = {}
+
+    try:
+        symbols = {str(r.get("symbol") or "").strip() for r in rows or [] if str(r.get("symbol") or "").strip()}
+        missing = {s for s in symbols if s not in base}
+        fallback = _ranking_entry_fix_latest_summary_tech_map(missing)
+        if fallback:
+            merged = dict(base)
+            merged.update(fallback)
+            logger.warning(
+                "[RANKING ENTRY FIX] technical fallback attached base=%s fallback=%s total=%s missing_symbols=%s",
+                len(base), len(fallback), len(merged), len(missing),
+            )
+            return merged
+        logger.warning(
+            "[RANKING ENTRY FIX] technical fallback none base=%s symbols=%s missing=%s",
+            len(base), len(symbols), len(missing),
+        )
+        return base
+    except Exception:
+        logger.exception("[RANKING ENTRY FIX] fallback tech map failed")
+        return base
 
 
 def _prepare_rows(ranking_df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -563,6 +2039,140 @@ def _ranking_technical_filter(row: Dict[str, Any], side: str) -> Tuple[bool, str
     return True, "OK", tech_score
 
 
+# ============================================================
+# マルチタイムフレーム 移動平均フィルタ (5MA/25MA/75MA)
+#   BUY: 終値 > 各MA / SELL: 終値 < 各MA
+#   1分足で成立 かつ (3分足 または 5分足) で成立
+#   却下理由は "MTF_MA_" 接頭辞 = 救済対象外のハードゲート。
+# ============================================================
+_RANKING_MTF_TF_MAP = {1: "1m", 3: "3m", 5: "5m"}
+
+
+def _ranking_mtf_ma_enabled(cfg: Dict[str, Any]) -> bool:
+    env = os.getenv("RANKING_ENTRY_MTF_MA_ENABLED")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip().lower() not in ("0", "false", "no", "off")
+    return bool((cfg or {}).get("ENABLED", False))
+
+
+def _ranking_mtf_ma_map(symbols: set) -> Dict[str, Dict[str, float]]:
+    """各銘柄について 1m/3m/5m の close と ma5/ma25/ma75 を、
+    足を潰さずサフィックス付きキー (close_1m, ma5_3m, ...) で返す。
+
+    _ranking_entry_fix_latest_summary_tech_map() は「最初にヒットした足だけ」
+    採用して 3m/5m を捨てるが、こちらは全足を保持する点が異なる。
+    データ源は GC.get_summary_history(tf, source="push") (in-memory / NAS 非依存)。
+    """
+    result: Dict[str, Dict[str, float]] = {}
+    if not symbols:
+        return result
+    for tf_i, tf_s in _RANKING_MTF_TF_MAP.items():
+        try:
+            df = _ranking_entry_fix_get_gc_history(tf_i, symbols=symbols)
+        except Exception:
+            logger.debug("[RANKING MTF MA] history fetch failed tf=%s", tf_i, exc_info=True)
+            continue
+        if not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
+            continue
+        work = df.copy()
+        work["symbol"] = work["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        work = work[work["symbol"].isin(symbols)]
+        if work.empty:
+            continue
+        if "datetime" in work.columns:
+            work["datetime"] = pd.to_datetime(work["datetime"], errors="coerce")
+            work = work.sort_values(["symbol", "datetime"], kind="stable")
+        latest = work.groupby("symbol", as_index=False).tail(1)
+        for _, r in latest.iterrows():
+            sym = str(r.get("symbol") or "").strip()
+            if not sym:
+                continue
+            bucket = result.setdefault(sym, {})
+            close_v = r.get("close")
+            if close_v is None or (isinstance(close_v, float) and pd.isna(close_v)):
+                close_v = r.get("current_price")
+            bucket[f"close_{tf_s}"] = _safe_float(close_v, 0.0)
+            for ma in ("ma5", "ma25", "ma75"):
+                bucket[f"{ma}_{tf_s}"] = _safe_float(r.get(ma), 0.0)
+    return result
+
+
+def _ranking_mtf_ma_side_ok_for_tf(row: Dict[str, Any], side: str, tf_s: str, mas) -> Tuple[Any, str]:
+    """指定足について「終値 vs 各MA」を判定。
+    戻り値: (True/False/None, detail)。None = データ不足で判定不能。
+    値が無い MA は個別にスキップし、寄り直後の ma75 未成熟でも止めない。
+    """
+    close = _safe_float(row.get(f"close_{tf_s}"), 0.0)
+    if close <= 0 and tf_s == "1m":
+        close = _safe_float(row.get("close") or row.get("current_price") or row.get("price"), 0.0)
+    if close <= 0:
+        return None, f"{tf_s}:no_close"
+    checked = 0
+    for ma in mas:
+        mav = _safe_float(row.get(f"{ma}_{tf_s}"), 0.0)
+        if mav <= 0 and tf_s == "1m":
+            mav = _safe_float(row.get(ma), 0.0)  # 1m はサフィックス無しキーにも入る
+        if mav <= 0:
+            continue  # そのMAはデータ不足 → スキップ
+        checked += 1
+        if side == "BUY" and close < mav:
+            return False, f"{tf_s}:{ma} c={close:.1f}<{mav:.1f}"
+        if side == "SELL" and close > mav:
+            return False, f"{tf_s}:{ma} c={close:.1f}>{mav:.1f}"
+    if checked == 0:
+        return None, f"{tf_s}:no_ma"
+    return True, f"{tf_s}:ok({checked})"
+
+
+def _ranking_mtf_ma_filter(row: Dict[str, Any], side: str) -> Tuple[bool, str]:
+    cfg = RANKING_ENTRY_CONFIG.get("MTF_MA", {}) or {}
+    if not _ranking_mtf_ma_enabled(cfg):
+        return True, "MTF_MA_DISABLED"
+    side_u = str(side or "").upper().strip()
+    apply_sides = tuple(str(s).upper() for s in cfg.get("APPLY_SIDES", ("BUY", "SELL")))
+    if side_u not in apply_sides:
+        return True, "MTF_MA_SIDE_SKIP"
+    if side_u not in ("BUY", "SELL"):
+        return True, "MTF_MA_SIDE_NONE"
+
+    mas = tuple(cfg.get("MAS", ("ma5", "ma25", "ma75")))
+    base_tf = str(cfg.get("BASE_TF", "1m"))
+    confirm_tfs = tuple(cfg.get("CONFIRM_TFS", ("3m", "5m")))
+    confirm_mode = str(cfg.get("CONFIRM_MODE", "ANY")).upper()
+    allow_no_data = bool(cfg.get("ALLOW_WHEN_NO_DATA", True))
+
+    # (1) BASE 足 (1分足) は必須で成立
+    base_ok, base_detail = _ranking_mtf_ma_side_ok_for_tf(row, side_u, base_tf, mas)
+    if base_ok is False:
+        return False, f"MTF_MA_BASE_NG {base_detail}"
+    if base_ok is None and not allow_no_data:
+        return False, f"MTF_MA_BASE_NODATA {base_detail}"
+
+    # (2) CONFIRM 足 (3分足 / 5分足)
+    results = []
+    details = []
+    for tf_s in confirm_tfs:
+        ok, det = _ranking_mtf_ma_side_ok_for_tf(row, side_u, tf_s, mas)
+        results.append(ok)
+        details.append(det)
+    has_data = any(r is not None for r in results)
+    detail_s = ";".join(details)
+
+    if not has_data:
+        if allow_no_data:
+            return True, f"MTF_MA_OK_CONFIRM_NODATA base={base_detail}"
+        return False, f"MTF_MA_CONFIRM_NODATA {detail_s}"
+
+    if confirm_mode == "ALL":
+        if any(r is False for r in results):
+            return False, f"MTF_MA_CONFIRM_ALL_NG {detail_s}"
+        return True, f"MTF_MA_OK_ALL {detail_s}"
+    # ANY (既定): 3分足 または 5分足 のどれかが成立
+    if any(r is True for r in results):
+        return True, f"MTF_MA_OK_ANY {detail_s}"
+    return False, f"MTF_MA_CONFIRM_ANY_NG {detail_s}"
+
+
 def _calc_ranking_only_score(row: Dict[str, Any], side: str, prev_price: float, prev_rank: int, consecutive: int) -> Tuple[float, Dict[str, float]]:
     cfg_rank = RANKING_ENTRY_CONFIG["RANKING"]
     cfg_vol = RANKING_ENTRY_CONFIG["VOLUME"]
@@ -605,7 +2215,176 @@ def _calc_ranking_only_score(row: Dict[str, Any], side: str, prev_price: float, 
     }
 
 
+os.environ.setdefault("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK", "30")
+os.environ.setdefault("RANKING_ENTRY_RESCUE_MAX_RANK", "30")
+os.environ.setdefault("RANKING_ENTRY_RESCUE_MIN_TURNOVER", "30000000")
+os.environ.setdefault("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER", "30000000")
+
+_ranking_filter_rescue_in_filter = False
+
+
+def _ranking_filter_rescue_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", "").replace("%", ""))
+    except Exception:
+        return float(default)
+
+
+def _ranking_filter_rescue_safe_int(v: Any, default: int = 999999) -> int:
+    try:
+        return int(_ranking_filter_rescue_safe_float(v, float(default)))
+    except Exception:
+        return int(default)
+
+
+def _ranking_filter_rescue_first(row: Dict[str, Any], keys: Tuple[str, ...], default: Any = None) -> Any:
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+        except Exception:
+            pass
+    return default
+
+
+def _ranking_filter_rescue_reason_rescuable(reason_s: str) -> bool:
+    if reason_s.startswith("RANKING_TECH_"):
+        return True
+    if reason_s in {"FILTER_RECURSION", "ORIGINAL_FILTER_RECURSION", "ORIGINAL_FILTER_UNAVAILABLE", "FLAT_PRICE_FILTER_RECURSION"}:
+        return True
+    if _env_bool("RANKING_ENTRY_RESCUE_FLAT_PRICE_REASON", True):
+        if reason_s.startswith("BUY_PRICE_NOT_UP") or reason_s.startswith("SELL_PRICE_NOT_DOWN"):
+            return True
+    return False
+
+
+def _ranking_filter_rescue_is_recursion_reason(reason_s: str) -> bool:
+    return reason_s in {"FILTER_RECURSION", "ORIGINAL_FILTER_RECURSION", "FLAT_PRICE_FILTER_RECURSION"}
+
+
+def _ranking_filter_rescue_allowed(row: Dict[str, Any], side: str, score: float, reason: Any) -> Tuple[bool, Dict[str, Any]]:
+    reason_s = str(reason or "")
+    recursion_reason = _ranking_filter_rescue_is_recursion_reason(reason_s)
+    rank = _ranking_filter_rescue_safe_int(_ranking_filter_rescue_first(row, ("rank_position", "rank", "No", "no"), 999999), 999999)
+    price = _ranking_filter_rescue_safe_float(_ranking_filter_rescue_first(row, ("price", "current_price", "CurrentPrice", "close"), 0.0), 0.0)
+    volume = _ranking_filter_rescue_safe_float(_ranking_filter_rescue_first(row, ("volume", "trading_volume", "TradingVolume"), 0.0), 0.0)
+    turnover = _ranking_filter_rescue_safe_float(_ranking_filter_rescue_first(row, ("turnover", "trading_value", "Turnover"), 0.0), 0.0)
+    day = _ranking_filter_rescue_safe_float(_ranking_filter_rescue_first(row, ("day_change_pct", "change_percentage", "change_rate", "ChangePercentage", "ChangeRatio"), 0.0), 0.0)
+    rt = str(_ranking_filter_rescue_first(row, ("rank_type", "ranking_type", "CategoryName"), ""))
+    side_u = str(side or "").upper().strip()
+    if turnover <= 0 and price > 0 and volume > 0:
+        turnover = price * volume
+
+    min_score = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_SCORE" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_SCORE", 55.0 if recursion_reason else 60.0)
+    max_rank = _env_int("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK" if recursion_reason else "RANKING_ENTRY_RESCUE_MAX_RANK", 30)
+    min_turnover = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_TURNOVER", 30000000.0)
+    min_volume = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_VOLUME" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_VOLUME", 30000.0)
+    min_abs_day = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_ABS_DAY_PCT" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_ABS_DAY_PCT", 0.0 if recursion_reason else 3.0)
+    min_price = _env_float("RANKING_ENTRY_RESCUE_MIN_PRICE", 300.0)
+    max_price = _env_float("RANKING_ENTRY_RESCUE_MAX_PRICE", 7000.0)
+
+    diag = {"reason": reason_s, "recursion_reason": recursion_reason, "rank": rank, "rank_type": rt, "side": side_u, "score": score, "price": price, "volume": volume, "turnover": turnover, "day": day, "min_score": min_score, "max_rank": max_rank, "min_turnover": min_turnover, "min_volume": min_volume}
+    if not _ranking_filter_rescue_reason_rescuable(reason_s):
+        return False, {**diag, "ng": "not_rescuable_reason"}
+    if score < min_score:
+        return False, {**diag, "ng": "score_low"}
+    if rank > max_rank:
+        return False, {**diag, "ng": "rank_low"}
+    if price > 0 and (price < min_price or price > max_price):
+        return False, {**diag, "ng": "price_range"}
+    if volume > 0 and volume < min_volume:
+        return False, {**diag, "ng": "volume_low"}
+    if turnover > 0 and turnover < min_turnover:
+        return False, {**diag, "ng": "turnover_low"}
+    if min_abs_day > 0 and abs(day) < min_abs_day:
+        return False, {**diag, "ng": "day_move_low"}
+    if not recursion_reason:
+        if side_u == "BUY" and day <= 0:
+            return False, {**diag, "ng": "buy_day_not_positive"}
+        if side_u == "SELL" and day >= 0:
+            return False, {**diag, "ng": "sell_day_not_negative"}
+    else:
+        if day != 0:
+            if side_u == "BUY" and day < 0:
+                return False, {**diag, "ng": "buy_day_negative"}
+            if side_u == "SELL" and day > 0:
+                return False, {**diag, "ng": "sell_day_positive"}
+    return True, {**diag, "rescue": True}
+
+
+def _ranking_filter_rescue_try(row: Any, side: str, score: float, reason: Any) -> Tuple[bool, str]:
+    try:
+        if not _env_bool("RANKING_ENTRY_STRONG_TECH_RESCUE_ENABLED", True):
+            return False, str(reason or "RESCUE_DISABLED")
+        if not isinstance(row, dict):
+            return False, str(reason or "ROW_NOT_DICT")
+        allowed, diag = _ranking_filter_rescue_allowed(row, str(side or ""), _ranking_filter_rescue_safe_float(score, 0.0), reason)
+        if allowed:
+            row["ranking_filter_rescue"] = True
+            row["ranking_filter_rescue_reason"] = str(reason or "")
+            row["ranking_filter_rescue_diag"] = str(diag)
+            logger.warning("[RANKING FILTER RESCUE] allow symbol=%s side=%s diag=%s", row.get("symbol") or row.get("Symbol"), side, diag)
+            return True, "RANKING_FILTER_RESCUE"
+        logger.info("[RANKING FILTER RESCUE] reject symbol=%s side=%s diag=%s", row.get("symbol") or row.get("Symbol"), side, diag)
+        return False, str(reason or "RESCUE_NG")
+    except Exception:
+        logger.exception("[RANKING FILTER RESCUE] rescue check failed symbol=%s", row.get("symbol") if isinstance(row, dict) else None)
+        return False, str(reason or "RESCUE_EXCEPTION")
+
+
 def _passes_ranking_only_filters(row: Dict[str, Any], side: str, prev_h: Dict[str, Any], score: float, parts: Dict[str, float]) -> Tuple[bool, str]:
+    """ランキング単独条件のフィルタ (最終公開エントリポイント)。
+
+    旧 core/startup/ranking_entry_filter_rescue_patch V1.7 がこの関数
+    (flat price guard 適用後の版) をさらに外側からラップし、フィルタ落選時に
+    「テクニカル理由 / 再帰検出 / (env既定 True で) 価格未達」を、rank・出来高・
+    売買代金・値幅などの強い流動性条件を満たす場合だけ救済していた。
+    再帰ガード (_ranking_filter_rescue_in_filter) は当時、他パッチとのラップ順
+    不定による無限再帰を防ぐための防御であり、本文化後も挙動保持のため残す。
+    """
+    global _ranking_filter_rescue_in_filter
+    if _ranking_filter_rescue_in_filter:
+        ok, reason = _ranking_filter_rescue_try(row, side, score, "FILTER_RECURSION")
+        return ok, reason
+    _ranking_filter_rescue_in_filter = True
+    try:
+        ok = False
+        reason: Any = "ORIGINAL_FILTER_UNAVAILABLE"
+        try:
+            ok, reason = _passes_ranking_only_filters_pre_rescue(row, side, prev_h, score, parts)
+        except RecursionError:
+            logger.warning("[RANKING FILTER RESCUE] original filter recursion detected symbol=%s side=%s", row.get("symbol") if isinstance(row, dict) else None, side)
+            ok, reason = False, "ORIGINAL_FILTER_RECURSION"
+        if ok:
+            return ok, reason
+        rescue_ok, rescue_reason = _ranking_filter_rescue_try(row, side, score, reason)
+        if rescue_ok:
+            return True, rescue_reason
+        return False, reason
+    finally:
+        _ranking_filter_rescue_in_filter = False
+
+
+def _passes_ranking_only_filters_pre_rescue(row: Dict[str, Any], side: str, prev_h: Dict[str, Any], score: float, parts: Dict[str, float]) -> Tuple[bool, str]:
+    """flat price guard 適用後・filter rescue 適用前のランキング単独条件フィルタ。
+
+    旧 core/startup/ranking_entry_flat_price_guard_patch V1.4 がこの関数を
+    ラップして「volume/turnover 単位補修 + flat price 救済」を行っていた。
+    その処理は trading/ranking/ranking_flat_price_guard.py へ移設済み。
+    """
+    from trading.ranking import ranking_flat_price_guard as _flat
+
+    if _flat.flat_price_guard_enabled():
+        return _flat.apply_flat_price_guard(
+            _passes_ranking_only_filters_core, row, side, prev_h, score, parts
+        )
+    return _passes_ranking_only_filters_core(row, side, prev_h, score, parts)
+
+
+def _passes_ranking_only_filters_core(row: Dict[str, Any], side: str, prev_h: Dict[str, Any], score: float, parts: Dict[str, float]) -> Tuple[bool, str]:
     cfg_rank = RANKING_ENTRY_CONFIG["RANKING"]
     cfg_vol = RANKING_ENTRY_CONFIG["VOLUME"]
     cfg_price = RANKING_ENTRY_CONFIG["PRICE"]
@@ -667,6 +2446,9 @@ def _passes_ranking_only_filters(row: Dict[str, Any], side: str, prev_h: Dict[st
     tech_ok, tech_reason, _tech_score = _ranking_technical_filter(row, side)
     if not tech_ok:
         return False, tech_reason
+    mtf_ok, mtf_reason = _ranking_mtf_ma_filter(row, side)
+    if not mtf_ok:
+        return False, mtf_reason
     min_score = _safe_float(cfg_score.get("MIN_ENTRY_SCORE", 70.0), 70.0)
     if score < min_score:
         return False, f"SCORE_NG score={score:.2f} min={min_score:.2f}"
@@ -691,29 +2473,59 @@ def entry_from_ranking():
     if not is_time_allowed(started):
         logger.info("[RANKING ENTRY LOOP] skip reason=TIME_GUARD now=%s", started.strftime("%H:%M:%S"))
         return 0
+    _t_phase = time.perf_counter()
     ranking_df = _get_ranking_source_df()
+    _el_source = time.perf_counter() - _t_phase
     if ranking_df is None or ranking_df.empty:
-        logger.info("[RANKING ENTRY LOOP] skip reason=no_ranking_df")
+        logger.info("[RANKING ENTRY LOOP] skip reason=no_ranking_df elapsed=%.2fs", _el_source)
         return 0
     now = _now()
+    _t_phase = time.perf_counter()
     rows_all = _prepare_rows(ranking_df)
+    _el_prepare = time.perf_counter() - _t_phase
     if not rows_all:
         logger.info("[RANKING ENTRY LOOP] skip reason=no_normalized_rows")
         return 0
+    _t_phase = time.perf_counter()
     rows = _light_prefilter_rows(rows_all)
+    _el_prefilter = time.perf_counter() - _t_phase
+    logger.warning(
+        "[RANKING ENTRY LOOP] phase ranking_source=%.2fs prepare_rows=%.2fs prefilter=%.2fs raw=%s prefiltered=%s",
+        _el_source, _el_prepare, _el_prefilter, len(rows_all), len(rows),
+    )
     if not rows:
         logger.info("[RANKING ENTRY LOOP] skip reason=no_prefilter_rows raw_rows=%s", len(rows_all))
         return 0
 
     tech_map: Dict[str, Dict[str, Any]] = {}
+    _el_tech = 0.0
     cfg_tech = RANKING_ENTRY_CONFIG.get("TECHNICAL", {}) or {}
     if bool(cfg_tech.get("ENABLED", True)) and callable(save_ranking_pseudo_technicals):
+        _t_phase = time.perf_counter()
         try:
             tech_map = save_ranking_pseudo_technicals(rows)
         except Exception:
             logger.exception("[RANKING ENTRY LOOP] technical attach failed -> continue without tech")
             tech_map = {}
+        _el_tech = time.perf_counter() - _t_phase
+        logger.warning(
+            "[RANKING ENTRY LOOP] phase technical_attach=%.2fs symbols=%s",
+            _el_tech, len(tech_map),
+        )
         logger.info("[RANKING ENTRY LOOP] ranking_technical attached symbols=%s prefiltered_rows=%s raw_rows=%s", len(tech_map), len(rows), len(rows_all))
+
+    # マルチタイムフレーム MA (5/25/75) を 1m/3m/5m 別に取得して行へ付与する。
+    # tech_map (足を潰した 1 足分) とは別に、close_3m/ma75_5m 等のサフィックス付き
+    # キーを additive に載せる。MTF_MA フィルタが無効なら構築自体をスキップ。
+    mtf_ma_map: Dict[str, Dict[str, float]] = {}
+    if _ranking_mtf_ma_enabled(RANKING_ENTRY_CONFIG.get("MTF_MA", {}) or {}):
+        try:
+            _mtf_syms = {str(r.get("symbol") or "").strip() for r in rows if str(r.get("symbol") or "").strip()}
+            mtf_ma_map = _ranking_mtf_ma_map(_mtf_syms)
+            logger.info("[RANKING MTF MA] map built symbols=%s/%s", len(mtf_ma_map), len(_mtf_syms))
+        except Exception:
+            logger.exception("[RANKING MTF MA] map build failed -> MTF MA gate falls back to no-data behavior")
+            mtf_ma_map = {}
 
     created = 0
     build_reject = 0
@@ -724,7 +2536,18 @@ def entry_from_ranking():
     current_keys: set[str] = set()
     best_by_symbol_side: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
+    _wg = _worker_guard_mod()
+    _row_elapsed: List[Tuple[str, float]] = []
+    _t_scoring = time.perf_counter()
     for row in rows:
+        _row_t0 = time.perf_counter()
+        # scheduler が timeout したら worker 自身も止まる (daemon thread を残さない)
+        if _wg is not None and _wg.check(label="ranking_scoring_loop"):
+            logger.warning(
+                "[RANKING ENTRY LOOP] worker cancelled elapsed=%.3fs scored=%s candidates=%s",
+                time.perf_counter() - started_perf, len(_row_elapsed), len(best_by_symbol_side),
+            )
+            break
         if time.perf_counter() >= deadline and best_by_symbol_side:
             logger.warning(
                 "[RANKING ENTRY LOOP] stop scoring with candidates elapsed=%.3fs candidates=%s",
@@ -739,6 +2562,11 @@ def entry_from_ranking():
             break
         if callable(attach_ranking_technicals):
             row = attach_ranking_technicals(row, tech_map)
+        if mtf_ma_map:
+            _mtf = mtf_ma_map.get(str(row.get("symbol") or "").strip())
+            if _mtf:
+                for _k, _v in _mtf.items():
+                    row.setdefault(_k, _v)  # 既存キーは壊さず additive に付与
         symbol = str(row.get("symbol") or "").strip()
         if not symbol:
             continue
@@ -775,12 +2603,30 @@ def entry_from_ranking():
         old_score = _safe_float(old["row"].get("score_total"), 0.0) if isinstance(old, dict) and isinstance(old.get("row"), dict) else 0.0
         if old is None or score > old_score:
             best_by_symbol_side[key] = {"row": row, "parts": parts, "prev_price": prev_price, "prev_rank": prev_rank, "consecutive": consecutive}
+        _row_elapsed.append((symbol, time.perf_counter() - _row_t0))
 
+    _el_scoring = time.perf_counter() - _t_scoring
+
+    # 1 銘柄ごとの所要時間を出す (どこで詰まったか特定するため)
+    try:
+        if _row_elapsed:
+            _slow = sorted(_row_elapsed, key=lambda x: -x[1])[:5]
+            logger.warning(
+                "[RANKING ENTRY LOOP] per-symbol elapsed n=%s total=%.2fs max=%.2fs slow=%s",
+                len(_row_elapsed), sum(x[1] for x in _row_elapsed),
+                _slow[0][1], [(s, round(e, 2)) for s, e in _slow],
+            )
+    except Exception:
+        logger.exception("[RANKING ENTRY LOOP] per-symbol elapsed log failed")
+
+    _t_phase = time.perf_counter()
     _reset_missing_histories(current_keys)
+    _el_reset = time.perf_counter() - _t_phase
 
     packs = list(best_by_symbol_side.items())
     packs.sort(key=lambda kv: _safe_float(kv[1]["row"].get("score_total"), 0.0), reverse=True)
 
+    _t_pending = time.perf_counter()
     for (symbol, side), pack in packs:
         if created >= max_pending:
             break
@@ -850,7 +2696,20 @@ def entry_from_ranking():
         else:
             pending_reject += 1
 
+    _el_pending = time.perf_counter() - _t_pending
+
     elapsed = time.perf_counter() - started_perf
+    # どの phase にも計上されていない時間。ここが大きいなら計測点が足りない。
+    _phase_sum = _el_source + _el_prepare + _el_prefilter + _el_tech + _el_scoring + _el_reset + _el_pending
+    _unaccounted = elapsed - _phase_sum
+    _log_phase = logger.warning if _unaccounted > 2.0 else logger.info
+    _log_phase(
+        "[RANKING ENTRY LOOP] phase breakdown total=%.2fs phase_sum=%.2fs unaccounted=%.2fs "
+        "ranking_source=%.2fs prepare_rows=%.2fs prefilter=%.2fs technical_attach=%.2fs "
+        "scoring=%.2fs reset_histories=%.2fs pending_add=%.2fs",
+        elapsed, _phase_sum, _unaccounted, _el_source, _el_prepare, _el_prefilter,
+        _el_tech, _el_scoring, _el_reset, _el_pending,
+    )
     if reject_samples:
         logger.warning("[RANKING ENTRY LOOP] ranking_only_reject_counts=%s samples=%s", dict(reject_counts), reject_samples)
     logger.info(
@@ -862,3 +2721,309 @@ def entry_from_ranking():
 
 def run_ranking_entry_pipeline():
     return entry_from_ranking()
+
+
+# ============================================================
+# ranking source が空のときの PUSH summary フォールバック
+# ------------------------------------------------------------
+# 旧 core/startup/ranking_entry_push_fallback_patch.py を本文化。
+# ranking source DF が空なら、PUSH summary から ranking 相当の DF を
+# 組み立てて返す。無効化は RANKING_ENTRY_PUSH_SUMMARY_FALLBACK_ENABLED=0。
+#
+# 適用スコープは旧 install 導線
+# (trading/entry_exit/tasks.py の ranking entry companion patch, main.py 経路)
+# を _rpf2_scope_enabled() で再現する。
+# ============================================================
+
+def _rpf2_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _rpf2_env_int(name: str, default: int) -> int:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        return int(float(raw))
+    except Exception:
+        return int(default)
+
+
+def _rpf2_num(s: pd.Series | Any, default: Any = 0.0, index=None) -> pd.Series:
+    """常に float64 Series を返す。
+
+    以前は to_numeric/fillna が失敗したときや、列が無くて
+    スカラーが渡ったときに float を返していた。その場合
+    呼び出し側の `.loc[out.index]` が AttributeError になる。
+    index を渡すとその index に揃える (欠損は default で埋める)。
+    default に Series を渡した場合は index 合わせで埋める。
+    """
+    if index is None:
+        if isinstance(s, pd.Series):
+            index = s.index
+        elif isinstance(default, pd.Series):
+            index = default.index
+
+    # default を Series / スカラーに正規化する
+    dser = None
+    dval = 0.0
+    if isinstance(default, pd.Series):
+        try:
+            dser = pd.to_numeric(default, errors="coerce")
+            if index is not None:
+                dser = dser.reindex(index)
+            dser = dser.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        except Exception:
+            logger.exception("[RANKING PUSH FALLBACK] _rpf2_num default coerce failed")
+            dser = None
+    else:
+        try:
+            dval = float(default)
+        except Exception:
+            dval = 0.0
+
+    try:
+        if isinstance(s, pd.Series):
+            base = pd.to_numeric(s, errors="coerce")
+            if index is not None and not base.index.equals(index):
+                base = base.reindex(index)
+        elif (isinstance(s, (list, tuple, np.ndarray, pd.Index))
+              and index is not None and len(s) == len(index)):
+            base = pd.to_numeric(pd.Series(list(s), index=index), errors="coerce")
+        else:
+            # スカラー (列が存在しなかったケース)
+            try:
+                sval = float(s)
+            except Exception:
+                sval = float("nan")
+            if index is None:
+                index = pd.RangeIndex(0)
+            base = pd.Series(sval, index=index, dtype="float64")
+    except Exception:
+        # 握り潰さずログを残したうえで default だけの Series にする
+        logger.exception("[RANKING PUSH FALLBACK] _rpf2_num coerce failed")
+        base = pd.Series(np.nan,
+                         index=index if index is not None else pd.RangeIndex(0),
+                         dtype="float64")
+
+    base = base.replace([np.inf, -np.inf], np.nan)
+    if dser is not None:
+        base = base.fillna(dser).fillna(0.0)
+    else:
+        base = base.fillna(dval)
+    try:
+        return base.astype("float64")
+    except Exception:
+        logger.exception("[RANKING PUSH FALLBACK] _rpf2_num astype failed")
+        return pd.to_numeric(base, errors="coerce").fillna(0.0)
+
+
+def _rpf2_latest_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "datetime" in out.columns:
+        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.sort_values(["symbol", "datetime"], kind="stable").groupby("symbol", as_index=False).tail(1)
+    else:
+        out = out.drop_duplicates(subset=["symbol"], keep="last")
+    return out
+
+
+def _rpf2_get_push_summary_df() -> pd.DataFrame:
+    candidates = []
+    try:
+        from global_state import global_data
+        for fn_name in ("get_push_merged_summary", "get_merged_summary", "get_multi_summary", "get_summary"):
+            try:
+                fn = getattr(global_data, fn_name, None)
+                if not callable(fn):
+                    continue
+                if fn_name in {"get_merged_summary", "get_multi_summary"}:
+                    df = fn(1, source="push")
+                else:
+                    df = fn(1)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    candidates.append((fn_name, df))
+            except TypeError:
+                try:
+                    df = fn(1)
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        candidates.append((fn_name, df))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        from core.global_context.context import global_context as GC
+        for call in (
+            lambda: GC.get_merged_summary(1, source="push"),
+            lambda: GC.get_push_merged_summary(1),
+            lambda: GC.summary.to_dataframe(1),
+        ):
+            try:
+                df = call()
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    candidates.append(("GC", df))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not candidates:
+        return pd.DataFrame()
+    name, df = max(candidates, key=lambda x: len(x[1]))
+    latest = _rpf2_latest_per_symbol(df)
+    logger.warning("[RANKING PUSH FALLBACK] source=%s rows=%s latest_rows=%s", name, len(df), len(latest))
+    return latest
+
+
+def _rpf2_build_ranking_like_from_push(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "symbol" not in df.columns:
+        return pd.DataFrame()
+
+    out = df.copy()
+    # index が非一意だと後段の .loc[out.index] / .reindex が壊れる
+    # (summary 由来の df は index が重複しうる)
+    if not out.index.is_unique:
+        out = out.reset_index(drop=True)
+    out["symbol"] = out["symbol"].astype(str).str.strip()
+    out = out[out["symbol"] != ""]
+    if out.empty:
+        return pd.DataFrame()
+
+    # _rpf2_num は常に out.index に揃った float64 Series を返す
+    idx = out.index
+    price = _rpf2_num(out.get("price", out.get("close", out.get("current_price", 0.0))), 0.0, index=idx)
+    close = _rpf2_num(out.get("close", price), 0.0, index=idx)
+    open_ = _rpf2_num(out.get("open", out.get("open_price", close)), close, index=idx)
+    volume = _rpf2_num(out.get("volume", 0.0), 0.0, index=idx)
+    turnover = _rpf2_num(out.get("turnover", price * volume), 0.0, index=idx)
+    score_buy = _rpf2_num(out.get("score_buy", out.get("buy_score", 0.0)), 0.0, index=idx)
+    score_sell = _rpf2_num(out.get("score_sell", out.get("sell_score", 0.0)), 0.0, index=idx)
+    score_total = _rpf2_num(out.get("score_total", out.get("final_score", out.get("score", 0.0))), 0.0, index=idx)
+    slope = _rpf2_num(out.get("slope", 0.0), 0.0, index=idx)
+    mtf = _rpf2_num(out.get("mtf", out.get("score_mtf", out.get("mtf_score", 0.0))), 0.0, index=idx)
+
+    # open_.replace(0, pd.NA) は pandas 2.x で object へのダウンキャスト
+    # FutureWarning を出すうえ inf を残す。where + inf 除去で書く。
+    open_safe = open_.where(open_ != 0.0)
+    day_change_pct = (
+        ((close - open_) / open_safe * 100.0)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+    side = pd.Series("BUY", index=out.index)
+    side = side.mask((score_sell > score_buy) | ((score_buy <= 0) & (slope < 0)), "SELL")
+
+    strength = pd.concat([
+        score_buy.abs(),
+        score_sell.abs(),
+        score_total.abs(),
+        slope.abs() * 1000.0,
+        mtf.abs(),
+    ], axis=1).max(axis=1).fillna(0.0)
+    out["_strength"] = strength
+    out = out.sort_values("_strength", ascending=False, kind="stable")
+    max_rows = max(10, _rpf2_env_int("RANKING_PUSH_FALLBACK_MAX_ROWS", 80))
+    out = out.head(max_rows).copy()
+
+    # price が 0 / NaN / 負のときだけ close を使う。
+    # Series.replace(0, <Series>) は pandas が
+    #   ValueError: Series.replace cannot use dict-value and non-None to_replace
+    # で拒否する (Series は dict-like 扱い)。mask で書く。
+    px = price.reindex(out.index)
+    cl = close.reindex(out.index)
+    bad_px = (~np.isfinite(px)) | (px <= 0.0)
+    out["price"] = px.mask(bad_px, cl)
+    out["price"] = (
+        pd.to_numeric(out["price"], errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+    n_filled = int(bad_px.sum())
+    if n_filled:
+        logger.warning(
+            "[RANKING PUSH FALLBACK] price<=0/NaN rows=%s -> close で補完 (補完後も0=%s)",
+            n_filled, int((out["price"] <= 0.0).sum()),
+        )
+    out["current_price"] = out["price"]
+    out["volume"] = volume.reindex(out.index).fillna(0.0)
+    out["turnover"] = turnover.reindex(out.index).fillna(0.0)
+    out["trading_value"] = out["turnover"]
+    out["day_change_pct"] = day_change_pct.reindex(out.index).fillna(0.0)
+    out["side"] = side.reindex(out.index).fillna("BUY")
+    out["rank_position"] = range(1, len(out) + 1)
+    out["rank"] = out["rank_position"]
+    out["rank_type"] = out["side"].map({"BUY": "売買代金急増", "SELL": "値下がり率"}).fillna("売買代金急増")
+    out["ranking_source"] = "push_summary_fallback"
+    out["ranking_name"] = out.get("symbolname", out["symbol"])
+
+    logger.warning(
+        "[RANKING PUSH FALLBACK] built ranking-like df rows=%s buy=%s sell=%s symbols=%s",
+        len(out),
+        int((out["side"] == "BUY").sum()),
+        int((out["side"] == "SELL").sum()),
+        out["symbol"].nunique(),
+    )
+    return out
+
+
+_RPF2_SCOPE = None
+
+
+def _rpf2_scope_enabled() -> bool:
+    global _RPF2_SCOPE
+    if _RPF2_SCOPE is not None:
+        return _RPF2_SCOPE
+    enabled = False
+    try:
+        import sys as _sys
+
+        argv_text = " ".join(str(x) for x in _sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if not any(n in argv_text for n in db_names):
+            enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _RPF2_SCOPE = enabled
+    return enabled
+
+
+def _get_ranking_source_df() -> Optional[pd.DataFrame]:
+    df = None
+    try:
+        df = _get_ranking_source_df_pre_push_fallback()
+    except Exception:
+        logger.exception("[RANKING PUSH FALLBACK] original _get_ranking_source_df failed")
+        df = None
+
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        return df
+    if not _rpf2_scope_enabled():
+        return df
+    if not _rpf2_env_bool("RANKING_ENTRY_PUSH_SUMMARY_FALLBACK_ENABLED", True):
+        return df
+
+    push_df = _rpf2_get_push_summary_df()
+    fb = _rpf2_build_ranking_like_from_push(push_df)
+    if fb.empty:
+        logger.warning(
+            "[RANKING PUSH FALLBACK] fallback empty; original_empty=%s",
+            df is None or (isinstance(df, pd.DataFrame) and df.empty),
+        )
+        return df
+    return fb

@@ -34,8 +34,121 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+
+# ============================================================
+# 起動時 NAS I/O 対策 (2026-09-03)
+# ------------------------------------------------------------
+# この行より下は全部 NAS (W:) からの import になる。
+#
+# (1) バイトコードキャッシュをローカルへ
+#     NAS 側の __pycache__ を使うと 1 プロセスの起動で W: へ
+#     817 回 open() が飛び、その途中で SMB セッションが落ちる。実測:
+#         NAS cache    W: open=817 / 8.4s -> OSError(22) 予期しないネットワークエラー
+#                                         -> OSError(9)  ハンドルが無効です
+#                                         -> OSError(24) Too many open files
+#                      import は 1154 module で中断 (main.py が起動できない)
+#         local cache  W: open=5          -> 2156 module 完走・成功 (5/5)
+#     fd 残量は終始 4000 あり、ファイルディスクリプタは枯渇していない。
+#     Errno 24 は SMB セッション断の後始末として CRT が返しているだけで、
+#     直すべきは NAS への open 回数そのもの。
+#     AUTOSTOCK_LOCAL_PYCACHE=0 で従来動作 (NAS の __pycache__)。
+#     AUTOSTOCK_PYCACHE_DIR=... で置き場を変更。
+#
+# (2) NAS 表記を 1 つに固定
+#     nas_root() は UNC が到達可能なら UNC を優先するが、X: は既に
+#     同じ共有 (AutoStockBuyAndSell) にマップされている。同一共有へ
+#     UNC とドライブレターの 2 表記で触ると Windows は別々の SMB
+#     セッションとして扱い、サーバ側 open スロットを 2 倍消費する。
+#     nas_root.py 自身のコメントに残る 2026-08-28 の実測でも、
+#     落ちるのは UNC 側で X: は生きていた (優先順が実測と逆)。
+#     ここでは既定値だけを与える (setdefault 相当。明示指定が常に勝つ)。
+# ============================================================
+def _install_local_pycache_prefix() -> None:
+    try:
+        flag = str(os.environ.get('AUTOSTOCK_LOCAL_PYCACHE', '')).strip().lower()
+        if flag in {'0', 'false', 'no', 'off', 'disable', 'disabled'}:
+            return
+        if getattr(sys, 'pycache_prefix', None):
+            return
+        base = str(os.environ.get('AUTOSTOCK_PYCACHE_DIR', '')).strip()
+        if not base:
+            local = os.environ.get('LOCALAPPDATA') or os.environ.get('TEMP') or os.getcwd()
+            base = os.path.join(local, 'autostock_pycache')
+        os.makedirs(base, exist_ok=True)
+        sys.pycache_prefix = base
+        os.environ.setdefault('PYTHONPYCACHEPREFIX', base)
+    except Exception:
+        pass
+
+
+def _pin_nas_root_spelling() -> None:
+    try:
+        if os.environ.get('AUTOSTOCK_NAS_ROOT') is not None:
+            return
+        preferred = str(os.environ.get('AUTOSTOCK_NAS_ROOT_PREFERRED', 'X:')).strip()
+        if not preferred:
+            return
+        if os.path.exists(preferred + os.sep):
+            os.environ['AUTOSTOCK_NAS_ROOT'] = preferred
+    except Exception:
+        pass
+
+
+_install_local_pycache_prefix()
+
+
+# ============================================================
+# lightgbm が Smart App Control に止められた時のスタブ
+# ------------------------------------------------------------
+# 2026-09-15 08:34: lib_lightgbm.dll の読み込みが WinError 4551 (アプリケーション
+# 制御ポリシー) で失敗し、main.py が import 連鎖 (entry_controller ->
+# AI.entry_gate_tonosama -> import lightgbm) で起動できなかった。DLL は 7/29
+# から変わっておらず、前日までは読めていた (SAC の評価が変わった)。
+# lightgbm は推論モジュールが module レベルで import しているため、読めないと
+# 売買本体ごと落ちる。ここで先に試し、4551 なら Booster が例外を投げる
+# スタブを sys.modules に入れる。各 _load_model は例外を捕まえて
+# fallback (MODEL_MISSING_FAIL_OPEN 等) へ倒れるので、モデル無しと同じ挙動になる。
+# SAC 自体は勝手に切らない (ユーザー判断)。
+# ============================================================
+def _install_lightgbm_sac_stub() -> None:
+    if os.environ.get("DISABLE_LIGHTGBM_SAC_STUB", "").strip() in {"1", "true", "yes"}:
+        return
+    try:
+        import lightgbm  # noqa: F401
+        return
+    except OSError as e:
+        if getattr(e, "winerror", None) != 4551 and "4551" not in str(e):
+            return
+        reason = f"WinError 4551 (Smart App Control): {e}"
+    except Exception:
+        return
+
+    import types
+
+    class _BlockedBooster:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(f"lightgbm is unavailable: {reason}")
+
+    m = types.ModuleType("lightgbm")
+    m.__blocked__ = True
+    m.__blocked_reason__ = reason
+    m.__version__ = "0.0.0-sac-blocked"
+    for name in ("Booster", "Dataset", "LGBMClassifier", "LGBMRegressor", "LGBMModel", "LGBMRanker"):
+        setattr(m, name, _BlockedBooster)
+    for name in list(sys.modules):
+        if name == "lightgbm" or name.startswith("lightgbm."):
+            sys.modules.pop(name, None)
+    sys.modules["lightgbm"] = m
+    print(f"[SITECUSTOMIZE] lightgbm stubbed: {reason}", file=sys.stderr, flush=True)
+
+
+_install_lightgbm_sac_stub()
+_pin_nas_root_spelling()
+
+from nas_root import nas_path, nas_root
+
 logger = logging.getLogger(__name__)
-BOOT_EVIDENCE_DIR = Path(r"\\192.168.0.22\AutoStockBuyAndSell\Logs\boot_evidence")
+BOOT_EVIDENCE_DIR = Path(nas_path(r"Logs\boot_evidence"))
 
 
 def _ensure_project_root() -> str:
@@ -179,10 +292,26 @@ def _install_module(module_name: str, label: str, *, disabled_env: str | None = 
             return
         _ensure_project_root()
         mod = __import__(module_name, fromlist=["install"])
-        fn = getattr(mod, "install", None)
-        ok = bool(fn()) if callable(fn) else False
-        _write_boot_evidence(f"{label}_INSTALL_DONE", {"ok": ok})
-        logger.warning("[SITECUSTOMIZE] %s auto install ok=%s", label, ok)
+
+        # 本文化済みのモジュールは install() を持たず、
+        # import 時に自己適用するものがある
+        # (例: trading.entry.tonosama.history_missing_guard は
+        #  apply_history_guard_defaults() を import 時に呼んでいる)。
+        # 旧実装はそれを一律に ok=False と報告しており、
+        # 「本当の install 失敗」と区別がつかなかった。
+        entry_name = str(getattr(mod, "SITECUSTOMIZE_INSTALL", "") or "install")
+        fn = getattr(mod, entry_name, None)
+        if callable(fn):
+            ok = bool(fn())
+            status = "ok" if ok else "install_returned_false"
+        else:
+            # エントリポイントなし = import 時自己適用型。
+            # import は成功しているので適用済みとして扱う
+            # (適用側で失敗した場合はそのモジュール自身が例外ログを出す)。
+            ok = True
+            status = "self_applied_on_import"
+        _write_boot_evidence(f"{label}_INSTALL_DONE", {"ok": ok, "status": status, "entry": entry_name})
+        logger.warning("[SITECUSTOMIZE] %s auto install ok=%s status=%s entry=%s", label, ok, status, entry_name)
     except Exception:
         _write_boot_evidence(f"{label}_EXCEPTION", traceback.format_exc())
         try:
@@ -191,19 +320,63 @@ def _install_module(module_name: str, label: str, *, disabled_env: str | None = 
             pass
 
 
+def _is_database_like_process() -> bool:
+    """旧 core/startup/liquidity_empty_fallback_patch._is_database_like_process()。
+
+    _is_database_process() より狭く、main_database / data_collectors_runner /
+    push_receiver_runner の 3 つだけを見る。判定基準が違うのでそのまま残す。
+    """
+    try:
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if any(x in argv for x in ("main_database.py", "data_collectors_runner.py", "push_receiver_runner.py")):
+            return True
+    except Exception:
+        pass
+    return str(os.environ.get("AUTOSTOCK_DATA_COLLECTORS_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _enable_push_db_writer_env_if_database_process() -> None:
+    """旧 liquidity_empty_fallback_patch.install() が持っていた env 強制。
+
+    DB 系プロセスで PUSH DB writer を明示的に有効化し、memory_only 誤判定を避ける。
+    ENABLE_LIQ_EMPTY_FALLBACK_PATCH が真のときだけ走る点も旧構成どおり。
+    """
+    if not _is_database_like_process():
+        return
+    os.environ["AUTOSTOCK_DATA_COLLECTORS_PROCESS"] = "1"
+    os.environ["AUTOSTOCK_MAIN_DATABASE_PROCESS"] = "1"
+    os.environ["AUTOSTOCK_EXTERNAL_DATA_COLLECTORS"] = "1"
+    os.environ["PUSH_STREAM_DB_WRITE"] = "1"
+    os.environ["PUSH_STREAM_ORDER_BOOK_WRITE"] = os.environ.get("PUSH_STREAM_ORDER_BOOK_WRITE", "1")
+    os.environ["AUTOSTOCK_SUMMARY_SAVE_OWNER"] = os.environ.get("AUTOSTOCK_SUMMARY_SAVE_OWNER", "database")
+    os.environ["AUTOSTOCK_SUMMARY_DB_WRITER"] = os.environ.get("AUTOSTOCK_SUMMARY_DB_WRITER", "1")
+    logger.warning(
+        "[LIQ EMPTY FALLBACK] database-like process detected -> PUSH DB writer env forced on argv=%s",
+        sys.argv[:3],
+    )
+
+
 def _install_liq_empty_fallback_only_if_enabled() -> None:
     if not _env_on("ENABLE_LIQ_EMPTY_FALLBACK_PATCH", False):
         os.environ.setdefault("DISABLE_LIQ_EMPTY_FALLBACK_PATCH", "1")
         _write_boot_evidence("LIQ_EMPTY_FALLBACK_DISABLED_BY_DEFAULT")
         return
     os.environ.pop("DISABLE_LIQ_EMPTY_FALLBACK_PATCH", None)
-    _install_module("core.startup.liquidity_empty_fallback_patch", "LIQ_EMPTY_FALLBACK")
+    # 段階緩和のロジック本体は
+    #   trading/push/subscription_manager/ranking_selector._apply_min_liquidity
+    #   trading/ranking/filters/liquidity_filter.apply_liquidity_filter
+    # へ本文化済み。両モジュールの _liq_empty_fallback_enabled() が
+    # ENABLE_LIQ_EMPTY_FALLBACK_PATCH / DISABLE_LIQ_EMPTY_FALLBACK_PATCH を見て
+    # 有効/無効を判定するので、install 呼び出しは不要になった。
+    # install() が持っていた env 強制だけをここへ移す。
+    _enable_push_db_writer_env_if_database_process()
+    _write_boot_evidence("LIQ_EMPTY_FALLBACK_ENABLED")
 
 
 def _install_runtime_defaults() -> None:
     try:
         _ensure_project_root()
-        mod = __import__("core.startup.runtime_env_defaults_patch", fromlist=["install"])
+        mod = __import__("core.startup.runtime_env.installer", fromlist=["install"])
         ok = bool(getattr(mod, "install")())
         os.environ["ENTRY_SHORT_MTF_REQUIRE_ALL"] = "0"
         _write_boot_evidence("CENTRAL_RUNTIME_DEFAULTS_SET", {"ok": ok})
@@ -236,13 +409,15 @@ def _install_summary_mtf_catchup_safely() -> None:
         os.environ.setdefault("SUMMARY_MTF_STARTUP_CATCHUP_ENABLED", "1")
         os.environ.setdefault("SUMMARY_MTF_CATCHUP_INTERVALS", "3,5")
         os.environ.setdefault("SUMMARY_MTF_CATCHUP_RUN_ASYNC", "1")
-        _install_module("core.startup.summary_multiframe_startup_catchup_patch", "SUMMARY_MTF_CATCHUP")
+        # summary_multiframe_startup_catchup_patch は trading/summary/mtf_startup_catchup.py へ
+        # 移設済み (モンキーパッチではなく db_prepare 専用のバッチジョブだったため)。
+        _install_module("trading.summary.mtf_startup_catchup", "SUMMARY_MTF_CATCHUP")
     except Exception:
         _write_boot_evidence("SUMMARY_MTF_CATCHUP_EXCEPTION", traceback.format_exc())
 
 
 DB_SYNC_PATCHES = [
-    ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
+    ("core.startup.sqlite_memory_pragmas", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
 ]
 
 # push_summary_fallback_and_active_price_patch (REV5) はインライン化済み。
@@ -259,64 +434,222 @@ DB_SYNC_PATCHES = [
 # trading/ranking/ranking_technical_store.py の attach_ranking_technicals
 # (_copy_snapshot_technical_aliases) へ本文化済みのため削除した。
 
+# entry_controller_source_prefilter_patch は本文化済みで空スタブになっており、
+# 実体は「この env を先に確定させてから summary_ai_volatility_rescue_patch を
+# install する」だけの中継だった。この値を読んでいたのは旧 V4 rescue 実装。
+os.environ["SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE"] = os.getenv(
+    "SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE_OPERATOR",
+    "0.0002",
+)
+
+
+def _apply_final_board_guard_signature_env_defaults() -> None:
+    """final_entry_board_guard_signature_runtime_patch が持っていた env 既定値。
+
+    このパッチは final_entry_safety_guard_patch の _board_guard /
+    _call_board_guard / _board_missing_fallback_ok を包み直すものだったが、
+    ホストがコミット 46ddd54 で本文化されて属性ごと消えたため、
+    _patch_once() の中で実効だったのはこの 6 件の setdefault だけになっていた
+    (ラップは 3 つとも target=None で失敗し、install() は常に False を返す)。
+
+    順序について: このうち ENTRY_ALLOW_ENTRY_WITHOUT_BOARD は
+    entry_controller._final_guard_board_ok (板データ無しエントリーの許可) を
+    左右する load-bearing な値。他に同じキーを書くのは
+      - 同値の setdefault (entry_final_filter_failopen "1" /
+        entry_count_unblock "0" / runtime_env_defaults の MIN_* 3 件)
+      - 後から実行されるハード代入 (board_missing_failopen_runtime 等)
+      - sitecustomize より後に走る usercustomize の setdefault "0"
+    だけなので、background loop の先頭へ前倒ししても最終値は変わらない。
+    """
+    os.environ.setdefault("ENTRY_SUMMARY_AI_DELEGATE_BOARD_TO_ORDER_BUILDER", "1")
+    os.environ.setdefault("ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", "0")
+    # 成行許可ではなく、order_builder の安全指値 fallback へ進ませるための既定値。
+    os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "1")
+    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_VOLUME", "30000"))
+    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_TURNOVER", "10000000"))
+    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_SCORE", "0.90"))
+
+
+def _apply_summary_ai_vol_rescue_env_defaults() -> None:
+    """summary_ai_volatility_rescue_patch (V5 strict stub) が持っていた env 既定値。
+
+    V5 は何もラップしない strict stub で、実体はこの 4 つの setdefault と
+    install ログだけだった。パッチファイルは削除し、install されていたのと
+    同じ位置・同じスコープ (main lite / full non-main) で env だけを設定する。
+
+    Note: この 4 つと SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE は、現時点で
+    リポジトリ内に読み手が存在しない (読んでいたのは削除済みの V4 実装だけ)。
+    挙動を変えないため残しているが、消しても実害はない。
+    """
+    os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_ENABLED", "0")
+    os.environ.setdefault("SUMMARY_AI_ZERO_SCORE_PUSH_BOOTSTRAP_ENABLED", "0")
+    os.environ.setdefault("SUMMARY_AI_DB_FRESH_INPUT_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_WATCH_LOOPS", "0")
+
+
 SYNC_MAIN_PATCHES = [
-    ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
-    ("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", "DISABLE_ENTRY_LOG_SKIP_GUARD"),
-    ("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", "DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH"),
-    ("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
-    ("core.startup.entry_execute_timeout_guard_patch", "ENTRY_EXECUTE_TIMEOUT_GUARD", "DISABLE_ENTRY_EXECUTE_TIMEOUT_GUARD_PATCH"),
-    ("core.startup.summary_ai_blowoff_prefilter_patch", "SUMMARY_AI_BLOWOFF_PREFILTER", "DISABLE_SUMMARY_AI_BLOWOFF_PREFILTER_PATCH"),
-    ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
-    ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),
-    ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_SYNC", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
+    ("core.startup.sqlite_memory_pragmas", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
+    # summary_ai_volatility_rescue_patch は削除済み (env 既定値のみのstubだった)。
+    # 代わりに _apply_summary_ai_vol_rescue_env_defaults() を install 前に呼ぶ。
+    ("trading.entry.summary_ai.direct_input_context", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
+    # summary_main_push_db_refresh_patch は削除した。
+    # _load_push_memory_df の stale 時 PUSH DB 再取得は
+    # scheduler_jobs/summary/memory_latest_1m.py へ本文化済み
+    # (スコープは同ファイルの _push_db_refresh_enabled() が再現。
+    #  DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH=1 も従来どおり効く)。
+    ("scheduler_jobs.summary.direct_push_1m", "SUMMARY_FORCE_DIRECT_1M_SYNC", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
 ]
 
 BACKGROUND_MAIN_PATCHES = [
-    ("core.startup.summary_db_date_guard_patch", "SUMMARY_DB_DATE_GUARD", "DISABLE_SUMMARY_DB_DATE_GUARD_PATCH"),
-    ("core.startup.summary_save_quality_guard_patch", "SUMMARY_SAVE_QUALITY_GUARD", "DISABLE_SUMMARY_SAVE_QUALITY_GUARD"),
-    ("core.startup.tonosama_5sec_advisory_patch", "TONOSAMA_5SEC_ADVISORY", "DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH"),
-    ("core.startup.tonosama_datetime_tz_guard_patch", "TONOSAMA_DT_TZ_GUARD", "DISABLE_TONOSAMA_DT_TZ_GUARD_PATCH"),
-    ("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_HISTORY_MISSING_GUARD", "DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH"),
-    ("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FLAT_PRICE_DB_FALLBACK", "DISABLE_RANKING_FLAT_PRICE_PATCH"),
-    ("core.startup.ranking_entry_source_db_fallback_patch", "RANKING_ENTRY_SOURCE_DB_FALLBACK", "DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH"),
-    ("core.startup.ranking_entry_high_low_from_snapshot_patch", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT", "DISABLE_RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH"),
-    ("core.startup.yahoo_complement_db_warmup_patch", "YAHOO_COMPLEMENT_DB_WARMUP", "DISABLE_YAHOO_COMPLEMENT_DB_WARMUP_PATCH"),
-    ("core.startup.entry_mtf_short_required_daily_optional_patch", "SHORT_MTF_2OF3_GUARD", "DISABLE_SHORT_MTF_2OF3_GUARD_PATCH"),
-    ("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", "DISABLE_TONOSAMA_AI_BRIDGE_PATCH"),
-    ("core.startup.final_entry_tonosama_liquidity_patch", "FINAL_TONOSAMA_LIQUIDITY", "DISABLE_FINAL_TONOSAMA_LIQUIDITY_PATCH"),
-    ("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE", "DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH"),
-    ("core.startup.tonosama_fast_score_prefilter_patch", "TONOSAMA_FAST_SCORE_PREFILTER", "DISABLE_TONOSAMA_FAST_SCORE_PREFILTER_PATCH"),
-    ("core.startup.tonosama_fresh_summary_wait_fix_patch", "TONOSAMA_FRESH_SUMMARY_WAIT_FIX", "DISABLE_TONOSAMA_FRESH_SUMMARY_WAIT_FIX_PATCH"),
-    ("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", "DISABLE_SUMMARY_AI_DF_TRUTH_PATCH"),
-    ("core.startup.summary_ai_candidate_refill_patch", "SUMMARY_AI_CANDIDATE_REFILL", "DISABLE_SUMMARY_AI_CANDIDATE_REFILL_PATCH"),
-    ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY_BG", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
-    ("core.startup.summary_ai_low_move_softpass_patch", "SUMMARY_AI_LOW_MOVE_SOFTPASS", "DISABLE_SUMMARY_AI_LOW_MOVE_SOFTPASS_PATCH"),
-    ("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
+    # tonosama_5sec_advisory_patch は trading/entry/tonosama/runner._apply_climax_guards
+    # へ本文化済み。残っていた中継 install (entry_order_5s_breakout_optional_patch) を
+    # ここから直接行う。
+    # entry_order_5s_breakout_optional_patch は trading/handlers/entry_order_builder.py へ
+    # 本文化済み (_five_sec_optional_fallback_order)。NO_5S_BREAKOUT を返すのは
+    # build_entry_order の 1 箇所だけなので、そこに直接置いた。
+    # install スコープと DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH /
+    # ENTRY_ORDER_5S_BREAKOUT_OPTIONAL_ENABLED の判定は
+    # entry_order_builder._five_sec_optional_scope_enabled() が再現している。
+    # entry_controller への別名差し替えは不要 (entry_controller.py:118 が
+    # from-import で同じ関数オブジェクトを束縛しているため)。
+    # tonosama_datetime_tz_guard_patch は tonosama_history_missing_guard_patch へ統合済み。
+    # DISABLE_TONOSAMA_DT_TZ_GUARD_PATCH は統合先の _tzg_enabled() が見ている。
+    ("trading.entry.tonosama.history_missing_guard", "TONOSAMA_HISTORY_MISSING_GUARD", "DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH"),
+    # ranking_entry_source_db_fallback_patch は trading/ranking/entry_from_ranking.py へ
+    # 本文化済み (_get_ranking_source_df_with_db_fallback)。元関数を一度も呼ばない
+    # 完全置換だったので、本文側も _rsrc_scope_enabled() が真なら置換のまま動く。
+    # install スコープ (main lite / full non-main、DBプロセス除外) と
+    # env setdefault 10 件は entry_from_ranking 側が再現している。
+    # 同じ属性を包んでいた ranking_entry_source_prefilter_patch_v2 も
+    # 同時に本文化した (main.py では置換で捨てられていた挙動を維持)。
+    ("trading.handlers.short_mtf_direction_guard", "SHORT_MTF_2OF3_GUARD", "DISABLE_SHORT_MTF_2OF3_GUARD_PATCH"),
+    # entry_controller_tonosama_ai_bridge_patch は trading/handlers/entry_controller.py へ
+    # 本文化済み (_tonosama_bridge_ai_result / _tonosama_bridge_pass_check)。
+    # 旧パッチは ec.ai_final_entry_check と ec._passes_ai_gate をモジュール属性ごと
+    # 差し替えていたが、どちらも読み手は entry_controller 内の呼び出し 1 箇所だけなので、
+    # 呼び出し側で結果に噛ませる形にした。これで summary_ai_entry_controller_bridge_patch /
+    # entry_volume_direction_guard_patch / entry_controller_final_gate_relax_patch の
+    # 上に載る = 旧構成と同じ最外周の位置を保てる。
+    # install スコープと DISABLE_TONOSAMA_AI_BRIDGE_PATCH の判定は
+    # entry_controller._tonosama_bridge_scope_enabled() が再現している。
+    # final_entry_tonosama_liquidity_patch は削除済み。ラップ対象だった
+    # final_entry_safety_guard_patch._liquidity_guard が本文化で消えており、
+    # install() が常に False を返す完全な死にコードだった。
+    # 流動性ガード本体は trading/handlers/entry_controller._final_guard_liquidity_ok。
+    # final_entry_board_guard_signature_runtime_patch は削除済み。
+    # ラップ対象の final_entry_safety_guard_patch._board_guard / _call_board_guard が
+    # 本文化で消えており、実効は env 既定値 6 件だけだった。
+    # それを _apply_final_board_guard_signature_env_defaults() として
+    # background loop / full non-main の先頭で設定する。
+    # tonosama_fast_score_prefilter_patch は trading/entry/tonosama/fast_score_prefilter.py
+    # へ本文化済み。中継していた tonosama_range_from_history_patch も
+    # trading/entry/tonosama/runner.py (_repair_intrabar_range_from_history) へ
+    # 本文化済みのため、ここでの install は不要になった。
+    # スコープと env 条件は runner._range_repair_enabled() が再現している。
+    ("trading.entry.tonosama.fresh_summary_wait", "TONOSAMA_FRESH_SUMMARY_WAIT_FIX", "DISABLE_TONOSAMA_FRESH_SUMMARY_WAIT_FIX_PATCH"),
+    # summary_ai_entry_hook_dataframe_truth_patch は本文化済み:
+    #   weak filter  -> trading/entry/summary_ai/ai_gate_runner.py の内部呼び出し直後
+    #                   (_wk_*)。モジュール属性ではなく呼び出し位置に置いてある。
+    #                   runner.py:1066 経路には元から効いていなかったため
+    #                   (entry_fire_rescue が runner 側の束縛を上書きする)。
+    #   price floor  -> trading/entry/summary_ai/executor.py (_dft_apply_entry_price_floor)
+    # スコープ判定 _dft_scope_enabled() は DISABLE_SUMMARY_AI_DF_TRUTH_PATCH を
+    # そのまま見る。
+    # summary_ai_candidate_refill_patch は trading/entry/summary_ai/candidate_refill.py へ移設した
+    # (env 既定値 + runner のガード/候補補充ラップ。fallback stale guard は
+    #  scheduler_jobs/summary/fallback_loader.select_best_candidate 本体へ本文化済み)。
+    ("trading.entry.summary_ai.candidate_refill", "SUMMARY_AI_CANDIDATE_REFILL", "DISABLE_SUMMARY_AI_CANDIDATE_REFILL_PATCH"),
+    ("trading.entry.summary_ai.direct_input_context", "SUMMARY_AI_RUNTIME_CONSISTENCY_BG", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
+    ("trading.filters.summary_ai_range_bridge", "SUMMARY_AI_LOW_MOVE_SOFTPASS", "DISABLE_SUMMARY_AI_LOW_MOVE_SOFTPASS_PATCH"),
+    # summary_mtf_early_ready_patch は AI/entry_gate.py の _summary_mtf_status へ
+    # 本文化済み (_emr_*)。controller_cache の history-first ラッパーは
+    # 呼び手が居ない死んだラッパーだったので移していない。
+    # 残りは下記 3 つの中継 install だけだったので、ここへ直接並べた。
+    # summary_controller_neutral_score_guard_patch は
+    # trading/summary/controller_cache.py / controller_projection.py へ本文化済み
+    # (trading/summary/controller_layers.apply_layers の 1 層目)。
+    # DISABLE_SUMMARY_MTF_EARLY_READY_PATCH は controller_layers.neutral_enabled() が見る。
+    # summary_mtf_push_raw_fallback_patch は
+    # core/startup/summary_mtf_diff_from_1m_patch.py の
+    # _cached_1m_history_from_global へ本文化済み (_prf_*)。
+    # 同モジュールを import すれば env 既定値と bootstrap も走る。
+    ("trading.summary.mtf_diff_from_1m", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
+    # summary_ai_order_builder_range_repair_patch は削除した。
+    # 共有ライブラリ部分 (_repair_row / _update_original_row) は
+    # trading/filters/summary_ai_range_repair.py へ移設し、呼び出し元 2 箇所が
+    # 直接 import する。install していた atr_1m_filter のラップは、実 install 順の
+    # 測定で volatility_filter_tonosama_entryrow_rescue_patch に巻き戻されて
+    # 一度も到達していない死にラッパーだったため移していない。
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
-    ("core.startup.summary_controller_concat_duplicate_columns_patch", "SUMMARY_CONTROLLER_DUPCOL_PATCH", "DISABLE_SUMMARY_CONTROLLER_DUPCOL_PATCH"),
-    ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH_BG", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),
-    ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_FINAL", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
+    # summary_main_push_db_refresh_patch / direct_push_1m (旧 summary_main_direct_push_force_patch) の
+    # background 再適用は削除した。どちらも冪等な no-op で、SYNC_MAIN_PATCHES
+    # (上の 2 件) が先に走った時点で完了している:
+    #   push_db_refresh   install() 冒頭が `if _PATCHED: return True`
+    #                     (その前の _install_context_stale_guard() はフラグを
+    #                      立てて True を返すだけの死にコード)
+    #   direct_push_force install() は env setdefault 5 件とログだけ
+    #                     (V10 で job_summary のラップは撤去済み)
 ]
 
-ENTRY_FAILOPEN_PATCHES = [
-    ("core.startup.entry_direction_recursion_failopen_patch", "ENTRY_DIRECTION_RECURSION_FAILOPEN", "DISABLE_ENTRY_DIRECTION_RECURSION_FAILOPEN_PATCH"),
-]
+# entry_direction_recursion_failopen_patch は削除した。二重ゲートで既定 OFF
+# (runtime_env_defaults.py:98 SITECUSTOMIZE_ENABLE_ENTRY_FAILOPEN_PATCHES="0" と
+#  同:108 ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED="0")。
+# さらに仮に両方を 1 にしても、install() が old (= failclosed / failopen_runtime v5 の
+# ラッパー) を退避するだけで一度も呼ばず、base の _direction_confirm を直呼びする
+# ため、下の 2 層をまとめて無効化してしまう実装だった (*args/**kwargs も破棄)。
+# 再帰時 fail-open の意図は entry_direction_failclosed_patch の
+# ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN が担っている。
+# グループ自体は将来の追加用に残す。
+ENTRY_FAILOPEN_PATCHES: list = []
 
-RANKING_RESCUE_PATCHES = [
-    ("core.startup.ranking_entry_final_rescue_patch", "RANKING_FINAL_RESCUE", "DISABLE_RANKING_FINAL_RESCUE_PATCH"),
-]
+# ranking_entry_final_rescue_patch は trading/handlers/entry_controller.py へ
+# 本文化済み (_ranking_final_rescue_atr + _ranking_rescue_apply_env_defaults)。
+# range_5m_filter 側の softpass は volatility_filter へインライン化済み、
+# ai_final_entry_check のラップは常時 no-op だったので移していない。
+# opt-in スコープは entry_controller._ranking_rescue_scope_enabled() が再現する。
+# グループ自体は将来の追加用に残す。
+RANKING_RESCUE_PATCHES: list = []
 
 TONOSAMA_EXTRA_RESCUE_PATCHES = [
-    ("core.startup.low_movement_tonosama_no_highlow_patch", "LOW_MOVE_TONOSAMA_FALLBACK", "DISABLE_LOW_MOVE_TONOSAMA_FALLBACK_PATCH"),
-    ("core.startup.tonosama_pending_warning_relax_patch", "TONOSAMA_PENDING_WARNING_RELAX", "DISABLE_TONOSAMA_PENDING_WARNING_RELAX_PATCH"),
-    ("core.startup.tonosama_price_change_or_range_patch", "TONOSAMA_PRICE_RANGE_RESCUE", "DISABLE_TONOSAMA_PRICE_RANGE_PATCH"),
-    ("core.startup.tonosama_volume_surge_zero_rescue_patch", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE", "DISABLE_TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_PATCH"),
-    ("core.startup.tonosama_slope_range_rescue_patch", "TONOSAMA_SLOPE_RANGE_RESCUE", "DISABLE_TONOSAMA_SLOPE_RANGE_RESCUE_PATCH"),
+    # low_movement_tonosama_no_highlow_patch は
+    # core/startup/low_movement_entry_guard_patch.py へマージ済み
+    # (_range_pct_from_row_core + _no_highlow_range_pct)。ホストがまだ
+    # core/startup 配下のパッチなので本文化ではなく統合だが、
+    # モンキーパッチは 1 段減った。
+    # opt-in スコープと env 既定値は
+    # low_movement_entry_guard_patch._no_highlow_scope_enabled() /
+    # _no_highlow_apply_env_defaults() が再現している。
+    # tonosama_pending_warning_relax_patch は
+    # trading/entry/tonosama/pending_writer.py へ本文化済み (_warning_relax_stage)。
+    # main.py から入る tonosama_5sec_stopped_relax_patch と同じシンボルを
+    # 互いに _original 剥がしで奪い合っていたので、2 件セットで
+    # _climax_reject_reason の直列ステージへ畳んだ。
+    # opt-in スコープと DISABLE_TONOSAMA_PENDING_WARNING_RELAX_PATCH は
+    # pending_writer._warning_relax_scope_enabled() が再現している。
+    # install 時のモジュール定数書き換え (REJECT_ZERO_5SEC_FINAL / MIN_FINAL_5SEC_CHANGE_PCT)
+    # は pending_writer._effective_zero_5sec_guard() が実効値として返す。
+    # tonosama_price_change_or_range_patch / tonosama_volume_surge_zero_rescue_patch /
+    # tonosama_slope_range_rescue_patch の 3 件は trading/entry/tonosama/runner.py へ
+    # 本文化済み (_rescue_max_price_change_pct / _rescue_max_volume_surge_ratio / _rescue_slope)。
+    # 3 件とも runner._num_series() を多段ラップしていたが補正対象カラムが排他なので、
+    # _num_series 側の col 分岐で等価になる。
+    # opt-in スコープと DISABLE_* / *_ENABLED 条件、install 時の env 副作用は
+    # runner._tonosama_extra_rescue_enabled() と
+    # runner._apply_tonosama_rescue_env_defaults() が再現している。
 ]
 
-SUMMARY_AI_RESCUE_PATCHES = [
-    ("core.startup.summary_ai_liquidity_rescue_patch", "SUMMARY_AI_LIQ_RESCUE", "DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH"),
-]
+# summary_ai_liquidity_rescue_patch は削除した。
+# 後半のゼロスコア救済 (attach_display_like_columns のラップ) は
+# trading/entry/summary_ai/candidates.py へ本文化済み
+# (_apply_zero_score_rescue。opt-in スコープは
+#  candidates._zero_score_rescue_scope_enabled() が再現する)。
+# 前半の executor._filter_blocked_ai_ok_items のラップは移していない:
+# executor.py:1664 が import 時に起動する core filter watcher が
+# 0.5 秒ごとに _ensure_core_filter() でモジュール属性を base へ戻し、
+# 一度戻すと誰も再 install しないため、install 直後の 0.5 秒未満しか
+# 生存できない実質的な死にラッパーだった。
+# グループ自体は将来の追加用に残す。
+SUMMARY_AI_RESCUE_PATCHES: list = []
 
 
 def _install_patch_list(items) -> None:
@@ -324,6 +657,12 @@ def _install_patch_list(items) -> None:
         _install_module(module_name, label, disabled_env=disabled_env)
 
 
+# 2026-08-11 時点で下の 4 グループはすべて空になった。
+# (ENTRY failopen / RANKING final rescue / TONOSAMA extra rescue / SUMMARY AI rescue)
+# 中身はそれぞれ本体モジュールへ本文化するか、実質的な死にコードとして削除済み。
+# 有効/無効の判定は各本体側の *_scope_enabled() が同じ env を見て再現している。
+# この関数は将来 opt-in パッチを足すときの枠組みとして残してあり、
+# 現状は "skipped count=0" のログを 4 行出すだけの no-op。
 def _install_optional_rescue_patches() -> None:
     all_rescue = _env_on("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES", False)
     groups = [
@@ -342,17 +681,24 @@ def _install_optional_rescue_patches() -> None:
 
 def _background_main_patch_loop() -> None:
     logger.warning("[SITECUSTOMIZE] main background patches start count=%s", len(BACKGROUND_MAIN_PATCHES))
+    _apply_final_board_guard_signature_env_defaults()
     _install_patch_list(BACKGROUND_MAIN_PATCHES)
     _install_optional_rescue_patches()
     _install_liq_empty_fallback_only_if_enabled()
     _install_summary_mtf_catchup_safely()
-    # Final re-apply after all background patches because several summary/controller patches re-wrap runner_core.job_summary.
-    _install_module("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH_BG_LAST", disabled_env="DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH")
-    _install_module("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_LAST", disabled_env="DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH")
-    # Final board signature re-apply after all background patches because some entry guards replace _board_guard.
-    _install_module("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE_LAST", disabled_env="DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH")
+    # 旧: 「several summary/controller patches re-wrap runner_core.job_summary」
+    # という理由で background パッチの後に 2 件を再適用していたが、
+    # このコメントは陳腐化していた。job_summary を再ラップするコードは
+    # リポジトリに 1 つも残っていない (git grep 'job_summary =' の実結果は
+    # ログ文字列 1 件のみ)。3-way race は runner_core.py:300-324 の
+    # tier1/tier2/tier3 固定順で解消済み。
+    # 2 件とも冪等な no-op なので再適用ごと削除した。
+    # 旧: 全 background パッチの後で board signature を再適用していた
+    # (一部の entry guard が _board_guard を差し替えるため)。ホストが本文化されて
+    # ラップ対象が無くなり、実効は env 既定値だけなので再適用は不要になった。
+    # setdefault は冪等なので loop 先頭の 1 回で足りる。
     # Last Summary-AI consistency pass must run after board/signature and candidate-refill patches.
-    _install_module("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY_LAST", disabled_env="DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH")
+    _install_module("trading.entry.summary_ai.direct_input_context", "SUMMARY_AI_RUNTIME_CONSISTENCY_LAST", disabled_env="DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH")
     logger.warning("[SITECUSTOMIZE] main background patches done")
 
 
@@ -374,11 +720,14 @@ if _is_database_process():
     _install_summary_mtf_catchup_safely()
     logger.warning("[SITECUSTOMIZE] database context detected; DB minimal patches installed=%s heavy entry/rescue patches skipped argv=%s", len(DB_SYNC_PATCHES), sys.argv)
 elif _is_main_py_process() and _env_on("SITECUSTOMIZE_MAIN_LITE", True):
+    _apply_summary_ai_vol_rescue_env_defaults()
     _install_patch_list(SYNC_MAIN_PATCHES)
     threading.Thread(target=_background_main_patch_loop, name="sitecustomize-main-bg-patches", daemon=True).start()
     logger.warning("[SITECUSTOMIZE] main lite mode enabled sync=%s background=%s", len(SYNC_MAIN_PATCHES), len(BACKGROUND_MAIN_PATCHES))
 elif _env_on("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False):
     logger.warning("[SITECUSTOMIZE] full non-main mode enabled by env; installing trading patches argv=%s", sys.argv)
+    _apply_summary_ai_vol_rescue_env_defaults()
+    _apply_final_board_guard_signature_env_defaults()
     _install_patch_list(SYNC_MAIN_PATCHES + BACKGROUND_MAIN_PATCHES)
     _install_optional_rescue_patches()
     _install_liq_empty_fallback_only_if_enabled()

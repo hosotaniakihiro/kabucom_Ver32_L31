@@ -1,0 +1,230 @@
+# ============================================================
+# File   : ai_control/config.yaml
+# Purpose:
+#   - supervisor.py の動作設定
+#   - 第1段階（監視 → Codex解析 → task.json 生成）で使う値のみを持つ
+# ------------------------------------------------------------
+# 第2段階以降で claude / restart / test のセクションを足す。
+# ============================================================
+
+paths:
+  # 空文字なら supervisor.py の 1 つ上（= ソースコード直下）を使う
+  project_dir: ""
+  # console_tee.py が書き出す NAS 上のログディレクトリ
+  log_dir: "//192.168.0.22/AutoStockBuyAndSell/Logs/console"
+  # プロジェクトの venv。第3段階（compileall / pytest）で使う
+  python: ".venv/Scripts/python.exe"
+
+watch:
+  # 起動ごとに <prefix>_<日時>_<PID>.log が新規作成されるため、
+  # prefix ごとに「最新の 1 本」を追う
+  prefixes:
+    - console
+    - main_database
+    - push_receiver_runner
+    - summary_database_runner
+    - ranking_collector_runner
+    # 2026-08-29 の再起動後に、監視から漏れていたことが判明して追加した。
+    # data_collectors_runner は 10 時間で 46MB と最も活発。
+    - data_collectors_runner
+    - yahoo_complement_runner
+    # 起動のたびに動く準備プロセス。2026-08-29 の再起動で存在に気づいて追加
+    - db_prepare_runner
+  suffix: ".log"
+
+  # NAS への I/O 予算。ログの NAS 書き込みは本体の実行時間を実測 25% 食っていた
+  # （core/logging/console_tee.py のコメント参照）ので、監視側は控えめにする。
+  poll_interval_sec: 10        # 既知ファイルの stat + 追記読み取り
+  rescan_interval_sec: 60      # ディレクトリを走査して新しいログを見つける間隔
+  max_read_bytes_per_poll: 262144   # 1 ポーリングで読む上限。超過分は読み飛ばす
+
+  # supervisor 起動時に既存ファイルのどこから読むか
+  #   end       … 末尾から（過去ログを解析しない。通常はこちら）
+  #   beginning … 先頭から（過去ログの検証用）
+  start_at: end
+
+  # 全ログが一定時間伸びなければ「停止」とみなす。0 で無効
+  stall_seconds: 300
+
+evidence:
+  # トリガ行の前後を何行 Codex に渡すか
+  context_lines_before: 300
+  context_lines_after: 80
+  # 証拠テキストの上限（文字）。超えたら前方を削る
+  max_evidence_chars: 60000
+
+codex:
+  bin: "codex"
+  # 診断役は絶対にファイルを書けない。指示文ではなくサンドボックスで縛る
+  sandbox: "read-only"
+  timeout_sec: 420
+  # 空なら codex の既定モデル
+  model: ""
+
+  # ★ Codex にはローカルディスク上の checkout を見せる。
+  #   codex exec の read-only サンドボックスは、ドライブレター (W:) でも
+  #   UNC でも、-c sandbox_permissions=["disk-full-read-access"] を付けても
+  #   ネットワークドライブを読めない (2026-08-29 実測)。
+  #   NAS を作業ルートにすると Codex はソースを読めず、ログだけの推測しか
+  #   返せない。実際 401 の解析で「UNCパスがPermissionDeniedで裏取りできない」
+  #   と報告された。
+  #   空文字にすると本番ディレクトリを直接渡す (推奨しない)。
+  worktree_dir: "C:/Users/hosot/AppData/Local/ai_diag_worktree"
+
+  # ★ 診断の自己検証（Codex に自分の診断を検証させる 2 回目の呼び出し）
+  #
+  #   1 回目の診断は、思い込みで CONFIRMED を書くことがある。
+  #   2026-08-29 の 401 解析では、1 回の検証で主張 2 件が REFUTED になり、
+  #   confidence が 0.91 -> 0.72 に下がった。覆ったのは
+  #     - 「認証は run_system_startup() が最初」→ sitecustomize から先に走っていた
+  #     - 「未コミット版 token_bootstrap.py がトークンを無効化した可能性」
+  #   の 2 件で、どちらも修正方針を左右する。
+  #
+  #   検証するのは status=FIX_REQUIRED のときだけ。
+  #   NO_ACTION / NEED_MORE_INFO はどのみち修正へ進まないので呼ばない。
+  #   DIAGNOSIS_WRONG なら status を NEED_MORE_INFO へ落として修正させない。
+  verify:
+    enabled: true
+    timeout_sec: 420
+    # 稼働中の未コミット差分を検証役へ渡す量の上限
+    max_diff_chars: 40000
+
+limits:
+  # 同じ症状を何秒間は再解析しないか
+  cooldown_sec_per_signature: 1800
+  # 1 時間あたりの Codex 起動上限
+  max_analyses_per_hour: 6
+  # 同じ症状を通算何回まで解析するか。超えたら SAFE_STOP
+  max_same_signature: 3
+
+triggers:
+  - name: traceback
+    severity: HIGH
+    pattern: '^\s*Traceback \(most recent call last\):'
+
+  - name: critical
+    severity: HIGH
+    pattern: '\[CRITICAL\]'
+
+  - name: db_lock
+    severity: HIGH
+    pattern: 'database is locked|database table is locked|SQLITE_BUSY'
+
+  - name: unauthorized
+    severity: HIGH
+    # 生の "401" は株価・数量と衝突するため単独では拾わない
+    pattern: '401 Unauthorized|Unauthorized|認証に失敗|トークンが無効'
+
+  - name: push_disconnect
+    severity: HIGH
+    # 実装が実際に出す文言に合わせる (trading/push/push_stream/ws_callbacks.py,
+    # transport.py)。"--- DISCONNECTED expected_rotation ---" は正常系なので
+    # 末尾のダッシュまで含めて区別する。
+    pattern: '--- DISCONNECTED --- |\[push_stream\] mark ws disconnected|ws socket already closed'
+
+  - name: memory_error
+    severity: HIGH
+    pattern: 'MemoryError|Cannot allocate memory'
+
+  # 建玉が取れていないのに空リストが返っている状態。
+  # kabu_api/positions.py がこの行を出す。2026-08-29 の 401 障害では
+  # 401 が一般 traceback に紛れ、直後に
+  #   [EXIT CLOSING RECONCILE] helper positions ok rows=0
+  # と記録されていた（取得失敗を建玉ゼロと誤認していた）。
+  - name: positions_auth_failed
+    severity: HIGH
+    pattern: '\[POSITIONS AUTH FAILED\]'
+
+  # 発注が認証異常で止められた。止まったこと自体は正しい動作だが、
+  # 止まり続けると売買機会を失うので必ず人に届ける。
+  - name: entry_blocked_auth
+    severity: HIGH
+    pattern: '\[ENTRY BLOCKED: AUTH\]'
+
+  # 起動できずに落ちた。2026-08-29 はこれが約2時間続いた。
+  # main_database が abort すると DB/PUSH/ranking が全部立たない。
+  - name: startup_abort
+    severity: HIGH
+    pattern: '\[MAIN DATABASE\] abort|abort because token bootstrap'
+
+  # 起動時のトークン検証が通らなかった。abort の一歩手前で捕まえる。
+  # kind=no_response は「接続はできたが応答が返らない」。
+  # 2026-08-29 は urllib の Connection: close が原因だった。
+  - name: token_preflight_failed
+    severity: HIGH
+    pattern: 'TOKEN_ACTION=preflight_ng|TOKEN REQUEST FAILED|got NO RESPONSE'
+
+  # 窓内で min_count 回出て初めてトリガ。単発の ERROR では起こさない
+  - name: error_burst
+    severity: MEDIUM
+    pattern: '\[ERROR\]'
+    min_count: 5
+    window_sec: 120
+
+# ------------------------------------------------------------
+# 既知の良性行。トリガ判定より先に落とす。
+# 実ログ (2026-08-28) で誤検出したものを登録している。
+# ------------------------------------------------------------
+exclude_patterns:
+  # websocket のコールバック登録ログ。"error=True close=True" を含むだけ
+  - 'websocket callbacks wired'
+  # ヘルスログ。ws_disconnect 系のカウンタを常時出している
+  - '\[PUSH OWNER HEALTH\]'
+  # 正常なローテーション切断
+  - '--- DISCONNECTED expected_rotation ---'
+  # data_collectors_runner は子プロセスのログを [CHILD:xxx] で包んで再出力する
+  # 多重化ログ。子 (ranking_collector / summary_database / push_receiver) は
+  # それぞれ自分のログを持っており、そちらを個別に監視している。
+  # ここを除外しないと同じ事象を二重に検出する。
+  # 実測 (2026-08-29): 46MB のログで 4,391 件検出のうち大半がこの重複だった。
+  # runner 自身が出す行 (子の起動・停止・異常終了) は除外されない。
+  - '\[CHILD:[a-z_]+\]'
+
+# ============================================================
+# 第2段階: Codex の指示書 → Claude Code 自動修正
+# ============================================================
+
+claude:
+  bin: "claude"
+  timeout_sec: 900
+  max_turns: 30
+  # 編集の確認プロンプトを出さない。Bash は claude_client.py 側で禁止している
+  permission_mode: "acceptEdits"
+  model: ""
+
+repair:
+  enabled: true
+
+  # Codex の確信度がこれ未満なら Claude に渡さない
+  min_confidence: 0.7
+
+  # 自動修正を許す分類。RED は絶対に入れないこと
+  allow_levels: [GREEN, YELLOW]
+
+  # 無限修正ループ防止
+  max_repairs_per_hour: 5
+  max_same_signature: 3
+
+  # repair.lock の有効期限。これを過ぎたロックは異常終了とみなして奪う
+  lock_timeout_sec: 3600
+
+  # 本番の作業ツリーの外に置くこと（稼働中プロセスに見せない）。
+  # ★ NAS 上には置かないこと。2026-08-28 に NAS 上へ作ろうとして
+  #    git worktree add が 600 秒でタイムアウトした（2111 ファイル / 16.5MB）。
+  #    worktree は毎回 git から作り直す使い捨てなので、ローカルディスクで良い。
+  worktree_dir: "C:/Users/hosot/AppData/Local/ai_fix_worktree"
+
+  # worktree の作成・リセットにかける上限
+  worktree_timeout_sec: 900
+
+  # 第2段階では本番へ反映しない。第4段階で扱う
+  apply_to_production: false
+
+tests:
+  # compileall は常に実行する（コードを実行しないので安全）
+  compile_timeout_sec: 300
+  # import smoke はコードを実行する。tests_runner.py の denylist で
+  # 起動系・発注系・バッチ・テストスクリプトを除外している
+  import_smoke: true
+  import_timeout_sec: 90
+  max_import_modules: 12

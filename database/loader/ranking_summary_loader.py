@@ -22,6 +22,7 @@ from database.schema.ranking_summary_schema import (
     table_name,
 )
 from database.sqlite import is_lock_error, quote_ident
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,15 @@ def load_latest_ranking_summary(
     interval: int,
     trade_date=None,
     db_path: Optional[str] = None,
-    ranking_dir: str = DEFAULT_RANKING_DIR,
+    # 2026-09-11: 既定を NAS 固定から「現在の既定」(ローカル) へ。
+    #   DEFAULT_RANKING_DIR は NAS のパスで import 時に固定される。
+    #   ranking DB は 2026-09-07 にローカルへ移っており、ここだけ NAS を
+    #   指していたため ranking_summary の保存が 1 回 53 秒 (upsert 24s +
+    #   commit 28s) かかり、ranking_job_all が平均 111 秒に膨らんでいた。
+    #   その結果 bar_age が 180 秒上限を超えて候補が全滅していた。
+    #   書き手・読み手・スキーマを同時に揃えること。片側だけ変えると
+    #   「書いた場所と読む場所が違う」状態になる (2026-09-11 に実際に発生)。
+    ranking_dir: Optional[str] = None,
     limit_minutes: int = 240,
 ) -> pd.DataFrame:
     """
@@ -49,7 +58,7 @@ def load_latest_ranking_summary(
 
     try:
         with RANKING_SUMMARY_DB_LOCK:
-            with sqlite3.connect(path, timeout=10) as con:
+            with committing_connect(path, timeout=10) as con:
                 con.execute("PRAGMA busy_timeout=10000")
 
                 try:
@@ -101,7 +110,15 @@ def load_ranking_summary_at_latest_slot(
     interval: int,
     trade_date=None,
     db_path: Optional[str] = None,
-    ranking_dir: str = DEFAULT_RANKING_DIR,
+    # 2026-09-11: 既定を NAS 固定から「現在の既定」(ローカル) へ。
+    #   DEFAULT_RANKING_DIR は NAS のパスで import 時に固定される。
+    #   ranking DB は 2026-09-07 にローカルへ移っており、ここだけ NAS を
+    #   指していたため ranking_summary の保存が 1 回 53 秒 (upsert 24s +
+    #   commit 28s) かかり、ranking_job_all が平均 111 秒に膨らんでいた。
+    #   その結果 bar_age が 180 秒上限を超えて候補が全滅していた。
+    #   書き手・読み手・スキーマを同時に揃えること。片側だけ変えると
+    #   「書いた場所と読む場所が違う」状態になる (2026-09-11 に実際に発生)。
+    ranking_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     ranking_summary_* の最新 datetime の行だけを読む。
@@ -116,7 +133,7 @@ def load_ranking_summary_at_latest_slot(
 
     try:
         with RANKING_SUMMARY_DB_LOCK:
-            with sqlite3.connect(path, timeout=10) as con:
+            with committing_connect(path, timeout=10) as con:
                 con.execute("PRAGMA busy_timeout=10000")
 
                 try:
@@ -181,7 +198,15 @@ def get_ranking_summary_schema_columns(
     interval: int,
     trade_date=None,
     db_path: Optional[str] = None,
-    ranking_dir: str = DEFAULT_RANKING_DIR,
+    # 2026-09-11: 既定を NAS 固定から「現在の既定」(ローカル) へ。
+    #   DEFAULT_RANKING_DIR は NAS のパスで import 時に固定される。
+    #   ranking DB は 2026-09-07 にローカルへ移っており、ここだけ NAS を
+    #   指していたため ranking_summary の保存が 1 回 53 秒 (upsert 24s +
+    #   commit 28s) かかり、ranking_job_all が平均 111 秒に膨らんでいた。
+    #   その結果 bar_age が 180 秒上限を超えて候補が全滅していた。
+    #   書き手・読み手・スキーマを同時に揃えること。片側だけ変えると
+    #   「書いた場所と読む場所が違う」状態になる (2026-09-11 に実際に発生)。
+    ranking_dir: Optional[str] = None,
 ) -> list[str]:
     """
     ranking_summary_* の既存カラム一覧を返す。
@@ -195,7 +220,7 @@ def get_ranking_summary_schema_columns(
 
     try:
         with RANKING_SUMMARY_DB_LOCK:
-            with sqlite3.connect(path, timeout=10) as con:
+            with committing_connect(path, timeout=10) as con:
                 con.execute("PRAGMA busy_timeout=10000")
                 if not table_exists(con, table):
                     return []

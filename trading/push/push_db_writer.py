@@ -128,6 +128,95 @@ def _log_owner_guard_skip_once(action: str, extra: dict[str, Any] | None = None)
         )
 
 
+# ============================================================
+# P0-1: WAL checkpoint を commit から外すための設定
+# ============================================================
+
+def _push_bg_checkpoint_enabled() -> bool:
+    v = os.getenv("PUSH_DB_BG_CHECKPOINT")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _push_bg_checkpoint_interval_sec() -> float:
+    try:
+        v = os.getenv("PUSH_DB_BG_CHECKPOINT_INTERVAL_SEC")
+        if v and str(v).strip():
+            return max(5.0, float(str(v).strip()))
+    except Exception:
+        pass
+    return 30.0
+
+
+def _push_wal_size_limit_bytes() -> int:
+    """checkpoint 後に WAL ファイルをこのサイズまで切り詰める。
+
+    実測で push20260828.db-wal が 167.3MB まで肥大していた。
+    """
+    try:
+        v = os.getenv("PUSH_DB_WAL_SIZE_LIMIT_MB")
+        if v and str(v).strip():
+            return int(float(str(v).strip()) * 1024 * 1024)
+    except Exception:
+        pass
+    return 64 * 1024 * 1024
+
+
+def _push_db_buffer_size() -> int:
+    """1 回の flush で書く行数。
+
+    2026-09-08 の実測で、flush ループが 27 回/分 -> 2-4 回/分 へ落ちたときに
+    1 回 500 行では到着 (約 3,500 行/分) に追いつかず、152,066 行を捨てた。
+    ローカル DB なら 500 行の executemany+commit は 0.03 秒なので、
+    1 回あたりを増やしてもコストはほぼ変わらない。
+    """
+    try:
+        v = os.getenv("PUSH_DB_BUFFER_SIZE")
+        if v is not None and str(v).strip() != "":
+            return max(100, int(float(str(v).strip())))
+    except Exception:
+        pass
+    return 5000
+
+
+def _push_db_flush_interval_sec() -> float:
+    try:
+        v = os.getenv("PUSH_DB_FLUSH_INTERVAL_SEC")
+        if v is not None and str(v).strip() != "":
+            return max(0.2, float(str(v).strip()))
+    except Exception:
+        pass
+    return 2.0
+
+
+def _push_nas_sync_stop_timeout_sec() -> float:
+    """停止時に NAS 複製を待つ上限。
+
+    NAS がハングしていると停止できなくなるので上限を切る。健全なら
+    520MB で 15 秒ほどなので既定 120 秒は十分な余裕がある。
+    """
+    try:
+        v = os.getenv("PUSH_DB_NAS_SYNC_STOP_TIMEOUT_SEC")
+        if v is not None and str(v).strip() != "":
+            return max(5.0, float(str(v).strip()))
+    except Exception:
+        pass
+    return 120.0
+
+
+def _push_db_write_raw_json() -> bool:
+    """stream_data / stream_data_raw の raw_json 列を実際に保存するか。
+
+    既定 False。読み手が居ないうえ 1 行の大半を占め、NAS への commit を
+    数十秒に伸ばしていたため。診断で生 JSON が要るときだけ 1 にする。
+    """
+    v = os.getenv("PUSH_DB_WRITE_RAW_JSON")
+    if v is None or str(v).strip() == "":
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 class StreamDBWriter:
     # stream_data: 21基本 + 40板 + 1json + date + time = 64
     EXPECTED_COLUMN_COUNT = 64
@@ -142,15 +231,243 @@ class StreamDBWriter:
     FLUSH_BUSY_RETRY_COUNT = 3
     FLUSH_BUSY_SLEEP_BASE_SEC = 0.35
 
+    # P0-1: 背景 checkpoint スレッド (プロセスで 1 本だけ)
+    _BG_CKPT_LOCK = threading.RLock()
+    _BG_CKPT_THREAD = None
+
+    # 場中の NAS 複製スレッド (プロセスで 1 本だけ)
+    _BG_NAS_SYNC_LOCK = threading.RLock()
+    _BG_NAS_SYNC_THREAD = None
+    _BG_CKPT_STATS = {
+        "runs": 0, "busy": 0, "frames": 0, "checkpointed": 0,
+        "last_elapsed": None, "last_at": None, "errors": 0,
+    }
+
+    def _start_bg_nas_sync(self, db_path: str) -> None:
+        """場中の定期複製。writer の flush を止めないよう専用スレッドで回す。
+
+        複製は 1 回で数十秒かかりうるので flush ループには載せない。
+        checkpoint スレッドと同じく、プロセスで 1 本だけ動かす。
+        """
+        try:
+            from trading.push import push_db_location
+        except Exception:
+            logger.exception("[PUSH DB NAS SYNC] push_db_location を読めないので定期複製しない")
+            return
+
+        if not push_db_location.local_staging_enabled():
+            return
+
+        # 2026-09-07: 実際に PUSH DB を書いているプロセスだけが複製する。
+        # main_database と push_receiver の両方がこのスレッドを立てており、
+        # 同じ NAS ファイルへ 2 本の複製が走っていた (09:19 に 0.0MB と
+        # 78.5MB が 17 秒差で完了)。add_push_row には既にオーナーガードが
+        # あるのに、複製側には無かった。
+        if _should_skip_push_db_writer_here():
+            logger.warning(
+                "[PUSH DB NAS SYNC] このプロセスは PUSH DB の書き手ではないので定期複製しない pid=%s",
+                os.getpid(),
+            )
+            return
+
+        interval = push_db_location.nas_sync_interval_sec()
+        if interval <= 0:
+            logger.warning("[PUSH DB NAS SYNC] 定期複製は無効 (停止時とローテーション時のみ複製する)")
+            return
+
+        cls = StreamDBWriter
+        with cls._BG_NAS_SYNC_LOCK:
+            th = cls._BG_NAS_SYNC_THREAD
+            if th is not None and th.is_alive():
+                return
+
+            def _loop() -> None:
+                # 複製先の解決は NAS に触る (mkdir)。ここで固まると定期複製が
+                # 一度も回らなくなるので、ログのためだけに待たない。
+                logger.warning(
+                    "[PUSH DB NAS SYNC] 定期複製を開始 interval=%.0fmin timeout=%.0fs src=%s",
+                    interval / 60.0, push_db_location.sync_timeout_sec(), db_path,
+                )
+                while True:
+                    time.sleep(interval)
+                    try:
+                        push_db_location.sync_to_nas(reason="periodic")
+                    except Exception:
+                        logger.exception("[PUSH DB NAS SYNC] 定期複製で例外")
+
+            t = threading.Thread(target=_loop, daemon=True, name="push_db_nas_sync")
+            t.start()
+            cls._BG_NAS_SYNC_THREAD = t
+
+    def _start_bg_checkpoint(self, db_path: str) -> None:
+        """WAL checkpoint を writer の commit 経路から外して専用スレッドで回す。"""
+        if not _push_bg_checkpoint_enabled():
+            return
+        # R18: type(self) にすると サブクラスが独自の _BG_CKPT_THREAD を持ち、
+        # 「プロセスで 1 本だけ」が崩れる。基底クラスに固定する。
+        # (ranking_db_writer 側は R18 で同じ修正を入れた)
+        cls = StreamDBWriter
+        with cls._BG_CKPT_LOCK:
+            th = cls._BG_CKPT_THREAD
+            if th is not None and th.is_alive():
+                return
+
+            interval = _push_bg_checkpoint_interval_sec()
+
+            def _loop() -> None:
+                logger.warning(
+                    "[PUSH DB CHECKPOINT] background checkpoint started interval=%.1fs db=%s "
+                    "(commit 経路から checkpoint を外した)",
+                    interval, db_path,
+                )
+                while True:
+                    time.sleep(interval)
+                    conn = None
+                    t0 = time.perf_counter()
+                    try:
+                        conn = sqlite3.connect(db_path, timeout=30.0)
+                        conn.execute("PRAGMA busy_timeout=%d" % int(cls.BUSY_TIMEOUT_MS))
+                        row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                        el = time.perf_counter() - t0
+                        busy, frames, done = (row or (None, None, None))
+
+                        # ------------------------------------------------------------
+                        # 2026-09-02 P0: PASSIVE が 1 フレームも進まないまま
+                        # WAL が膨らみ続ける状態を検知して解消する。
+                        #
+                        # 本番実測 (2026-09-02 15:21):
+                        #   [PUSH DB CHECKPOINT] passive busy=0 log_frames=41055 checkpointed=0
+                        #   -> WAL 196MB。長時間の読み取りトランザクション
+                        #      (timeout 後に放置された summary-force-direct worker が
+                        #       880 秒の full scan を続けていた) が read-mark を
+                        #      握っているため PASSIVE が進めない。
+                        #   その結果 commit が 17-24 秒かかるようになっていた。
+                        #
+                        # 読み手側は別途 1 本化・増分化・中断可能化したが、
+                        # ここでも「進んでいない」ことを検知して RESTART/TRUNCATE を
+                        # 試し、原因が読み手側にあることをログに残す。
+                        # busy_timeout は短く縛るので writer を長く止めない。
+                        # ------------------------------------------------------------
+                        try:
+                            stall_frames = int(os.getenv("PUSH_DB_CHECKPOINT_STALL_FRAMES", "8000"))
+                        except Exception:
+                            stall_frames = 8000
+                        try:
+                            stall_rounds = int(os.getenv("PUSH_DB_CHECKPOINT_STALL_ROUNDS", "3"))
+                        except Exception:
+                            stall_rounds = 3
+                        with cls._BG_CKPT_LOCK:
+                            prev_stall = int(cls._BG_CKPT_STATS.get("stall_rounds", 0) or 0)
+                        stalled = bool(
+                            frames is not None
+                            and int(frames) >= stall_frames
+                            and (done is None or int(done) <= 0)
+                        )
+                        prev_stall = (prev_stall + 1) if stalled else 0
+                        with cls._BG_CKPT_LOCK:
+                            cls._BG_CKPT_STATS["stall_rounds"] = prev_stall
+
+                        if stalled and prev_stall >= stall_rounds:
+                            logger.error(
+                                "[PUSH DB CHECKPOINT][STALLED] PASSIVE が %d 回連続で 0 フレームしか "
+                                "進んでいない log_frames=%s。長時間の読み取りトランザクションが "
+                                "read-mark を握っている可能性が高い "
+                                "(summary 側の full scan / 放置 worker を疑う)。RESTART を試す。",
+                                prev_stall, frames,
+                            )
+                            try:
+                                mode = os.getenv("PUSH_DB_CHECKPOINT_ESCALATE_MODE", "RESTART").upper()
+                                if mode not in ("RESTART", "TRUNCATE", "FULL"):
+                                    mode = "RESTART"
+                                esc_ms = int(os.getenv("PUSH_DB_CHECKPOINT_ESCALATE_BUSY_MS", "5000"))
+                                conn.execute("PRAGMA busy_timeout=%d" % esc_ms)
+                                t1 = time.perf_counter()
+                                r2 = conn.execute("PRAGMA wal_checkpoint(%s)" % mode).fetchone()
+                                b2, f2, d2 = (r2 or (None, None, None))
+                                logger.error(
+                                    "[PUSH DB CHECKPOINT][ESCALATE] mode=%s busy=%s log_frames=%s "
+                                    "checkpointed=%s elapsed=%.2fs "
+                                    "(busy=1 なら読み手がまだ握っている)",
+                                    mode, b2, f2, d2, time.perf_counter() - t1,
+                                )
+                                if d2 is not None and int(d2) > 0:
+                                    with cls._BG_CKPT_LOCK:
+                                        cls._BG_CKPT_STATS["stall_rounds"] = 0
+                            except Exception:
+                                logger.warning(
+                                    "[PUSH DB CHECKPOINT][ESCALATE] 失敗 (次回再試行。tick 受信は止めない)",
+                                    exc_info=True,
+                                )
+                            finally:
+                                try:
+                                    conn.execute("PRAGMA busy_timeout=%d" % int(cls.BUSY_TIMEOUT_MS))
+                                except Exception:
+                                    pass
+                        with cls._BG_CKPT_LOCK:
+                            s = cls._BG_CKPT_STATS
+                            s["runs"] += 1
+                            s["busy"] += 1 if busy else 0
+                            s["frames"] = frames
+                            s["checkpointed"] = done
+                            s["last_elapsed"] = round(el, 2)
+                            s["last_at"] = dt.datetime.now()
+                        wal_mb = None
+                        try:
+                            wal_mb = round(os.path.getsize(db_path + "-wal") / 1024 / 1024, 1)
+                        except Exception:
+                            wal_mb = None
+                        log = logger.warning if (el >= 5.0 or busy) else logger.info
+                        log(
+                            "[PUSH DB CHECKPOINT] passive busy=%s log_frames=%s checkpointed=%s "
+                            "elapsed=%.2fs wal_mb=%s interval=%.1fs "
+                            "(commit をブロックしない)",
+                            busy, frames, done, el, wal_mb, interval,
+                        )
+                    except Exception:
+                        with cls._BG_CKPT_LOCK:
+                            cls._BG_CKPT_STATS["errors"] += 1
+                        logger.warning(
+                            "[PUSH DB CHECKPOINT] failed db=%s (次回再試行。tick 受信は止めない)",
+                            db_path, exc_info=True,
+                        )
+                    finally:
+                        if conn is not None:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+
+            t = threading.Thread(target=_loop, name="push-db-checkpoint", daemon=True)
+            cls._BG_CKPT_THREAD = t
+            t.start()
+
+    @classmethod
+    def checkpoint_stats(cls) -> dict:
+        with cls._BG_CKPT_LOCK:
+            return dict(cls._BG_CKPT_STATS)
+
     def __init__(
         self,
-        buffer_size: int = 500,
-        flush_interval_sec: float = 2.0,
+        buffer_size: int = 0,
+        flush_interval_sec: float = 0.0,
         enable_raw_save: bool = True,
     ):
-        # NAS向け既定値
-        self.buffer_size = int(buffer_size) if buffer_size else 500
-        self.flush_interval_sec = float(flush_interval_sec) if flush_interval_sec else 2.0
+        # 2026-09-08: buffer_size の既定を 500 -> 5000 へ引き上げた。
+        #
+        # 本番実測 (後場):
+        #   12:53  flush 27 回/分 = 13,500 行/分   <- 足りている
+        #   13:08  flush  4 回/分 =  2,000 行/分   <- 急落
+        #   以後   2-4 回/分 のまま大引けまで
+        # 到着は約 3,500 行/分。1 回の flush は **必ず 500 行** (548/548) なので、
+        # ループが遅くなった瞬間に構造的に追いつかなくなり、キューが上限
+        # 200,000 に達して 152,066 行を捨てた (DB の最終 tick は 13:56 で停止)。
+        #
+        # ループが遅くなる理由は未特定だが、1 回あたりの行数を増やせば
+        # ループ速度に関係なく容量が増える。4 回/分 x 5,000 行 = 20,000 行/分。
+        # ローカル DB なので 500 行の executemany+commit は 0.03 秒しかかからず、
+        # 5,000 行でも十分速い (書き込み自体は律速ではない)。
+        self.buffer_size = int(buffer_size) if buffer_size else _push_db_buffer_size()
+        self.flush_interval_sec = float(flush_interval_sec) if flush_interval_sec else _push_db_flush_interval_sec()
         self.enable_raw_save = bool(enable_raw_save)
 
         self.buffer = []
@@ -497,6 +814,19 @@ class StreamDBWriter:
     # ========================================================
 
     def _resolve_db_path(self) -> Path:
+        # 2026-09-05: 置き場所の判断は push_db_location へ集約した。
+        # 既定でローカルに書き、NAS へは区切りで複製する。
+        # 読み手 (memory_latest_1m / fallback_loader / freshness_timeline) も
+        # 同じ関数を使うので、書き手だけが別の場所を見ることはない。
+        try:
+            from trading.push import push_db_location
+
+            return push_db_location.push_db_path()
+        except Exception:
+            logger.exception(
+                "[PUSH DB WRITER] push_db_location を使えないので NAS 直書きへ退避する"
+            )
+
         today = dt.datetime.now().strftime("%Y%m%d")
         base_dir: Path = get_path("raw_push")
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -519,10 +849,51 @@ class StreamDBWriter:
 
         self.cursor.execute("PRAGMA journal_mode=WAL;")
         self.cursor.execute("PRAGMA synchronous=NORMAL;")
-        self.cursor.execute("PRAGMA wal_autocheckpoint=1000;")
+
+        # ============================================================
+        # P0-1: checkpoint を commit の経路から外す
+        # ------------------------------------------------------------
+        # 2026-08-28 14:00-15:20 の実測 (417 flush):
+        #   executemany push  mean=0.201s p95=0.618s
+        #   executemany raw   mean=0.255s p95=1.259s
+        #   commit            mean=8.999s p95=29.629s max=483.847s
+        #   -> commit だけで 3,743 秒 = 84 分の 74%
+        #   1 flush あたり平均 29 行しか書いていないのに commit が 9 秒。
+        #
+        # NAS 上に新規 DB を作って測ると commit は 3.5〜6.8 ms しかかからない。
+        # つまり NAS 固有の遅さではない。原因は **inline auto-checkpoint**。
+        #
+        #   wal_autocheckpoint=1000 (= 4MB) を超えるたびに、
+        #   commit した **writer スレッド自身が** WAL -> 本体 DB の
+        #   ページコピーを SMB 越しに同期実行する。
+        #   実測: PRAGMA wal_checkpoint(PASSIVE) は busy=0 で
+        #         12,229 frames を全部流せたが **33.27 秒**かかった。
+        #
+        # その間 tick は届き続けるので queue が 7,800 まで積み上がり、
+        # writer は永久に追いつけない (received 19,440 / flushed 11,593)。
+        #
+        # 対策: inline auto-checkpoint を止め、専用スレッドで定期的に
+        # PASSIVE checkpoint する。commit は 3.5ms 側へ戻る。
+        # PASSIVE なので writer/reader をブロックしない。
+        # journal_size_limit で WAL ファイル自体も切り詰める
+        # (実測 167.3MB まで肥大していた)。
+        #
+        # 従来動作へ戻す場合: PUSH_DB_BG_CHECKPOINT=0
+        # ============================================================
+        if _push_bg_checkpoint_enabled():
+            self.cursor.execute("PRAGMA wal_autocheckpoint=0;")
+            self.cursor.execute(
+                "PRAGMA journal_size_limit=%d;" % int(_push_wal_size_limit_bytes())
+            )
+        else:
+            self.cursor.execute("PRAGMA wal_autocheckpoint=1000;")
+
         self.cursor.execute(f"PRAGMA busy_timeout={int(self.BUSY_TIMEOUT_MS)};")
         self.cursor.execute("PRAGMA temp_store=MEMORY;")
         self.cursor.execute("PRAGMA cache_size=-50000;")
+
+        self._start_bg_checkpoint(db_path)
+        self._start_bg_nas_sync(db_path)
 
         self._ensure_table()
         if self.enable_raw_save:
@@ -749,6 +1120,8 @@ class StreamDBWriter:
 
         logger.info("[PUSH DB WRITER] Rotating DB → %s", today)
 
+        prev_date = self.current_date
+
         if self.conn:
             if self.buffer:
                 self._flush_without_rotate_locked()
@@ -759,8 +1132,56 @@ class StreamDBWriter:
 
         self.conn = None
         self.cursor = None
+
+        # 前日ぶんを NAS へ複製する。ただし **この場で待たない**。
+        # ここは writer のロックを握ったまま呼ばれるので、NAS がハングすると
+        # 取り込みごと止まる。前日のファイルはもう変化しないので、
+        # 複製は別スレッドに任せて今日の DB を先に開く。
+        self._sync_to_nas_safe(reason="rotate", date=prev_date, wait=False)
+
         self.current_date = today
         self._open_connection()
+
+    def _sync_to_nas_safe(
+        self,
+        *,
+        reason: str,
+        date: Optional[dt.date] = None,
+        wait: bool = True,
+        timeout_sec: Optional[float] = None,
+        slot_wait_sec: float = 0.0,
+    ) -> None:
+        """NAS への複製。失敗しても取り込みは止めない。
+
+        ``wait=False`` のときは投げっぱなしにする。ロックを握っている
+        経路 (ローテーション) から呼ぶときは必ずこちらを使う。
+        NAS のハングで PUSH の取り込みが止まるのが一番まずい。
+        """
+        try:
+            from trading.push import push_db_location
+
+            if not push_db_location.local_staging_enabled():
+                return
+
+            def _run() -> None:
+                try:
+                    push_db_location.sync_to_nas(
+                        reason=reason,
+                        date=date,
+                        timeout_sec=timeout_sec,
+                        slot_wait_sec=slot_wait_sec,
+                    )
+                except Exception:
+                    logger.exception("[PUSH DB WRITER] NAS 複製に失敗 reason=%s", reason)
+
+            if wait:
+                _run()
+            else:
+                threading.Thread(
+                    target=_run, daemon=True, name=f"push_db_nas_sync_{reason}"
+                ).start()
+        except Exception:
+            logger.exception("[PUSH DB WRITER] NAS 複製の起動に失敗 reason=%s", reason)
 
     # ========================================================
     # DIRECT ADD
@@ -833,7 +1254,26 @@ class StreamDBWriter:
                     push_data.append(None)
                     push_data.append(None)
 
-        push_data.append(raw_json)
+        # ------------------------------------------------------------
+        # 2026-09-03 P0: raw_json を DB へ書かない (既定)。
+        #
+        # raw_json は kabu Station の tick 生 JSON (1 行あたり 1.5-2KB) で、
+        # stream_data / stream_data_raw の 1 行のバイト数の大半を占める。
+        # **読み手はどこにも居ない**:
+        #   - scheduler_jobs/summary/memory_latest_1m は SELECT から明示除外
+        #   - この writer 自身は DB ではなく受信 row の dict から読んでいる
+        # 本番実測 (2026-09-03 13:1x, SMB):
+        #   executemany push 500 行 = 0.23-0.59s
+        #   executemany raw  500 行 = 2.5-10.6s
+        #   commit           500 行 = 45-47s   <- NAS へ書くバイト数で決まる
+        # 500 行 x 約 2KB = 約 1MB を毎回 WAL へ流していた。
+        # 列は残したまま値だけ NULL にするので schema は変わらない。
+        # PUSH_DB_WRITE_RAW_JSON=1 で従来どおり保存できる。
+        # ------------------------------------------------------------
+        if _push_db_write_raw_json():
+            push_data.append(raw_json)
+        else:
+            push_data.append(None)
 
         if len(push_data) != self.EXPECTED_COLUMN_COUNT:
             logger.error(
@@ -1288,6 +1728,18 @@ class StreamDBWriter:
                 self.conn = None
                 self.cursor = None
                 self._started = False
+
+        # 接続を閉じてから複製する。大引け後の停止で今日ぶんが NAS へ渡る。
+        # ここで失敗しても、ローカルの DB は残るので後から手動で複製できる。
+        #
+        # 待つが、無限には待たない。NAS がハングしていると停止できなくなる。
+        # 定期複製の最中に停止した場合は、それが終わるのを少しだけ待ってから
+        # 最後のぶんを流す (待たないとその日の終盤が NAS へ渡らない)。
+        self._sync_to_nas_safe(
+            reason="stop",
+            timeout_sec=_push_nas_sync_stop_timeout_sec(),
+            slot_wait_sec=_push_nas_sync_stop_timeout_sec(),
+        )
 
     def _loop(self) -> None:
         logger.info("[PUSH DB WRITER] writer loop started")

@@ -21,13 +21,13 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-from core.startup.merged_summary_access import (
+from core.startup.summary.merged_access import (
     get_push_merged_summary_safe,
     set_push_merged_summary_safe,
 )
 
 try:
-    from core.startup.merged_summary_access import (
+    from core.startup.summary.merged_access import (
         get_summary_history_safe as _external_get_summary_history_safe,
         set_summary_history_safe as _external_set_summary_history_safe,
     )

@@ -52,7 +52,7 @@ def build_unified_close_1min(
                 p["symbol"] = p["symbol"].astype(str)
                 p["datetime"] = pd.to_datetime(
                     p["datetime"], errors="coerce"
-                ).dt.floor("T")
+                ).dt.floor("min")
                 p["close"] = pd.to_numeric(
                     p[close_col], errors="coerce"
                 )
@@ -68,7 +68,7 @@ def build_unified_close_1min(
             r["symbol"] = r["symbol"].astype(str)
             r["datetime"] = pd.to_datetime(
                 r["snapshot_time"], errors="coerce"
-            ).dt.floor("T")
+            ).dt.floor("min")
             r["close"] = pd.to_numeric(
                 r["current_price"], errors="coerce"
             )
@@ -84,7 +84,7 @@ def build_unified_close_1min(
             y["symbol"] = y["symbol"].astype(str)
             y["datetime"] = pd.to_datetime(
                 y["datetime"], errors="coerce"
-            ).dt.floor("T")
+            ).dt.floor("min")
             y["close"] = pd.to_numeric(
                 y["close"], errors="coerce"
             )

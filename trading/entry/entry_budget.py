@@ -82,7 +82,7 @@ def _cfg(key: str, default: Any) -> Any:
         pass
 
     try:
-        from core.startup.settings_ini_loader import get_setting
+        from core.startup.runtime_env.settings_ini import get_setting
         v = get_setting(key, None)
         if v is not None and str(v).strip() != "":
             return v

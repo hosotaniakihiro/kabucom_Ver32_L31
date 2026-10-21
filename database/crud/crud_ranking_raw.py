@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from sqlalchemy import text
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ TMP_TABLE_NAME = "ranking_raw_1min__new"
 # constants
 # ------------------------------------------------------------
 
-DEFAULT_NAS_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_NAS_ROOT = nas_root()
 
 _ENGINE_CACHE: Dict[str, Any] = {}
 

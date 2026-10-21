@@ -14,10 +14,11 @@ import os
 import sqlite3
 from pathlib import Path
 from typing import Any
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_DB = r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\runtime\early_profit_state.db"
+_DEFAULT_DB = nas_path(r"raw_data\kabu_station\runtime\early_profit_state.db")
 
 
 def _db_path() -> str:

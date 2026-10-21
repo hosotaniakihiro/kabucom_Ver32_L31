@@ -45,13 +45,15 @@ from __future__ import annotations
 import os
 import time
 import sqlite3
+import threading
 import logging
 import datetime as dt
 from typing import Iterable, Optional, Callable, TypeVar
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 
 SQLITE_TIMEOUT_SEC = 30.0
 SQLITE_BUSY_TIMEOUT_MS = 30000
@@ -362,12 +364,47 @@ def _to_dt_str(value) -> Optional[str]:
 # db bootstrap
 # ============================================================
 
+# ============================================================
+# ensure 済み DB のプロセス内キャッシュ (2026-09-03)
+# ------------------------------------------------------------
+# ensure_yahoo_backfill_status_db() は upsert / mark / get の
+# 全関数の先頭から呼ばれている (このファイルだけで 6 箇所)。
+# そのため symbol / chunk ごとに毎回
+#   NAS SQLite へ connect -> CREATE TABLE IF NOT EXISTS
+#   -> CREATE INDEX x2 -> ログ 1 行
+# を実行しており、ログに
+#   [YAHOO BACKFILL STATUS] ensured db=...
+# がほぼ毎秒大量に出ていた。
+#
+# db_path には trade_date が含まれるので、日付が変われば
+# 別パスになり自動的に再 ensure される。
+# プロセス内で同じパスを 2 度 ensure する必要は無い。
+#
+# YAHOO_BACKFILL_STATUS_ENSURE_CACHE=0 で従来動作に戻せる。
+# ============================================================
+_ENSURED_DB_PATHS: set[str] = set()
+_ENSURED_LOCK = threading.Lock()
+
+
+def _ensure_cache_enabled() -> bool:
+    v = os.environ.get("YAHOO_BACKFILL_STATUS_ENSURE_CACHE")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() not in {"0", "false", "no", "off", "disable", "disabled"}
+
+
 def ensure_yahoo_backfill_status_db(
     trade_date: dt.date | str | None = None,
     base_dir: str = DEFAULT_BASE_DIR,
 ) -> str:
     tdate = _normalize_trade_date(trade_date)
     db_path = get_yahoo_status_db_path(trade_date=tdate, base_dir=base_dir)
+
+    if _ensure_cache_enabled():
+        with _ENSURED_LOCK:
+            if db_path in _ENSURED_DB_PATHS:
+                # 既に ensure 済み。NAS への DDL もログも出さない。
+                return db_path
 
     sql_table = """
     CREATE TABLE IF NOT EXISTS yahoo_backfill_status (
@@ -407,6 +444,10 @@ def ensure_yahoo_backfill_status_db(
     )
 
     if ok:
+        if _ensure_cache_enabled():
+            with _ENSURED_LOCK:
+                _ENSURED_DB_PATHS.add(db_path)
+        # ログはこのプロセスで 1 パスにつき 1 回だけ出る。
         logger.info("[YAHOO BACKFILL STATUS] ensured db=%s", db_path)
     else:
         logger.error("[YAHOO BACKFILL STATUS] ensure db failed path=%s", db_path)

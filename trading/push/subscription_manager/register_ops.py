@@ -22,9 +22,10 @@ import tempfile
 import threading
 import time
 import urllib.error
-import urllib.request
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence
+from typing import Any, Iterable, Iterator, Optional, Sequence
+
+from kabu_api import kabu_http
 
 from .globals_access import safe_get_global_data, safe_getattr
 from .symbols import dedupe_keep_order, normalize_symbol
@@ -616,17 +617,42 @@ def _resolve_unregister_url() -> str:
     )
 
 
-def _build_request(*, url: str, method: str, payload: Optional[dict], api_key: str) -> urllib.request.Request:
-    method = (_safe_str(method) or "PUT").upper()
-    body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, body, method=method)
-    req.add_header("Content-Type", "application/json")
-    if api_key:
-        req.add_header("X-API-KEY", api_key)
-    return req
+def _registration_endpoint(url: str) -> bool:
+    u = str(url or "").lower()
+    return "/register" in u or "/unregister" in u
+
+
+def _guard_registration_owner(url: str) -> tuple[bool, Any]:
+    """PUSH WebSocket 非所有プロセスからの register/unregister を止める。
+
+    戻り値: (続行してよいか, 拒否時のレスポンス相当)
+    """
+    if not _registration_endpoint(url):
+        return True, None
+    try:
+        from trading.push.push_stream.ws_owner import registration_allowed
+    except Exception:
+        return True, None
+    try:
+        allowed, holder = registration_allowed("register_ops")
+    except Exception:
+        logger.debug("[SUB MANAGER] registration owner check failed -> allow", exc_info=True)
+        return True, None
+    if allowed:
+        return True, None
+    logger.error(
+        "[SUB MANAGER][MULTI_WS_DETECTED] register/unregister skipped: "
+        "このプロセスは PUSH WebSocket の所有者ではない pid=%s url=%s holder=%s "
+        "(register リストはセッション共有資源。所有プロセスだけが操作する)",
+        os.getpid(), url, holder,
+    )
+    return False, {"Code": "SKIPPED_NOT_PUSH_WS_OWNER", "Message": "not push ws owner"}
 
 
 def _http_json_request(*, url: str, method: str, payload: Optional[dict], api_key: str, timeout: float = 10.0) -> tuple[bool, Any]:
+    ok_to_run, blocked = _guard_registration_owner(url)
+    if not ok_to_run:
+        return False, blocked
     """canonical token で api_key を上書きし、認証ミスマッチを診断ログに残す。
 
     旧 core/startup/kabusapi_token_retry_register_patch.py の
@@ -664,21 +690,19 @@ def _http_json_request_impl(*, url: str, method: str, payload: Optional[dict], a
     if not url:
         logger.warning("[SUB MANAGER] HTTP %s skipped: invalid url=%r", method, url)
         return False, "invalid_url"
+    # 送信は kabu_api.kabu_http に集約する。urllib.request は毎回
+    # "Connection: close" を送り、kabu Station はそれに応答を返さない。
+    # PUT /kabusapi/register が常に "timed out" になっていた原因はこれで、
+    # kabu Station 側の不調ではなかった (詳細は kabu_api/kabu_http.py)。
     try:
-        req = _build_request(url=url, method=method, payload=payload, api_key=api_key)
-    except Exception as e:
-        logger.exception("[SUB MANAGER] HTTP %s request build failed url=%r", method, url)
-        if is_transport_error(e):
-            mark_transport_broken(reason=f"http_{method.lower()}_build", exc=e)
-        return False, str(e)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            raw = res.read()
-            try:
-                content = json.loads(raw.decode("utf-8"))
-            except Exception:
-                content = raw.decode("utf-8", errors="ignore")
-            return True, content
+        content = kabu_http.request_json(
+            url,
+            method=method,
+            payload=payload,
+            api_key=api_key,
+            timeout=timeout,
+        )
+        return True, content
     except urllib.error.HTTPError as e:
         try:
             raw = e.read()
@@ -731,6 +755,14 @@ def _is_api_key_mismatch(content: Any) -> bool:
 
 def _abort_on_clear_failure() -> bool:
     return _env_bool("PUSH_REGISTER_ABORT_IF_CLEAR_FAILED", True)
+
+
+def _skip_clear_when_empty() -> bool:
+    """登録済みが 0 件のとき unregister/all を省略するか。
+
+    PUSH_REGISTER_SKIP_CLEAR_WHEN_EMPTY=0 で従来動作 (必ず呼ぶ)。
+    """
+    return _env_bool("PUSH_REGISTER_SKIP_CLEAR_WHEN_EMPTY", True)
 
 
 def _sequence_lock_path() -> str:
@@ -857,10 +889,19 @@ def _register_once_with_content(symbols: Sequence[str], *, exchange: int = DEFAU
     payload = {"Symbols": make_symbol_objects(normalized, exchange=exchange)}
     ok, content = _http_json_request(url=url, method="PUT", payload=payload, api_key=api_key)
     logger.info("[SUB MANAGER] register done size=%d ok=%s content=%r", len(normalized), ok, content)
+    if not ok:
+        # 2026-09-16: 4001019 (一部の銘柄が登録できませんでした) は応答に銘柄が含まれない。
+        #   どの銘柄が弾かれたかを後から特定できるよう、送った銘柄を必ず残す
+        #   (次に成功した register の RegistList と突き合わせる)。
+        try:
+            logger.warning("[SUB MANAGER][REGISTER NG SYMBOLS] size=%d content=%r symbols=%s",
+                           len(normalized), content, sorted(normalized))
+        except Exception:
+            pass
     return ok, content
 
 
-def run_register_chunks(symbols: Sequence[str], *, exchange: int = DEFAULT_EXCHANGE, chunk_size: int = REGISTER_CHUNK_SIZE) -> bool:
+def _run_register_chunks_core(symbols: Sequence[str], *, exchange: int = DEFAULT_EXCHANGE, chunk_size: int = REGISTER_CHUNK_SIZE) -> bool:
     del chunk_size
     normalized = _truncate_to_register_limit(symbols)
     if not normalized:
@@ -876,7 +917,168 @@ def run_register_chunks(symbols: Sequence[str], *, exchange: int = DEFAULT_EXCHA
     return False
 
 
-def run_refresh_sequence(
+def _registered_symbols_from_content(content: Any) -> list[str]:
+    """register/unregister のレスポンス RegistList から銘柄コード一覧を取り出す。"""
+    try:
+        if not isinstance(content, dict):
+            return []
+        items = content.get("RegistList")
+        if not isinstance(items, list):
+            return []
+        out: list[str] = []
+        for it in items:
+            if isinstance(it, dict):
+                sym = str(it.get("Symbol") or "").strip()
+            else:
+                sym = str(it or "").strip()
+            if sym:
+                out.append(sym)
+        return _normalize_symbols(out)
+    except Exception:
+        return []
+
+
+def _try_differential_register(
+    current_symbols: Sequence[str],
+    target_symbols: Sequence[str],
+    *,
+    exchange: int,
+) -> Optional[bool]:
+    """差分だけ unregister/register する。
+
+    kabu Station の PUT /register は「追加」、PUT /unregister は「指定解除」なので、
+    A -> B の入れ替えは (A-B) を unregister し (B-A) を register すれば足りる。
+    毎回 /unregister/all を撃つと登録ゼロの瞬間ができ、
+    固定枠の銘柄まで PUSH が途切れる。
+
+    戻り値:
+      True/False -> 差分登録を実施した (成否)
+      None       -> 差分登録を使わない (呼び出し側は従来の全解除→全登録へ)
+    """
+    if not _env_bool("PUSH_REGISTER_DIFFERENTIAL_ENABLED", True):
+        return None
+
+    current = _normalize_symbols(current_symbols)
+    target = _truncate_to_register_limit(target_symbols)
+    if not current or not target:
+        return None
+
+    cur_set = set(current)
+    tgt_set = set(target)
+    to_remove = [s for s in current if s not in tgt_set]
+    to_add = [s for s in target if s not in cur_set]
+    keep = [s for s in current if s in tgt_set]
+
+    if not to_remove and not to_add:
+        logger.info(
+            "[SUB MANAGER][DIFF REGISTER] no change current=%d target=%d keep=%d",
+            len(current), len(target), len(keep),
+        )
+        return True
+
+    logger.info(
+        "[SUB MANAGER][DIFF REGISTER] current=%d target=%d keep=%d remove=%d add=%d "
+        "(全解除せず差分だけ更新する)",
+        len(current), len(target), len(keep), len(to_remove), len(to_add),
+    )
+
+    if to_remove:
+        if not run_unregister_symbols(to_remove):
+            logger.warning(
+                "[SUB MANAGER][DIFF REGISTER] unregister diff failed size=%d -> 全解除→全登録へフォールバック",
+                len(to_remove),
+            )
+            return None
+
+    if not to_add:
+        return True
+
+    ok, content = _register_once_with_content(to_add, exchange=exchange)
+    if not ok:
+        if _is_partial_register_error(content):
+            logger.warning(
+                "[SUB MANAGER][DIFF REGISTER] partial register accepted size=%d content=%r",
+                len(to_add), content,
+            )
+            return True
+        logger.warning(
+            "[SUB MANAGER][DIFF REGISTER] register diff failed size=%d content=%r -> 全解除→全登録へフォールバック",
+            len(to_add), content,
+        )
+        return None
+
+    # vendor が返した実際の登録一覧と突き合わせる。
+    # ここがズレたまま差分を続けると 4002006 レジスト数エラーになるので、
+    # ズレたら一度だけ全解除→全登録へ落とす。
+    actual = _registered_symbols_from_content(content)
+    if actual and set(actual) != tgt_set:
+        logger.warning(
+            "[SUB MANAGER][DIFF REGISTER] vendor RegistList mismatch actual=%d target=%d "
+            "missing=%s extra=%s -> 全解除→全登録で作り直す",
+            len(actual), len(target),
+            sorted(tgt_set - set(actual))[:10],
+            sorted(set(actual) - tgt_set)[:10],
+        )
+        return None
+
+    logger.info(
+        "[SUB MANAGER][DIFF REGISTER] done removed=%d added=%d registered=%d",
+        len(to_remove), len(to_add), len(actual) if actual else len(target),
+    )
+    return True
+
+
+def _reg_state():
+    """登録状態の正規所有者。取得できなければ None。"""
+    try:
+        from trading.push import registration_state
+
+        return registration_state
+    except Exception:
+        logger.debug("[SUB MANAGER] registration_state unavailable", exc_info=True)
+        return None
+
+
+def _restore_last_good_batch(reason: str, *, exchange: int) -> bool:
+    """unregister は通ったが register に失敗した状態からの復旧。
+
+    直前に kabu が受理していたバッチを register し直す。
+    ここで復旧できないと registered_count=0 のまま PUSH が止まる。
+    """
+    if not _env_bool("PUSH_REGISTER_RESTORE_LAST_GOOD", True):
+        return False
+    st = _reg_state()
+    if st is None:
+        return False
+    last_good = st.last_good_registered_symbols()
+    if not last_good:
+        logger.error(
+            "[SUB MANAGER][RESTORE] last_good が無いため復旧できない reason=%s "
+            "(registered_count=0 のままになる)",
+            reason,
+        )
+        return False
+
+    target = _truncate_to_register_limit(last_good)
+    logger.warning(
+        "[SUB MANAGER][RESTORE] register に失敗したので直前の正常バッチを再登録する "
+        "reason=%s size=%d head=%s",
+        reason, len(target), target[:10],
+    )
+    ok, content = _register_once_with_content(target, exchange=exchange)
+    if ok or _is_partial_register_error(content):
+        st.mark_registered_confirmed(target, label="restore", source=reason)
+        logger.warning(
+            "[SUB MANAGER][RESTORE] 直前バッチの再登録に成功 size=%d reason=%s", len(target), reason
+        )
+        return True
+    logger.error(
+        "[SUB MANAGER][RESTORE] 直前バッチの再登録も失敗 reason=%s content=%r", reason, content
+    )
+    return False
+
+
+def _run_refresh_sequence_core(
     current_symbols: Sequence[str],
     target_symbols: Sequence[str],
     *,
@@ -897,6 +1099,21 @@ def run_refresh_sequence(
     wait_sec = max(0.0, float(wait_sec))
 
     reason = "clear_register" if clear_first else "unregister_register" if unregister_first else "register"
+
+    # 事前条件 (2026-09-01):
+    # 登録候補が空のときに unregister だけ通すと registered_count=0 になり、
+    # PUSH が止まって Summary も Ranking 候補も作れなくなる循環に入る。
+    # 空なら「今の登録を維持したまま」何もしない。
+    if not normalized_target:
+        st = _reg_state()
+        confirmed = st.registered_count() if st is not None else -1
+        logger.error(
+            "[SUB MANAGER][ROTATION SKIP] 登録候補が空なので unregister/register を行わない "
+            "reason=%s current=%d confirmed=%s (現在の登録を維持する)",
+            reason, len(current_symbols or []), confirmed,
+        )
+        return False
+
     with _registration_sequence_lock(reason):
         logger.info(
             "[SUB MANAGER] refresh sequence start current=%d target=%d clear_first=%s unregister_first=%s wait_after_clear=%.3fs locked=True",
@@ -907,12 +1124,41 @@ def run_refresh_sequence(
             wait_sec,
         )
 
+        if clear_first or unregister_first:
+            diff_result = _try_differential_register(
+                current_symbols, normalized_target, exchange=exchange,
+            )
+            if diff_result is True:
+                return True
+            if diff_result is False:
+                return False
+
         if clear_first:
-            ok = run_unregister_all()
-            if not ok:
-                logger.error("[SUB MANAGER] clear_first failed -> abort register abort_if_clear_failed=%s", _abort_on_clear_failure())
-                if _abort_on_clear_failure():
-                    return False
+            # 登録済みが 0 件なら消すものが無い。
+            #
+            # 2026-08-31 14:21-14:37 の実測:
+            #   [REGISTER AUDIT] refresh start current=0 target=50 clear_first=True
+            #   PUT /kabusapi/unregister/all err=timed out            (10 秒)
+            #   clear_first failed -> abort register                  (abort_if_clear_failed=True)
+            # これが 4 回連続し、register done が 1 回も出ないまま
+            # 銘柄が 1 つも登録されず PUSH 配信がゼロ (received_total=0) になっていた。
+            #
+            # 空リストに対する unregister/all は本来不要な REST 呼び出しで、
+            # それが登録シーケンス全体を落としていた。呼ばずに register へ進む。
+            # timeout を延ばすのでも、失敗を無視して進むのでもない
+            # (current_symbols がある場合は従来どおり失敗で中止する)。
+            if not current_symbols and _skip_clear_when_empty():
+                logger.warning(
+                    "[SUB MANAGER] clear_first skipped: 登録済み 0 件なので unregister/all を呼ばない "
+                    "target=%d (空リストへの PUT がタイムアウトして register 全体を中止させていた)",
+                    len(normalized_target),
+                )
+            else:
+                ok = run_unregister_all()
+                if not ok:
+                    logger.error("[SUB MANAGER] clear_first failed -> abort register abort_if_clear_failed=%s current=%d", _abort_on_clear_failure(), len(current_symbols or []))
+                    if _abort_on_clear_failure():
+                        return False
             if wait_sec > 0:
                 logger.info("[SUB MANAGER] wait after unregister all %.3fs before register size=%d", wait_sec, len(normalized_target))
                 time.sleep(wait_sec)
@@ -926,8 +1172,14 @@ def run_refresh_sequence(
                 logger.info("[SUB MANAGER] wait after unregister symbols %.3fs before register size=%d", wait_sec, len(normalized_target))
                 time.sleep(wait_sec)
 
+        st = _reg_state()
+        if st is not None:
+            st.set_requested(normalized_target, label=reason)
+
         ok, content = _register_once_with_content(normalized_target, exchange=exchange)
         if ok:
+            if st is not None:
+                st.mark_registered_confirmed(normalized_target, label=reason, source="refresh_sequence")
             return True
 
         if _is_partial_register_error(content):
@@ -936,6 +1188,8 @@ def run_refresh_sequence(
                 len(normalized_target),
                 content,
             )
+            if st is not None:
+                st.mark_registered_confirmed(normalized_target, label=reason, source="refresh_partial")
             return True
 
         if _is_register_count_error(content):
@@ -953,6 +1207,8 @@ def run_refresh_sequence(
             ok2, content2 = _register_once_with_content(normalized_target, exchange=exchange)
             logger.info("[SUB MANAGER] register retry after clear ok=%s content=%r", ok2, content2)
             if ok2:
+                if st is not None:
+                    st.mark_registered_confirmed(normalized_target, label=reason, source="count_error_retry")
                 return True
             if _is_partial_register_error(content2):
                 logger.warning(
@@ -960,15 +1216,31 @@ def run_refresh_sequence(
                     len(normalized_target),
                     content2,
                 )
+                if st is not None:
+                    st.mark_registered_confirmed(normalized_target, label=reason, source="count_error_retry_partial")
                 return True
+            if st is not None:
+                st.note_register_failed(label=reason, reason="register_count_error_retry_failed")
+            _restore_last_good_batch(f"{reason}/count_error", exchange=exchange)
             return False
 
         if _is_api_key_mismatch(content):
             logger.error("[SUB MANAGER] register failed by API key mismatch; check startup token bootstrap/settings.ini content=%r", content)
+        if st is not None:
+            st.note_register_failed(label=reason, reason=str(content)[:120])
+        # unregister は通ったのに register が落ちた = 登録 0 件の状態。
+        # 直前の正常バッチへ戻して PUSH を止めない。
+        _restore_last_good_batch(reason, exchange=exchange)
         return False
 
 
+# ats/ats_register_payload.py からも同じプロセス間ロックを取れるよう公開名を付ける。
+# (Kabu Station の register リストはセッション全体で 50 銘柄上限の共有資源なので、
+#  main.py 側の ATS 登録と push_receiver 側の rotation は同じロックで直列化する必要がある)
+registration_sequence_lock = _registration_sequence_lock
+
 __all__ = [
+    "registration_sequence_lock",
     "REGISTER_CHUNK_SIZE",
     "REGISTER_LIMIT",
     "DEFAULT_EXCHANGE",
@@ -979,3 +1251,117 @@ __all__ = [
     "run_register_chunks",
     "run_refresh_sequence",
 ]
+
+
+# ============================================================
+# 旧 core/startup/push_registration_recovery_patch._patch_register_ops を本文化。
+# 中身は監査ログのみで、戻り値は元関数のまま。
+#
+# 旧パッチは ro._http_json_request には触れない方針だった
+# (トークン処理は register_ops 側の正規実装が持つ)。その方針も変えていない。
+# _PUSH_REGISTER_RECOVERY_HTTP_DISABLED_V4 などのフラグは読み手が無いので移していない。
+#
+# 適用スコープは旧 _safe_install の allowed 集合
+# {main, main_database, push_receiver} を _prr_scope_enabled() で再現。
+# ============================================================
+
+_PRR_CONTEXTS = {"main", "main_database", "push_receiver"}
+
+
+def _prr_argv_context() -> str:
+    """core/startup/runtime_env/installer.py の _argv_context() と同一。"""
+    try:
+        text = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if "main_database.py" in text:
+            return "main_database"
+        if text.endswith("main.py") or "/main.py" in text:
+            return "main"
+        if "db_prepare_runner.py" in text:
+            return "db_prepare"
+        if "push_receiver_runner.py" in text:
+            return "push_receiver"
+        if "summary_database_runner.py" in text:
+            return "summary_database"
+        if "ranking_collector_runner.py" in text:
+            return "ranking_collector"
+        if "yahoo_complement_runner.py" in text:
+            return "yahoo_complement"
+        if "data_collectors_runner.py" in text:
+            return "main_database"
+        if text:
+            return "helper"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _prr_scope_enabled() -> bool:
+    if str(os.environ.get("DISABLE_PUSH_REGISTER_RECOVERY_PATCH", "")).strip() == "1":
+        return False
+    return _prr_argv_context() in _PRR_CONTEXTS
+
+
+def _prr_env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).replace(",", "")))
+    except Exception:
+        return int(default)
+
+
+def _prr_dedupe(items: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in items or []:
+        s = str(x or "").strip().upper()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _prr_split_ab_counts(symbols: Sequence[str]) -> tuple[int, int, list[str], list[str]]:
+    chunk = max(1, _prr_env_int("PUSH_REGISTER_CHUNK_SIZE", 50))
+    a = list(symbols or [])[:chunk]
+    b = list(symbols or [])[chunk:chunk * 2]
+    return len(a), len(b), a[:10], b[:10]
+
+
+def run_register_chunks(symbols, *args, **kwargs) -> bool:
+    if not _prr_scope_enabled():
+        return _run_register_chunks_core(symbols, *args, **kwargs)
+    target = _prr_dedupe([str(x) for x in list(symbols or [])])
+    a_count, b_count, a_head, b_head = _prr_split_ab_counts(target)
+    t0 = time.monotonic()
+    logger.warning(
+        "[PUSH REGISTER RECOVERY][REGISTER AUDIT] register_chunks start target=%s A=%s B=%s head=%s A_head=%s B_head=%s",
+        len(target), a_count, b_count, target[:10], a_head, b_head,
+    )
+    ok = _run_register_chunks_core(symbols, *args, **kwargs)
+    logger.warning(
+        "[PUSH REGISTER RECOVERY][REGISTER AUDIT] register_chunks done ok=%s elapsed=%.3fs target=%s A=%s B=%s",
+        ok, time.monotonic() - t0, len(target), a_count, b_count,
+    )
+    return ok
+
+
+def run_refresh_sequence(current_symbols, target_symbols, *args, **kwargs) -> bool:
+    if not _prr_scope_enabled():
+        return _run_refresh_sequence_core(current_symbols, target_symbols, *args, **kwargs)
+    target = _prr_dedupe([str(x) for x in list(target_symbols or [])])
+    a_count, b_count, a_head, b_head = _prr_split_ab_counts(target)
+    t0 = time.monotonic()
+    logger.warning(
+        "[PUSH REGISTER RECOVERY][REGISTER AUDIT] refresh start current=%s target=%s A=%s B=%s clear_first=%s unregister_first=%s target_head=%s A_head=%s B_head=%s",
+        len(current_symbols or []), len(target), a_count, b_count,
+        kwargs.get("clear_first"), kwargs.get("unregister_first"), target[:10], a_head, b_head,
+    )
+    ok = _run_refresh_sequence_core(current_symbols, target_symbols, *args, **kwargs)
+    logger.warning(
+        "[PUSH REGISTER RECOVERY][REGISTER AUDIT] refresh done ok=%s elapsed=%.3fs target=%s A=%s B=%s",
+        ok, time.monotonic() - t0, len(target), a_count, b_count,
+    )
+    return ok

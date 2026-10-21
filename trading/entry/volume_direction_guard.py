@@ -34,6 +34,8 @@ import time
 from typing import Any
 
 import pandas as pd
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 _RANKING_MA_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
@@ -127,15 +129,29 @@ def _close_price(row: dict) -> float:
 
 
 def _ranking_db_path() -> str:
+    # 2026-09-07: ranking DB はローカルへ移した。ここを NAS 固定にすると
+    # この経路だけ複製 (最大で複製間隔ぶん古い) を読むことになる。
     try:
-        from ats.ats_ranking.db_path import resolve_ranking_db_path
-        p = resolve_ranking_db_path()
+        from trading.ranking import ranking_db_location
+
+        return str(ranking_db_location.ranking_db_path())
+    except Exception:
+        pass
+
+    # 2026-09-08: ここは `resolve_ranking_db_path` を import していたが、
+    # その名前は ats.ats_ranking.db_path に存在せず、ImportError が
+    # 握り潰されて必ず下の NAS パスへ落ちていた (entry_from_ranking にも
+    # 同じ壊れ方があり、そちらは実害を出していた)。実在する関数に直す。
+    try:
+        from ats.ats_ranking.db_path import get_usable_ranking_db_path
+
+        p = get_usable_ranking_db_path()
         if p:
             return str(p)
     except Exception:
         pass
     today = dt.datetime.now().strftime("%Y%m%d")
-    root = os.getenv("AUTOSTOCK_ROOT", r"\\192.168.0.22\AutoStockBuyAndSell")
+    root = os.getenv("AUTOSTOCK_ROOT", nas_root())
     return os.path.join(root, "raw_data", "kabu_station", "ranking", f"ranking{today}.db")
 
 
@@ -163,7 +179,7 @@ def _ranking_snapshot_ma_from_db(symbol: str) -> dict[str, float]:
         if not db or not os.path.exists(db):
             return {}
         limit = int(max(6, _env_float("ENTRY_RANKING_MA5_LOOKBACK_ROWS", 20.0)))
-        with sqlite3.connect(db, timeout=1.0) as conn:
+        with committing_connect(db, timeout=1.0) as conn:
             table = "ranking_snapshot_1min"
             price_col = _find_price_col(conn, table)
             if not price_col:

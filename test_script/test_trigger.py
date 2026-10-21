@@ -26,7 +26,9 @@ def test_entry_pipeline_reaches_ai():
         {"symbol": "9999", "close": 1234.5, "volume": 1000}
     ])
 
-    run_entry_pipeline(source="ranking")
+    # entry_controller.run_entry_pipeline のキーワードは
+    # source -> pipeline_source へ改名済み (キーワード専用)。
+    run_entry_pipeline(pipeline_source="ranking")
 
     # ここでは「落ちない」ことだけ確認
     assert True

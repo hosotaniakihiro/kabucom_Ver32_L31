@@ -18,7 +18,10 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 import logging
+import os
 import sqlite3
+import threading
+import time
 from typing import Any
 
 from sqlalchemy import create_engine, text
@@ -55,6 +58,10 @@ _Session_ranking = None
 _Session_tosama = None
 
 _initialized = False
+
+# 旧 fast_startup_runtime_patch が _bootstrap_summary_schema を no-op へ
+# 差し替えていたのと同じ効果。apply_fast_startup_schema_skip() で True になる。
+_SKIP_SUMMARY_SCHEMA_BOOTSTRAP = False
 
 push_engine = None
 summary_engine = None
@@ -165,23 +172,226 @@ def _best_effort_configure_existing_db(path: Path) -> None:
 # RUNTIME PRAGMA
 # ============================================================
 
+def _conn_cache_size():
+    """接続ごとの cache_size。既定では設定しない (None)。
+
+    ENGINE_KWARGS は poolclass=NullPool なので、接続はクエリごとに作られて
+    すぐ捨てられる。そこで cache_size=-50000 (=50MB) を確保しても
+    一度も再利用されないまま解放される。
+    NAS(SMB) 越しではこれが MaxCmds=50 を飽和させ、
+    sqlite3.OperationalError: disk I/O error の直接原因になっていた
+    (2026-08-26 のログで disk I/O error 100 件中 90 件がこの行)。
+    """
+    v = os.getenv("SQLITE_CONN_CACHE_SIZE")
+    if v is None or str(v).strip() == "":
+        return None
+    try:
+        return int(float(str(v).strip()))
+    except Exception:
+        logger.warning("[DB PRAGMA] SQLITE_CONN_CACHE_SIZE を解釈できない: %r", v)
+        return None
+
+
+def _pragma_failsafe() -> bool:
+    """重要 PRAGMA の失敗時に接続を捨てるか。既定 True (握り潰さない)。"""
+    v = os.getenv("SQLITE_PRAGMA_FAILSAFE")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _pragma_strict_all() -> bool:
+    """全 PRAGMA を重要扱いにするか (以前の挙動)。既定 False。"""
+    v = os.getenv("SQLITE_PRAGMA_STRICT_ALL")
+    if v is None or str(v).strip() == "":
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# データ整合性に効く PRAGMA だけを「重要」とする。
+# 他は性能・耐久性のチューニングで、失敗しても接続自体は使える。
+# 失敗のたびに接続を捨てて再接続すると、NAS 越しでは
+# 毎分 100 件超のリトライストームになり fd を食い潰す (2026-08-27 実測)。
+_CRITICAL_PRAGMAS = frozenset({"foreign_keys"})
+
+
+def _pragma_is_critical(name: str) -> bool:
+    if _pragma_strict_all():
+        return True
+    return str(name or "") in _CRITICAL_PRAGMAS
+
+
+def _pragma_log_first() -> int:
+    try:
+        return max(1, int(float(os.getenv("SQLITE_PRAGMA_LOG_FIRST", "5"))))
+    except Exception:
+        return 5
+
+
+def _pragma_log_every() -> int:
+    try:
+        return max(1, int(float(os.getenv("SQLITE_PRAGMA_LOG_EVERY", "200"))))
+    except Exception:
+        return 200
+
+
+_PRAGMA_FAIL_COUNTS: dict = {}
+_PRAGMA_FAIL_LOCK = threading.Lock()
+
+
+def _pragma_should_log(db_path: str, pragma: str) -> tuple:
+    """(出すか, 累計件数) を返す。
+
+    同じ (db, pragma) の ERROR を 3,355 行も NAS 上のログへ書くこと自体が
+    NAS の負荷になっていたため間引く。ただし累計件数は必ず添える。
+    """
+    key = (str(db_path), str(pragma))
+    with _PRAGMA_FAIL_LOCK:
+        n = _PRAGMA_FAIL_COUNTS.get(key, 0) + 1
+        _PRAGMA_FAIL_COUNTS[key] = n
+    if n <= _pragma_log_first():
+        return True, n
+    if n % _pragma_log_every() == 0:
+        return True, n
+    return False, n
+
+
+def pragma_failure_snapshot() -> dict:
+    """診断用: (db, pragma) ごとの失敗累計。"""
+    with _PRAGMA_FAIL_LOCK:
+        return {"%s|%s" % k: v for k, v in _PRAGMA_FAIL_COUNTS.items()}
+
+
+def mark_engine_readonly(engine) -> None:
+    """このエンジンを読み取り専用として扱う。
+
+    読み取り接続に synchronous / foreign_keys を投げても意味が無く、
+    NAS 越しでは失敗するだけコストになる。
+    """
+    try:
+        engine._sqlite_readonly = True
+    except Exception:
+        logger.debug("[DB PRAGMA] mark_engine_readonly failed", exc_info=True)
+
+
+# ============================================================
+# P0-6: 接続の実数を数える
+# ------------------------------------------------------------
+# NullPool なのでクエリごとに接続が作られる。SQLAlchemy の pool
+# メトリクス (checkedin/checkedout) は NullPool では意味を持たないため、
+# connect / close イベントを直接数えて「今 NAS へ何本開いているか」を出す。
+# outstanding が単調増加したら接続リーク。
+# ============================================================
+
+_ENGINE_CONN_STATS: dict = {}
+_ENGINE_CONN_LOCK = threading.Lock()
+
+
+def _conn_stat_bump(db_path: str, key: str) -> None:
+    with _ENGINE_CONN_LOCK:
+        d = _ENGINE_CONN_STATS.setdefault(db_path, {"opened": 0, "closed": 0, "peak_outstanding": 0})
+        d[key] = d.get(key, 0) + 1
+        out = d["opened"] - d["closed"]
+        if out > d["peak_outstanding"]:
+            d["peak_outstanding"] = out
+
+
+def connection_stats() -> dict:
+    """DB ごとの接続 opened / closed / outstanding / peak。"""
+    with _ENGINE_CONN_LOCK:
+        out = {}
+        for path, d in _ENGINE_CONN_STATS.items():
+            name = str(path).rsplit("\\", 1)[-1].rsplit("/", 1)[-1] or path
+            out[name] = {
+                "opened": d.get("opened", 0),
+                "closed": d.get("closed", 0),
+                "outstanding": d.get("opened", 0) - d.get("closed", 0),
+                "peak_outstanding": d.get("peak_outstanding", 0),
+            }
+        return out
+
+
 def _attach_runtime_pragmas(engine) -> None:
     from sqlalchemy import event
 
     if getattr(engine, "_pragma_attached", False):
         return
 
+    db_path = str(getattr(getattr(engine, "url", None), "database", "") or "")
+
+    @event.listens_for(engine, "close")
+    def _on_close(dbapi_connection, connection_record):  # noqa: ANN001, ARG001
+        _conn_stat_bump(db_path, "closed")
+
+    @event.listens_for(engine, "close_detached")
+    def _on_close_detached(dbapi_connection):  # noqa: ANN001
+        _conn_stat_bump(db_path, "closed")
+
     @event.listens_for(engine, "connect")
     def set_sqlite_pragma(dbapi_connection, connection_record):  # noqa: ANN001, ARG001
+        _conn_stat_bump(db_path, "opened")
+        t0 = time.perf_counter()
         cursor = dbapi_connection.cursor()
+        readonly = bool(getattr(engine, "_sqlite_readonly", False))
+
+        # 永続するのは journal_mode(WAL) だけ。
+        # synchronous / foreign_keys は接続ごとの設定で、
+        # 設定しないと FULL / OFF に戻る (実測確認済み)。
+        # ただし読み取り専用エンジンには書き込み系を投げない。
+        plan = [("busy_timeout", f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};"),
+                ("temp_store", "PRAGMA temp_store=MEMORY;")]
+        if not readonly:
+            plan.append(("synchronous", f"PRAGMA synchronous={SQLITE_SYNCHRONOUS};"))
+            plan.append(("foreign_keys", "PRAGMA foreign_keys=ON;"))
+        # cache_size だけは既定で設定しない。
+        # NullPool では接続が使い捨てなので 50MB のページキャッシュは
+        # 一度も再利用されず、SMB(MaxCmds=50) を飽和させて
+        # disk I/O error の直接原因になっていた。
+        cs = _conn_cache_size()
+        if cs is not None:
+            plan.append(("cache_size", f"PRAGMA cache_size={int(cs)};"))
+
         try:
-            cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
-            cursor.execute("PRAGMA temp_store=MEMORY;")
-            cursor.execute(f"PRAGMA cache_size={SQLITE_CACHE_SIZE};")
-            cursor.execute(f"PRAGMA synchronous={SQLITE_SYNCHRONOUS};")
-            cursor.execute("PRAGMA foreign_keys=ON;")
+            for pragma, sql in plan:
+                try:
+                    cursor.execute(sql)
+                except Exception as e:
+                    critical = _pragma_is_critical(pragma)
+                    should_log, total = _pragma_should_log(db_path, pragma)
+                    if should_log:
+                        # 握り潰さない。DB 名・pragma・thread・elapsed・例外を必ず出す。
+                        logger.error(
+                            "[DB PRAGMA] failed db=%s pragma=%s thread=%s conn_id=%s "
+                            "elapsed=%.3fs critical=%s fail_count=%d readonly=%s err=%r",
+                            db_path or "<unknown>", pragma,
+                            threading.current_thread().name, id(dbapi_connection),
+                            time.perf_counter() - t0, critical, total, readonly, e,
+                        )
+                        # P0-6: 原因を推測しないため、直前 5 秒の資源状況を必ず添える。
+                        # disk I/O error は positions.db 固有ではなく、
+                        # プロセス全体のハンドル枯渇の症状として出ることがある。
+                        try:
+                            from core.diagnostics.resource_monitor import (
+                                log_io_error_chronology,
+                            )
+
+                            log_io_error_chronology(
+                                "DB PRAGMA %s db=%s" % (pragma, db_path or "<unknown>"), e
+                            )
+                        except Exception:
+                            logger.debug("[DB PRAGMA] chronology unavailable", exc_info=True)
+                    if critical and _pragma_failsafe():
+                        # データ整合性に関わる PRAGMA が効いていない接続は使わせない
+                        raise
+                    # 非重要 PRAGMA は接続を捨てない。
+                    # 捨てて再接続を繰り返すと NAS 越しでリトライストームになり、
+                    # fd を食い潰して Too many open files を招く。
         finally:
-            cursor.close()
+            try:
+                cursor.close()
+            except Exception:
+                logger.debug("[DB PRAGMA] cursor close failed db=%s",
+                             db_path or "<unknown>", exc_info=True)
 
     engine._pragma_attached = True
 
@@ -372,8 +582,35 @@ def _ensure_column(
         return False
 
 
+def _fss_env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+def apply_fast_startup_schema_skip() -> bool:
+    """旧 fast_startup_runtime_patch._patch_summary_schema_bootstrap() の本文化。
+
+    旧パッチは _bootstrap_summary_schema を no-op 関数へ差し替えていたが、
+    ここでは同じ効果をフラグで表現する。呼び出し元は main.py の
+    _install_main_runtime_patches のみ (= 旧 install 導線と同じスコープ)。
+    FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP=0 で従来どおり補完させられる
+    (旧パッチも同じ env で無効化できた)。
+    """
+    global _SKIP_SUMMARY_SCHEMA_BOOTSTRAP
+    if not _fss_env_bool("FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP", True):
+        return False
+    _SKIP_SUMMARY_SCHEMA_BOOTSTRAP = True
+    logger.warning("[SCHEMA BOOTSTRAP] summary schema bootstrap disabled (fast startup)")
+    return True
+
+
 def _bootstrap_summary_schema(engine) -> None:
     """起動時に summary DB の不足列を database/models.py から補完する。"""
+    if _SKIP_SUMMARY_SCHEMA_BOOTSTRAP:
+        return
+
     model_columns = _summary_model_columns()
     targets = tuple(model_columns.keys()) or SUMMARY_TARGET_TABLES
 
@@ -461,10 +698,32 @@ def init_engines() -> None:
     _Session_summary = sessionmaker(bind=_summary_engine)
 
     position_path = get_path("runtime_positions") / "positions.db"
+    # 2026-09-16: positions.db はローカルに書いて NAS/OneDrive へ複製する
+    #   (trading/position/positions_db_location.py)。NAS の SMB 劣化で開けなくなり
+    #   建玉の記録・保護・決済側の参照が落ちたため。ローカルに無ければ NAS から引き継ぐ。
+    try:
+        from trading.position import positions_db_location as _pdl
+        if _pdl.local_staging_enabled():
+            _pdl.bootstrap_local_from_nas()
+            position_path = _pdl.positions_db_path()
+            _pdl.start_background_sync()
+    except Exception:
+        logger.exception("[POSITION] local staging setup failed; use NAS path")
     _position_engine = _build_engine(position_path, Base_position, "POSITION")
     _Session_position = sessionmaker(bind=_position_engine)
 
     ranking_path = get_path("raw_ranking") / f"ranking{today}.db"
+    # 2026-09-16: ranking DB は 9/7 からローカル (LOCALAPPDATA/autostock/ranking) が正で
+    #   NAS (X:) は複製。ここだけ X: を向いたままで、起動時の build_monitor_symbols
+    #   (ranking_snapshot_1min を datetime desc で読む) が X: の遅延で 10 分以上止まり、
+    #   main.py が起動できなかった (14:16〜14:30 実測)。ローカルにあればそれを使う。
+    try:
+        from trading.ranking.ranking_db_location import ranking_db_path as _local_ranking_db_path
+        _lp = _local_ranking_db_path()
+        if _lp and _lp.exists():
+            ranking_path = _lp
+    except Exception:
+        logger.debug("[RANKING] local ranking db path resolve failed; use raw_ranking", exc_info=True)
     _ranking_engine = _build_engine(ranking_path, Base_ranking, "RANKING")
     _Session_ranking = sessionmaker(bind=_ranking_engine)
 

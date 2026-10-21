@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -221,33 +222,75 @@ def _read_one_table(conn: sqlite3.Connection, table: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def read_ranking_df_from_db(path: str) -> Tuple[pd.DataFrame, List[str]]:
+def _connect_ranking_readonly(path: str) -> sqlite3.Connection:
+    """ranking DB を読み取り専用で開く。呼び出し側が必ず close すること。
+
+    ranking DB は NAS 上にあり ranking_collector が毎分書き込む。
+    ここは純粋な読み取りなので、書き込みロックを取らない read-only で開き、
+    短時間のロックは busy_timeout で待つ。
+    `with sqlite3.connect(...)` は commit するだけで close しないため使わない。
+    """
+    timeout_sec = _env_float("RANKING_SOURCE_SQLITE_TIMEOUT_SEC", 5.0)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout_sec)
+    try:
+        conn.execute(f"PRAGMA busy_timeout={int(timeout_sec * 1000)}")
+    except Exception:
+        logger.debug("[SUB MANAGER] busy_timeout set failed path=%s", path, exc_info=True)
+    return conn
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return max(0.5, float(v))
+    except Exception:
+        return float(default)
+
+
+def _read_ranking_df_from_db_core(path: str) -> Tuple[pd.DataFrame, List[str]]:
     read_tables: List[str] = []
 
+    # read-only 接続はDBを新規作成しないため、存在しない場合は
+    # "unable to open database file" になる。従来は空DBが作られて
+    # 静かに空を返していたので、ここで同じ挙動に揃える。
+    if not path or not os.path.exists(path):
+        logger.debug("[SUB MANAGER] ranking db not found path=%s", path)
+        return pd.DataFrame(), []
+
+    conn = None
     try:
-        with sqlite3.connect(path, timeout=30) as conn:
-            tables = _detect_read_tables(conn)
-            if not tables:
-                return pd.DataFrame(), []
+        conn = _connect_ranking_readonly(path)
+        tables = _detect_read_tables(conn)
+        if not tables:
+            return pd.DataFrame(), []
 
-            frames: List[pd.DataFrame] = []
-            for table in tables:
-                one = _read_one_table(conn, table)
-                if one.empty:
-                    continue
+        frames: List[pd.DataFrame] = []
+        for table in tables:
+            one = _read_one_table(conn, table)
+            if one.empty:
+                continue
 
-                frames.append(one)
-                read_tables.append(table)
+            frames.append(one)
+            read_tables.append(table)
 
-            if not frames:
-                return pd.DataFrame(), read_tables
+        if not frames:
+            return pd.DataFrame(), read_tables
 
-            df = pd.concat(frames, ignore_index=True, sort=False)
-            return df, read_tables
+        df = pd.concat(frames, ignore_index=True, sort=False)
+        return df, read_tables
 
     except Exception:
         logger.exception("[SUB MANAGER] ranking read failed path=%s", path)
         return pd.DataFrame(), read_tables
+
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("[SUB MANAGER] ranking db close failed path=%s", path, exc_info=True)
 
 
 def _category_text_from_type_value(v: Any) -> str:
@@ -767,3 +810,21 @@ def select_subscription_symbols_from_ranking_df(
     )
 
     return result[:limit]
+
+
+# ============================================================
+# NAS/SMB sqlite I/O ガード (旧 core/startup/nas_sqlite_io_guard_patch.py)
+# ============================================================
+
+def read_ranking_df_from_db(path: str) -> Tuple[pd.DataFrame, List[str]]:
+    from utils import nas_sqlite_io_guard as _guard
+
+    if path and _guard.is_bad(path):
+        logger.warning("[NAS SQLITE IO GUARD] skip ranking_source_selector bad path=%s", path)
+        return pd.DataFrame(), []
+    try:
+        return _read_ranking_df_from_db_core(path)
+    except Exception as e:
+        if _guard.handle_error(path, e):
+            return pd.DataFrame(), []
+        raise

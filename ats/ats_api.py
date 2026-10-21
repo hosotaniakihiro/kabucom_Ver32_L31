@@ -11,10 +11,10 @@ import json
 import logging
 import time
 import urllib.error
-import urllib.request
 from typing import Optional
 
 from global_state import global_data
+from kabu_api import kabu_http
 
 logger = logging.getLogger(__name__)
 
@@ -54,21 +54,17 @@ def request_api_put(path: str, payload_obj: dict | None, timeout: int = 8):
         logger.warning("[ATS API] skipped in 429 cooldown path=%s", path)
         return False, 429, "cooldown"
 
-    data = None
-    if payload_obj is not None:
-        data = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
-
-    req = urllib.request.Request(
-        f"{API_BASE}{path}",
-        data=data,
-        method="PUT",
-        headers=headers,
-    )
-
+    # urllib.request は "Connection: close" を送り、kabu Station は応答を
+    # 返さない (詳細は kabu_api/kabu_http.py)。ATS も同じ localhost:18080 宛。
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            body = res.read().decode("utf-8", errors="ignore")
-            return True, getattr(res, "status", 200), body
+        status, body = kabu_http.request_text(
+            f"{API_BASE}{path}",
+            method="PUT",
+            payload=payload_obj,
+            headers=headers,
+            timeout=timeout,
+        )
+        return True, status, body
 
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")

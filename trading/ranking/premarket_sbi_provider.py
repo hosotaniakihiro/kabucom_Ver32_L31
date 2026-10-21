@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +46,11 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 DEFAULT_SBI_PREMARKET_DIR = (
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\SBI\SBI_yorimae_ranking"
+    nas_path(r"raw_data\SBI\SBI_yorimae_ranking")
 )
 
 DEFAULT_SYMBOL_FLAGS_DB = (
-    r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db"
+    nas_path(r"Basic\symbol_flags.db")
 )
 
 RISE_KEYWORDS: Tuple[str, ...] = (

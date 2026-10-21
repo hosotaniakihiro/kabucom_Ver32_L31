@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+import time
 from typing import Any, Optional
 
 import pandas as pd
@@ -41,7 +43,37 @@ DEFAULT_MIN_VOLUME = 1.0
 DEFAULT_MIN_PRICE = 200.0
 DEFAULT_MIN_BUY_SLOPE = 0.01
 DEFAULT_MAX_SELL_SLOPE = -0.01
-VERSION = "REV2.6-SUMMARY-1M-MOVEMENT-SCORE-BRIDGE-STRONG"
+VERSION = "REV2.7-SUMMARY-1M-MOVEMENT-SCORE-BRIDGE-STRONG-RANGE-PCT-PERCENT"
+
+# range_pct 系の列はすべて percent 単位 (1.88% = 1.88)。
+# 単位の定義は trading/entry/summary_ai/range_defs.py と揃えること。
+RANGE_PCT_SCALE = 100.0
+RANGE_PCT_RATIO_HINT = 1.0
+
+# 旧 tonosama_history_failclose_strict_patch._patch_summary_ai() の定数表。
+STRICT_CANDIDATE_CONSTANTS: dict[str, float] = {
+    "DEFAULT_MIN_BUY_SCORE": 3.0,
+    "DEFAULT_MAX_SELL_SCORE": 3.0,
+    "DEFAULT_MIN_BUY_SLOPE": 0.0,
+    "DEFAULT_MAX_SELL_SLOPE": 0.0,
+}
+
+
+def apply_strict_candidate_constants() -> dict[str, tuple[Any, Any]]:
+    """旧 tonosama_history_failclose_strict_patch._patch_summary_ai() の定数部を本文化。
+
+    core/startup/strict_entry_defaults.py が install 時と watcher から毎秒呼ぶ。
+    これらは関数シグネチャの既定値としても使われるが、既定値は import 時に
+    束縛済みなので、実効があるのは実行時に globals() を読む経路
+    (_resolve_min_buy_slope / _resolve_max_sell_slope など) 側。
+    """
+    changed: dict[str, tuple[Any, Any]] = {}
+    for name, value in STRICT_CANDIDATE_CONSTANTS.items():
+        old = globals().get(name)
+        if old != value:
+            globals()[name] = value
+            changed[name] = (old, value)
+    return changed
 
 
 def _env_float(name: str, default: float) -> float:
@@ -249,7 +281,11 @@ def _movement_score_fallback(out: pd.DataFrame, final_buy: pd.Series, final_sell
         open_valid = open_.where(open_ > 0, close)
         co_pct = ((close - open_valid) / open_valid.where(open_valid > 0, 1.0)).fillna(0.0)
         hl_pct = ((high - low) / safe_close).where((high > 0) & (low > 0) & (high >= low), 0.0).fillna(0.0)
-        range_pct = _max_series(hl_pct.abs(), range_pct_col.abs())
+        # range_pct 列は percent 単位 (2026-09-01 に統一)。
+        # ここから下の内部計算は比率 (0-1) なので 100 で割って揃える。
+        # 割らずに混ぜると raw_strength が 100 倍になり、
+        # movement_ok が常に True になって低変動ガードが効かなくなる。
+        range_pct = _max_series(hl_pct.abs(), (range_pct_col.abs() / RANGE_PCT_SCALE))
         atr_pct = (atr.abs() / safe_close).fillna(0.0)
         macd_diff = ((macd - signal) / safe_close).fillna(0.0)
 
@@ -388,7 +424,7 @@ def _apply_score_config_flags(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
+def attach_display_like_columns_core(df: pd.DataFrame) -> pd.DataFrame:
     out = safe_df(df)
     if out.empty:
         return out
@@ -437,6 +473,284 @@ def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
             logger.debug("[SUMMARY AI CANDIDATES] datetime normalize failed", exc_info=True)
     out = _apply_score_config_flags(out)
     return out.reset_index(drop=True)
+
+
+# ============================================================
+# SUMMARY AI candidate zero-score rescue
+#   旧 core/startup/summary_ai_liquidity_rescue_patch.py の後半 (V1)
+# ------------------------------------------------------------
+# score が全ゼロ / slope が全ゼロのとき、候補抽出そのものが成立しなくなる。
+# MTF + 現在足方向 + MACD方向 + レンジから候補抽出用のスコアと疑似 slope を
+# 作って、抽出だけは通るようにする。実売買の判定は後段ガードが行う。
+#
+# 旧パッチは sitecustomize の SUMMARY_AI_RESCUE_PATCHES = opt-in グループ
+# (既定 OFF) で install されていた。そのスコープを再現する。
+# ============================================================
+_ZERO_SCORE_RESCUE_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+_ZERO_SCORE_RESCUE_DB_PROCESS_ENVS = (
+    "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+    "AUTOSTOCK_SUMMARY_DB_WRITER",
+    "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+    "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+)
+
+
+def _zero_score_rescue_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _zero_score_rescue_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _zero_score_rescue_scope_enabled() -> bool:
+    """このプロセスでゼロスコア救済を使うか。
+
+    旧パッチは SUMMARY_AI_RESCUE_PATCHES (opt-in、既定 OFF) 経由で、
+    main lite の background loop か SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1 の
+    ときだけ install されていた。
+    SUMMARY_AI_ZERO_SCORE_RESCUE_SCOPE_ENABLED=1/0 で明示上書きできる。
+    """
+    try:
+        raw = os.getenv("SUMMARY_AI_ZERO_SCORE_RESCUE_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _zero_score_rescue_env_bool("SUMMARY_AI_ZERO_SCORE_RESCUE_SCOPE_ENABLED", False)
+        if str(os.environ.get("DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH", "")).strip() == "1":
+            return False
+        if not (
+            _zero_score_rescue_env_bool("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES", False)
+            or _zero_score_rescue_env_bool("SITECUSTOMIZE_ENABLE_SUMMARY_AI_RESCUE_PATCHES", False)
+        ):
+            return False
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_list)
+        if any(name in argv for name in _ZERO_SCORE_RESCUE_DB_PROCESS_NAMES):
+            return False
+        if any(_zero_score_rescue_env_bool(name, False) for name in _ZERO_SCORE_RESCUE_DB_PROCESS_ENVS):
+            return False
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv_list) and _zero_score_rescue_env_bool("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _zero_score_rescue_env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _apply_zero_score_rescue(out: pd.DataFrame) -> pd.DataFrame:
+    if not _zero_score_rescue_env_bool("SUMMARY_AI_ZERO_SCORE_RESCUE_ENABLED", True):
+        return out
+    try:
+        import numpy as np
+
+        if out is None or not isinstance(out, pd.DataFrame) or out.empty:
+            return out
+
+        work = out.copy()
+
+        def num(col: str, default: float = 0.0):
+            if col in work.columns:
+                return pd.to_numeric(work[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+            return pd.Series(default, index=work.index, dtype="float64")
+
+        buy = num("ai_disp_buy_score")
+        sell = num("ai_disp_sell_score").abs()
+        slope = num("ai_disp_slope")
+        close = num("ai_disp_close")
+        volume = num("ai_disp_volume")
+        turnover = num("ai_disp_turnover")
+        open_px = num("open", np.nan)
+        if open_px.isna().all():
+            open_px = num("open_price", np.nan)
+        high = num("high", np.nan)
+        if high.isna().all():
+            high = num("high_price", np.nan)
+        low = num("low", np.nan)
+        if low.isna().all():
+            low = num("low_price", np.nan)
+        mtf = num("ai_disp_mtf")
+        macd = num("ai_disp_macd")
+        sig = num("ai_disp_signal")
+
+        min_vol = _zero_score_rescue_env_float("SUMMARY_AI_ZERO_SCORE_RESCUE_MIN_VOLUME", 3000.0)
+        min_turnover = _zero_score_rescue_env_float("SUMMARY_AI_ZERO_SCORE_RESCUE_MIN_TURNOVER", 1000000.0)
+        min_score = _zero_score_rescue_env_float("SUMMARY_AI_ZERO_SCORE_RESCUE_MIN_SCORE", 4.1)
+
+        liquid = (volume >= min_vol) | (turnover >= min_turnover)
+        price_ok = close > 0
+        delta_pct = ((close - open_px) / open_px.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        range_pct = ((high - low) / close.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        macd_bias = (macd - sig).fillna(0.0)
+
+        # score が全ゼロなら、MTF + 現在足方向 + MACD方向 + レンジを候補抽出用スコアへ変換する。
+        score_all_zero = float(buy.abs().sum() + sell.abs().sum()) <= 0.000001
+        if score_all_zero:
+            buy_dir = liquid & price_ok & ((delta_pct > 0) | (macd_bias > 0))
+            sell_dir = liquid & price_ok & ((delta_pct < 0) | (macd_bias < 0))
+            base_strength = mtf.clip(lower=0.0) + range_pct.clip(lower=0.0, upper=3.0) + macd_bias.abs().clip(lower=0.0, upper=2.0)
+            rescued_buy = base_strength.where(buy_dir, 0.0).clip(lower=0.0)
+            rescued_sell = base_strength.where(sell_dir, 0.0).clip(lower=0.0)
+            rescued_buy = rescued_buy.where(rescued_buy <= 0.0, rescued_buy.clip(lower=min_score))
+            rescued_sell = rescued_sell.where(rescued_sell <= 0.0, rescued_sell.clip(lower=min_score))
+            work["ai_disp_buy_score"] = rescued_buy
+            work["ai_disp_sell_score"] = rescued_sell
+            work["score_buy"] = rescued_buy
+            work["buy_score"] = rescued_buy
+            work["score_sell"] = rescued_sell
+            work["sell_score"] = rescued_sell
+            work["score_total"] = rescued_buy - rescued_sell
+            work["total_score"] = work["score_total"]
+            work["final_score"] = work["score_total"]
+            work["display_score"] = work["score_total"]
+            work["ai_disp_total_score"] = work["score_total"]
+            work["ai_disp_final_score"] = work["score_total"]
+
+        # slope が全ゼロなら、同じ足の OHLC から候補抽出用の疑似slopeを作る。
+        slope_all_zero = float(slope.abs().sum()) <= 0.000001
+        if slope_all_zero:
+            pseudo_slope = delta_pct.where(delta_pct.abs() > 0.0, macd_bias / 10.0)
+            work["ai_disp_slope"] = pseudo_slope
+            if "slope" in work.columns:
+                work["slope"] = pseudo_slope
+            if "slope_atr_scaled" in work.columns:
+                work["slope_atr_scaled"] = pseudo_slope
+            if "score_slope" in work.columns:
+                work["score_slope"] = pseudo_slope
+
+        if score_all_zero or slope_all_zero:
+            try:
+                rb = pd.to_numeric(work.get("ai_disp_buy_score", 0.0), errors="coerce").fillna(0.0)
+                rs = pd.to_numeric(work.get("ai_disp_sell_score", 0.0), errors="coerce").fillna(0.0)
+                ps = pd.to_numeric(work.get("ai_disp_slope", 0.0), errors="coerce").fillna(0.0)
+                logger.warning(
+                    "[SUMMARY AI ZERO SCORE RESCUE] applied rows=%s score_all_zero=%s slope_all_zero=%s buy_pos=%s sell_pos=%s slope_nonzero=%s min_vol=%s min_turnover=%s",
+                    len(work), score_all_zero, slope_all_zero,
+                    int((rb > 0).sum()), int((rs > 0).sum()), int((ps.abs() > 0).sum()),
+                    min_vol, min_turnover,
+                )
+            except Exception:
+                pass
+
+        return work.reset_index(drop=True)
+    except Exception:
+        logger.exception("[SUMMARY AI ZERO SCORE RESCUE] failed; returning original dataframe")
+        return out
+
+
+# ============================================================
+# range_pct 補修
+# (旧 core/startup/summary_ai_more_candidates_patch._install_range_pct_repair_patch)
+# ------------------------------------------------------------
+# 1分足の high/low が close と同値へ潰れていても、day_high/day_low や
+# 始値-終値から実レンジを復元して range_pct 系の列へ書き戻す。
+# これが無いと SUMMARY AI LOW MOVE PREFILTER が range_pct=0 だけを見て
+# 候補を大量に落としてしまう。低変動ガード自体は緩めない。
+#
+# 旧パッチは attach_display_like_columns を外から包んでいたが、
+# 同じ属性を奪い合う相手が居ないので本体末尾へ畳んだ。
+# ============================================================
+
+_RANGE_PCT_REPAIR_VERSION = "Ver1.8-SUMMARY-AI-APPROVED-ROW-RANGE-REPAIR"
+
+
+def _rpr_series(df: pd.DataFrame, names: tuple[str, ...], default: float = 0.0):
+    for name in names:
+        try:
+            if name in df.columns:
+                return pd.to_numeric(df[name], errors="coerce").fillna(default).astype(float)
+        except Exception:
+            continue
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
+def _rpr_percent(s):
+    """既存の range_pct 系列を percent 単位へ正規化する (入力境界で 1 回だけ)。
+
+    range_pct は percent 単位 (1.88% = 1.88) に統一した。
+    古い比率表記 (0.0188) が残っている場合だけ 100 倍して揃える。
+    実務上 1% 未満の値幅は「比率で書かれた古い値」か
+    「本当に 1% 未満」かの区別が付かないため、
+    0 < v < RANGE_PCT_RATIO_HINT のときだけ比率とみなす。
+    """
+    ss = pd.to_numeric(s, errors="coerce").fillna(0.0).astype(float).abs()
+    return ss.mask((ss > 0.0) & (ss < RANGE_PCT_RATIO_HINT), ss * RANGE_PCT_SCALE)
+
+
+# 後方互換 alias (旧名で参照している箇所があっても壊さない)
+_rpr_fraction = _rpr_percent
+
+
+def _repair_range_pct_columns(out: pd.DataFrame) -> pd.DataFrame:
+    if not _env_bool("SUMMARY_AI_RANGE_PCT_REPAIR_ENABLED", True):
+        return out
+    try:
+        if not isinstance(out, pd.DataFrame) or out.empty:
+            return out
+        close = _rpr_series(out, ("close", "close_price", "current_price", "price", "last_price", "ai_disp_close"), 0.0)
+        safe_close = close.where(close > 0, 1.0)
+        existing = _rpr_percent(_rpr_series(out, ("range_pct", "intraday_range_pct", "day_range_pct", "summary_ai_movement_range_pct"), 0.0))
+
+        high = _rpr_series(out, ("high",), 0.0)
+        low = _rpr_series(out, ("low",), 0.0)
+        bar_rng = ((high - low) / safe_close * RANGE_PCT_SCALE).where((high > 0) & (low > 0) & (high >= low), 0.0).abs().fillna(0.0)
+
+        day_high = _rpr_series(out, ("day_high", "today_high", "intraday_high", "session_high", "high_price", "high_price_day", "range_high"), 0.0)
+        day_low = _rpr_series(out, ("day_low", "today_low", "intraday_low", "session_low", "low_price", "low_price_day", "range_low"), 0.0)
+        day_rng = ((day_high - day_low) / safe_close * RANGE_PCT_SCALE).where((day_high > 0) & (day_low > 0) & (day_high >= day_low), 0.0).abs().fillna(0.0)
+
+        open_ = _rpr_series(out, ("opening_price", "open_price", "open", "day_open"), 0.0)
+        open_rng = ((close - open_) / safe_close * RANGE_PCT_SCALE).where((open_ > 0) & (close > 0), 0.0).abs().fillna(0.0)
+
+        repaired = pd.concat([existing, bar_rng, day_rng, open_rng], axis=1).max(axis=1).fillna(0.0).astype(float)
+        improved = repaired > (existing + 1e-12)
+        if bool(improved.any()):
+            out = out.copy()
+            out["range_pct"] = repaired
+            out["intraday_range_pct"] = repaired
+            out["day_range_pct"] = repaired
+            out["ai_disp_range_pct"] = repaired
+            try:
+                samples = out.loc[improved, [c for c in ("symbol", "close", "close_price", "current_price", "high", "low", "high_price", "low_price", "day_high", "day_low", "open", "open_price", "range_pct") if c in out.columns]].head(12).to_dict(orient="records")
+            except Exception:
+                samples = []
+            logger.warning(
+                "[SUMMARY AI RANGE PCT REPAIR] repaired rows=%s before_pos=%s after_pos=%s max=%.6f samples=%s version=%s",
+                int(improved.sum()),
+                int((existing > 0).sum()),
+                int((repaired > 0).sum()),
+                float(repaired.max()) if len(repaired) else 0.0,
+                samples,
+                _RANGE_PCT_REPAIR_VERSION,
+            )
+        return out
+    except Exception:
+        logger.exception("[SUMMARY AI RANGE PCT REPAIR] repair failed; return original")
+        return out
+
+
+def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = attach_display_like_columns_core(df)
+    if _zero_score_rescue_scope_enabled():
+        out = _apply_zero_score_rescue(out)
+    return _repair_range_pct_columns(out)
 
 
 def filter_common_stock_rows(df: pd.DataFrame, *, require_buy_target: bool = False, exclude_etf_fund: bool = True, allowed_market_types: Optional[set[str]] = None) -> pd.DataFrame:
@@ -524,18 +838,82 @@ def _filter_fresh_candidate_rows(df: pd.DataFrame) -> pd.DataFrame:
         return out.reset_index(drop=True)
 
 
+def _keep_latest_slot_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
+    """銘柄ごとの最新 datetime の行だけ残す (同着は全部残す)。
+
+    AI へ渡すのは銘柄あたり 1 行なので、履歴全体に重い列生成をかける
+    必要が無い。実測で 55,131 行 -> 数千行になり 75〜92 秒が消える。
+    同一 datetime の行は残すので、dedupe_one_row_per_symbol の
+    _ai_quality によるタイブレーク結果は変わらない。
+    """
+    out = safe_df(df)
+    if out.empty or "symbol" not in out.columns or "datetime" not in out.columns:
+        return out
+    if not _env_bool("SUMMARY_AI_CANDIDATE_LATEST_ONLY", True):
+        return out
+    before = len(out)
+    t0 = time.perf_counter()
+    try:
+        ts = pd.to_datetime(out["datetime"], errors="coerce")
+        try:
+            ts = ts.dt.tz_localize(None)
+        except Exception:
+            pass
+        work = out.copy()
+        work["_slot_dt"] = ts
+        valid = work[work["_slot_dt"].notna()]
+        if valid.empty:
+            logger.warning(
+                "[SUMMARY AI CANDIDATES] latest-slot trim skipped reason=datetime全欠損 rows=%s", before,
+            )
+            return out
+        mx = valid.groupby("symbol")["_slot_dt"].transform("max")
+        kept = valid[valid["_slot_dt"] == mx].drop(columns=["_slot_dt"])
+        # datetime が欠損している行は判定できないので落とさず残す
+        na_rows = work[work["_slot_dt"].isna()].drop(columns=["_slot_dt"])
+        if not na_rows.empty:
+            kept = pd.concat([kept, na_rows], ignore_index=True, sort=False)
+        kept = kept.reset_index(drop=True)
+    except Exception:
+        logger.exception("[SUMMARY AI CANDIDATES] latest-slot trim failed rows=%s -> 元のまま使う", before)
+        return out
+    logger.warning(
+        "[SUMMARY AI CANDIDATES] latest-slot trim rows=%s->%s symbols=%s elapsed=%.2fs",
+        before, len(kept),
+        int(kept["symbol"].nunique()) if "symbol" in kept.columns else 0,
+        time.perf_counter() - t0,
+    )
+    return kept
+
+
 def _prepare_base(summary_df: pd.DataFrame, *, require_buy_target: bool, exclude_etf_fund: bool) -> pd.DataFrame:
-    df = attach_display_like_columns(summary_df)
+    t_all = time.perf_counter()
+    n_in = len(safe_df(summary_df))
+    # 重い列生成の前に「銘柄ごとの最新足」まで絞る
+    df = _keep_latest_slot_per_symbol(summary_df)
+    t0 = time.perf_counter()
+    df = attach_display_like_columns(df)
+    t_disp = time.perf_counter() - t0
     if df.empty:
         return df
     df = filter_common_stock_rows(df, require_buy_target=require_buy_target, exclude_etf_fund=exclude_etf_fund)
+    if df.empty:
+        return df
+    # 先に銘柄あたり 1 行へ畳んでから鮮度を見る。
+    # 逆順だと「履歴の古い行が多いので全部落ちる」という誤判定になる。
+    df = dedupe_one_row_per_symbol(df)
     if df.empty:
         return df
     df = _filter_fresh_candidate_rows(df)
     if df.empty:
         logger.warning("[SUMMARY AI CANDIDATES] no fresh rows after freshness filter")
         return df
-    return dedupe_one_row_per_symbol(df)
+    logger.warning(
+        "[SUMMARY AI CANDIDATES] prepare_base done in_rows=%s out_rows=%s "
+        "attach_display=%.2fs total=%.2fs",
+        n_in, len(df), t_disp, time.perf_counter() - t_all,
+    )
+    return df
 
 
 def _buy_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_n: int, min_buy_score: float, max_sell_score: float, min_volume: float, min_price: float, source: str) -> pd.DataFrame:
@@ -576,7 +954,60 @@ def _buy_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_
     return out
 
 
+# ============================================================
+# SELL 候補の short_ok 事前フィルタ
+# (旧 core/startup/summary_ai_more_candidates_patch._install_sell_short_ok_filter_patch)
+# ------------------------------------------------------------
+# 空売り可否 (short_ok) が立っていない銘柄を SELL 候補の段階で落とす。
+# 旧パッチは _sell_candidates_from_prepared を外から包んでいたが、
+# 同じ属性を奪い合う相手が居ないので本体へ畳んだ。ネイティブは *_core へ改名。
+# ============================================================
+
+
+def _apply_sell_short_ok_prefilter(out: pd.DataFrame) -> pd.DataFrame:
+    if not _env_bool("SUMMARY_AI_SELL_SHORT_OK_PREFILTER", True):
+        return out
+    try:
+        from AI.sell_credit_guard import can_sell_symbol
+
+        if not isinstance(out, pd.DataFrame) or out.empty:
+            return out
+        before = len(out)
+        keep_idx: list[Any] = []
+        skipped: list[dict[str, Any]] = []
+        for idx, row in out.iterrows():
+            try:
+                row_dict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+                symbol = str(row_dict.get("symbol") or "").strip()
+                if can_sell_symbol(row_dict, default=False):
+                    keep_idx.append(idx)
+                else:
+                    skipped.append({"symbol": symbol, "reason": "short_ok_not_1"})
+            except Exception as e:
+                skipped.append({"symbol": str(getattr(row, "symbol", "")), "reason": f"guard_error:{e}"})
+        if len(keep_idx) == before:
+            return out
+        filtered = out.loc[keep_idx].copy().reset_index(drop=True) if keep_idx else out.iloc[0:0].copy()
+        kept_symbols = list(filtered["symbol"].astype(str).head(20)) if "symbol" in filtered.columns and not filtered.empty else []
+        logger.warning(
+            "[SUMMARY AI SELL SHORT_OK PREFILTER] filtered before=%s after=%s skipped=%s kept_symbols=%s",
+            before, len(filtered), skipped[:20], kept_symbols,
+        )
+        return filtered
+    except Exception:
+        logger.exception("[SUMMARY AI SELL SHORT_OK PREFILTER] failed; return original candidates")
+        return out
+
+
 def _sell_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_n: int, min_sell_score: float, max_buy_score: float, min_volume: float, min_price: float, source: str) -> pd.DataFrame:
+    out = _sell_candidates_from_prepared_core(
+        df, interval=interval, top_n=top_n, min_sell_score=min_sell_score,
+        max_buy_score=max_buy_score, min_volume=min_volume, min_price=min_price, source=source,
+    )
+    return _apply_sell_short_ok_prefilter(out)
+
+
+def _sell_candidates_from_prepared_core(df: pd.DataFrame, *, interval: int | str, top_n: int, min_sell_score: float, max_buy_score: float, min_volume: float, min_price: float, source: str) -> pd.DataFrame:
     if df.empty:
         return df
     top_n = _resolve_top_n(top_n)
@@ -614,7 +1045,7 @@ def _sell_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top
     return out
 
 
-def build_summary_ai_entry_candidates(summary_df: pd.DataFrame, *, interval: int | str = 1, top_n: int = DEFAULT_TOP_N, min_buy_score: float = DEFAULT_MIN_BUY_SCORE, max_sell_score: float = DEFAULT_MAX_SELL_SCORE, min_volume: float = DEFAULT_MIN_VOLUME, min_price: float = DEFAULT_MIN_PRICE, require_buy_target: bool = False, exclude_etf_fund: bool = True, source: str = "SUMMARY") -> pd.DataFrame:
+def _build_summary_ai_entry_candidates_core(summary_df: pd.DataFrame, *, interval: int | str = 1, top_n: int = DEFAULT_TOP_N, min_buy_score: float = DEFAULT_MIN_BUY_SCORE, max_sell_score: float = DEFAULT_MAX_SELL_SCORE, min_volume: float = DEFAULT_MIN_VOLUME, min_price: float = DEFAULT_MIN_PRICE, require_buy_target: bool = False, exclude_etf_fund: bool = True, source: str = "SUMMARY") -> pd.DataFrame:
     top_n = _resolve_top_n(top_n)
     base = _prepare_base(summary_df, require_buy_target=require_buy_target, exclude_etf_fund=exclude_etf_fund)
     if base.empty:
@@ -629,6 +1060,123 @@ def build_summary_ai_entry_candidates(summary_df: pd.DataFrame, *, interval: int
     out = pd.concat(frames, ignore_index=True, sort=False)
     logger.warning("[SUMMARY AI CANDIDATES] BUY_SELL_COMBINED_READY interval=%s source=%s buy_count=%s sell_count=%s total=%s top_n_each=%s buy_symbols=%s sell_symbols=%s", interval, source, len(buy_df) if isinstance(buy_df, pd.DataFrame) else 0, len(sell_df) if isinstance(sell_df, pd.DataFrame) else 0, len(out), top_n, _safe_symbols(buy_df, top_n), _safe_symbols(sell_df, top_n))
     return out.reset_index(drop=True)
+
+
+# --- entry_affordability_runtime_patch (native化, 元 core/startup/entry_affordability_runtime_patch.py) ---
+# AIに確認する前に、対象価格帯外/最低1単元でも予算上限を超える銘柄を除外する。
+def _entry_affordability_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _entry_affordability_pick_price_from_row(row: Any) -> float:
+    try:
+        for key in (
+            "ai_disp_close",
+            "close_price",
+            "price",
+            "current_price",
+            "close",
+            "last_price",
+            "CurrentPrice",
+        ):
+            try:
+                v = row.get(key)
+            except Exception:
+                v = None
+            p = _entry_affordability_safe_float(v, 0.0)
+            if p > 0:
+                return p
+    except Exception:
+        pass
+    return 0.0
+
+
+def _entry_affordability_symbol_from_row(row: Any) -> str:
+    try:
+        s = str(row.get("symbol") or "").strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _entry_affordability_filter_candidates_df(df, *, label: str):
+    try:
+        from trading.entry.entry_budget import can_afford_min_lot, log_entry_budget_config
+    except Exception:
+        logger.exception("[ENTRY AFFORDABILITY PATCH] import failed")
+        return df
+
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+
+        log_entry_budget_config(prefix="[ENTRY AFFORDABILITY PATCH]")
+
+        keep_idx: list[Any] = []
+        skipped: list[dict[str, Any]] = []
+
+        for idx, row in df.iterrows():
+            price = _entry_affordability_pick_price_from_row(row)
+            ok, diag = can_afford_min_lot(price)
+            if ok:
+                keep_idx.append(idx)
+                continue
+
+            skipped.append(
+                {
+                    "symbol": _entry_affordability_symbol_from_row(row),
+                    "side": str(row.get("side") or row.get("ai_side") or ""),
+                    "price": round(float(diag.get("price") or price or 0.0), 2),
+                    "min_price": round(float(diag.get("min_price") or 0.0), 2),
+                    "max_price": round(float(diag.get("max_price") or 0.0), 2),
+                    "configured_max_price": round(float(diag.get("configured_max_price") or 0.0), 2),
+                    "affordable_max_price": round(float(diag.get("affordable_max_price") or 0.0), 2),
+                    "budget_yen": round(float(diag.get("budget_yen") or 0.0), 0),
+                    "lot_size": int(diag.get("lot_size") or 0),
+                    "min_notional": round(float(diag.get("min_notional") or 0.0), 0),
+                    "reason": str(diag.get("reason") or "price_range_or_budget_ng"),
+                }
+            )
+
+        if not skipped:
+            return df
+
+        out = df.loc[keep_idx].copy().reset_index(drop=True)
+        logger.warning(
+            "[ENTRY AFFORDABILITY PATCH] AI_PRE_FILTER label=%s before=%s after=%s skipped=%s",
+            label,
+            len(df),
+            len(out),
+            skipped[:80],
+        )
+        return out
+
+    except Exception:
+        logger.exception("[ENTRY AFFORDABILITY PATCH] filter failed label=%s", label)
+        return df
+
+
+def build_summary_ai_entry_candidates(summary_df: pd.DataFrame, *, interval: int | str = 1, top_n: int = DEFAULT_TOP_N, min_buy_score: float = DEFAULT_MIN_BUY_SCORE, max_sell_score: float = DEFAULT_MAX_SELL_SCORE, min_volume: float = DEFAULT_MIN_VOLUME, min_price: float = DEFAULT_MIN_PRICE, require_buy_target: bool = False, exclude_etf_fund: bool = True, source: str = "SUMMARY") -> pd.DataFrame:
+    df = _build_summary_ai_entry_candidates_core(
+        summary_df,
+        interval=interval,
+        top_n=top_n,
+        min_buy_score=min_buy_score,
+        max_sell_score=max_sell_score,
+        min_volume=min_volume,
+        min_price=min_price,
+        require_buy_target=require_buy_target,
+        exclude_etf_fund=exclude_etf_fund,
+        source=source,
+    )
+    return _entry_affordability_filter_candidates_df(df, label="summary_ai_candidates_after_build_before_ai_gate")
 
 
 def build_summary_ai_sell_entry_candidates(summary_df: pd.DataFrame, *, interval: int | str = 1, top_n: int = DEFAULT_TOP_N, min_sell_score: float = 0.01, max_buy_score: float = 2.0, min_volume: float = DEFAULT_MIN_VOLUME, min_price: float = DEFAULT_MIN_PRICE, require_buy_target: bool = False, exclude_etf_fund: bool = True, source: str = "SUMMARY") -> pd.DataFrame:
@@ -649,3 +1197,32 @@ __all__ = [
     "build_summary_ai_sell_entry_candidates",
     "attach_display_like_columns",
 ]
+
+
+# ============================================================
+# ENTRY FIRE RESCUE のしきい値緩和
+# (旧 core/startup/entry_fire_rescue_runtime_patch._patch_candidates)
+# ------------------------------------------------------------
+# 旧パッチは install 時にこの 4 定数を env 由来の値で「より緩い側へ」
+# 寄せていた (min は min()、max は max())。同じ計算を import 時に行う。
+# 適用スコープは entry_fire_rescue.scope_enabled() (main.py のみ)。
+# ============================================================
+
+
+def _efr_apply_threshold_relax() -> None:
+    global DEFAULT_MIN_BUY_SCORE, DEFAULT_MAX_SELL_SCORE
+    global DEFAULT_MIN_BUY_SLOPE, DEFAULT_MAX_SELL_SLOPE
+    try:
+        from .entry_fire_rescue import scope_enabled as _efr_scope, _env_float as _efr_env_float
+
+        if not _efr_scope():
+            return
+        DEFAULT_MIN_BUY_SCORE = min(float(DEFAULT_MIN_BUY_SCORE), _efr_env_float("SUMMARY_AI_MIN_BUY_SCORE", 0.12))
+        DEFAULT_MAX_SELL_SCORE = min(float(DEFAULT_MAX_SELL_SCORE), _efr_env_float("SUMMARY_AI_MIN_SELL_SCORE", 0.12))
+        DEFAULT_MIN_BUY_SLOPE = min(float(DEFAULT_MIN_BUY_SLOPE), _efr_env_float("SUMMARY_AI_MIN_BUY_SLOPE", 0.0))
+        DEFAULT_MAX_SELL_SLOPE = max(float(DEFAULT_MAX_SELL_SLOPE), _efr_env_float("SUMMARY_AI_MAX_SELL_SLOPE", 0.0))
+    except Exception:
+        logger.debug("[ENTRY FIRE RESCUE] candidates threshold relax skipped", exc_info=True)
+
+
+_efr_apply_threshold_relax()

@@ -14,14 +14,34 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 DEFAULT_KABU_STATION_DIR = os.path.join(
     DEFAULT_BASE_DIR,
     "raw_data",
     "kabu_station",
 )
+def _default_ranking_dir() -> str:
+    """ranking DB の置き場所。
+
+    2026-09-07: 既定を NAS からローカルへ移した。NAS 上の ranking DB は
+    427MB + WAL 129MB まで育ち、`ranking_snapshot_1min` の読み取りが
+    2 秒の予算に間に合わず err=interrupted になっていた。その結果
+    候補が作れず (`no_ranking_df`)、**毎日エントリーが 1 件も出ていなかった**。
+    NAS へは trading/ranking/ranking_db_location.py が定期複製する。
+    """
+    try:
+        from trading.ranking import ranking_db_location
+
+        return str(ranking_db_location.ranking_db_dir())
+    except Exception:
+        return os.path.join(DEFAULT_KABU_STATION_DIR, "ranking")
+
+
+# 後方互換: モジュール定数として参照している箇所があるので残す。
+# ただし import 時に固定されるので、既定値の解決は _default_ranking_dir() を使う。
 DEFAULT_RANKING_DIR = os.path.join(
     DEFAULT_KABU_STATION_DIR,
     "ranking",
@@ -58,10 +78,17 @@ def normalize_yyyymmdd(value: Any = None) -> str:
 def get_ranking_db_path(
     trade_date: Any = None,
     *,
-    ranking_dir: str = DEFAULT_RANKING_DIR,
+    ranking_dir: str | None = None,
 ) -> str:
+    """ranking DB のフルパス。
+
+    ranking_dir を省略すると現在の既定 (通常はローカル) を使う。
+    既定値を引数のデフォルトに固定すると import 時に決まってしまい、
+    env での切り替えが効かなくなるので None 経由にしている。
+    """
     ymd = normalize_yyyymmdd(trade_date)
-    return str(Path(ranking_dir) / f"ranking{ymd}.db")
+    base = ranking_dir if ranking_dir else _default_ranking_dir()
+    return str(Path(base) / f"ranking{ymd}.db")
 
 
 def resolve_ranking_db_path(

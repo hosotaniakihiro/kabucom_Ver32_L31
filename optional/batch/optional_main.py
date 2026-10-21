@@ -134,10 +134,10 @@ def install_daily_mtf_runtime_safe() -> None:
     - 失敗しても optional/main boot は止めない
     """
     try:
-        from trading.summary.mtf.daily_runtime_patch import install_daily_mtf_runtime_patch
+        from trading.summary.mtf.daily_runtime import install_daily_mtf_runtime_merge
 
         logger.info("⏳ DAILY MTF runtime patch install start")
-        install_daily_mtf_runtime_patch()
+        install_daily_mtf_runtime_merge()
         logger.info(
             "✅ DAILY MTF runtime patch installed rows=%s latest=%s db=%s table=%s",
             getattr(global_data, "daily_mtf_loaded_rows", None),

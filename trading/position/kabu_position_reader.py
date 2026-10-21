@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/position/kabu_position_reader.py
-# Version: V1.6-KABU-CREDIT-POSITION-READER-VALUATION-QTY-FALLBACK
+# Version: V1.7-KABU-CREDIT-POSITION-READER-SHARED-READ-CACHE
 # ------------------------------------------------------------
 # kabu Station の建玉一覧から「信用建玉だけ」を読み、
 # symbol -> position dict に正規化する。
@@ -16,6 +16,14 @@
 #   - 復元は「信用候補」「評価額>0」「価格>0」の場合のみ。現物は対象外。
 #   - これにより、画面上は建玉が残っているのに EXIT が credit_open=0 と
 #     判断して損切りに到達しない問題を防ぐ。
+#
+# V1.7 (2026-09-01):
+#   - 実 GET を kabu_api.positions_read_cache 経由に統一。
+#     singleflight / TTL 共有 / 失敗時の指数バックオフを他経路と共有する。
+#     (旧: PositionStateService と exit_utils が同じ 5 秒枠で個別に叩き、
+#      無応答時に 1 サイクル 3 本 x 3 秒待ちを積み上げていた)
+#   - timeout の数値は kabu_api.rest_limits が唯一の持ち主。
+#   - 429 ではトークンを取り直さない (認証エラーではない)。
 # ============================================================
 
 from __future__ import annotations
@@ -26,9 +34,10 @@ import logging
 import re
 import urllib.error
 import urllib.parse
-import urllib.request
 import unicodedata
 from typing import Any, Dict, Iterable, Sequence
+
+from kabu_api import kabu_http
 
 logger = logging.getLogger(__name__)
 
@@ -274,26 +283,48 @@ def _iter_items(payload: Any) -> Iterable[dict]:
             yield payload
 
 
+def _positions_timeout_sec() -> float:
+    """/positions の読み取り timeout。数値は kabu_api.rest_limits が持つ。"""
+    try:
+        from kabu_api import rest_limits
+
+        return float(rest_limits.policy("positions").timeout_sec)
+    except Exception:
+        logger.debug("[KABU POSITION READER] rest_limits 参照に失敗", exc_info=True)
+        return 3.0
+
+
 def _urlopen_positions(base: str, token: str, *, product: int) -> Any:
+    # urllib.request は毎回 "Connection: close" を送り、kabu Station は
+    # それに応答を返さない。/positions だけ timeout していた原因はこれ
+    # (詳細は kabu_api/kabu_http.py)。非 2xx は従来どおり HTTPError で上がる。
     url = base.rstrip("/") + "/positions?" + urllib.parse.urlencode({"product": int(product)})
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("X-API-KEY", token)
-    with urllib.request.urlopen(req, timeout=3.0) as res:
-        raw = res.read()
-        if not raw:
-            return []
-        return json.loads(raw.decode("utf-8"))
+    content = kabu_http.request_json(
+        url,
+        method="GET",
+        api_key=token,
+        timeout=_positions_timeout_sec(),
+    )
+    if content == "":
+        return []
+    return content
 
 
-def _fetch_positions_payload(*, product: int = 2) -> Any:
+def _fetch_positions_payload_direct(*, product: int = 2) -> Any:
+    """実 GET。共有キャッシュ (kabu_api.positions_read_cache) の下請け。"""
     base, token = _resolve_base_and_token()
     if not base or not token:
         raise RuntimeError("base/token unavailable")
     try:
         return _urlopen_positions(base, token, product=product)
     except urllib.error.HTTPError as e:
-        if getattr(e, "code", None) != 401:
+        code = getattr(e, "code", None)
+        if code == 429:
+            # 429 は認証エラーではない。トークンを取り直さない。
+            # バックオフは共有キャッシュ側が行う。
+            logger.warning("[KABU POSITION READER] got 429 -> token は取り直さず backoff する")
+            raise
+        if code != 401:
             raise
         logger.warning("[KABU POSITION READER] got 401 -> refresh token and retry once")
         new_token = _refresh_token_after_401()
@@ -306,6 +337,33 @@ def _fetch_positions_payload(*, product: int = 2) -> Any:
                 logger.warning("[KABU POSITION READER] still 401 after refresh -> skip this cycle")
                 return []
             raise
+
+
+def _fetch_positions_payload(*, product: int = 2, caller: str = "kabu_position_reader") -> Any:
+    """/positions を共有キャッシュ経由で読む。
+
+    2026-09-01 の障害では、同じ product=2 の GET を
+      PositionStateService 経由 と exit_utils の直接呼び出し
+    が同じ 5 秒枠で重ねており、無応答の kabu Station に対して
+    1 サイクルあたり 3 本の 3 秒待ちを積み上げていた。
+    singleflight + TTL + 失敗時バックオフをここで共有する。
+
+    「読めなかった」は例外で伝える。空リストを返してはならない
+    (呼び出し側が「建玉ゼロ」と誤認する)。
+    """
+    from kabu_api import positions_read_cache
+
+    def _fetch():
+        try:
+            return _fetch_positions_payload_direct(product=product), True, ""
+        except Exception as e:  # noqa: BLE001
+            return None, False, "%s: %s" % (type(e).__name__, e)
+
+    key = positions_read_cache.KEY_CREDIT if int(product) == 2 else ("product%s" % product)
+    res = positions_read_cache.get_positions_cached(_fetch, key=key, caller=caller)
+    if not res.ok:
+        raise RuntimeError(res.error or "positions read failed")
+    return res.payload
 
 
 def _is_credit_position(x: dict) -> bool:
@@ -327,7 +385,7 @@ def _is_credit_position(x: dict) -> bool:
     return False
 
 
-def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
+def read_kabu_open_positions(*, caller: str = "kabu_position_reader") -> Dict[str, Dict[str, Any]]:
     global LAST_READ_OK, LAST_RAW_COUNT, LAST_CREDIT_CANDIDATE_COUNT, LAST_CREDIT_OPEN_COUNT
     global LAST_SKIPPED_CASH, LAST_SKIPPED_QTY, LAST_SKIPPED_PRICE, LAST_SAMPLE_KEYS, LAST_QTY_SAMPLES
     global LAST_ERROR, LAST_READ_AT
@@ -345,7 +403,7 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
     LAST_ERROR = ""
 
     try:
-        payload = _fetch_positions_payload(product=2)
+        payload = _fetch_positions_payload(product=2, caller=caller)
         LAST_READ_OK = True
     except Exception as e:
         LAST_ERROR = str(e)
@@ -401,6 +459,32 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
                 LAST_QTY_SAMPLES.append({"symbol": symbol, "side": _pick(x, "Side", "side"), "qty_values": _qty_debug_sample(x)})
             continue
 
+        row_hold = {
+            "hold_id": _pick(x, "HoldID", "hold_id") or _pick(x, "ExecutionID", "execution_id"),
+            "execution_id": _pick(x, "ExecutionID", "execution_id"),
+            "qty": qty,
+            "price": avg_price,
+        }
+        if symbol in out:
+            # 2026-09-16: 同一銘柄に建玉が複数行ある (7013: 100+100, 5019: 100+200) と
+            #   後勝ちで qty が 1 行分になっていた。数量は合算・単価は加重平均にし、
+            #   建玉ごとの hold_id/qty を holds に残す (決済は holds を 1 件ずつ返済する)。
+            prev = out[symbol]
+            prev_qty = int(prev.get("qty") or 0)
+            new_qty = prev_qty + int(qty)
+            try:
+                prev_px = float(prev.get("avg_price") or 0.0)
+                w_px = (prev_px * prev_qty + float(avg_price) * int(qty)) / new_qty if new_qty > 0 else avg_price
+            except Exception:
+                w_px = avg_price
+            prev["qty"] = new_qty
+            prev["quantity"] = new_qty
+            prev["avg_price"] = w_px
+            prev["entry_price"] = w_px
+            prev["valuation"] = float(prev.get("valuation") or 0.0) + _pick_positive_float(x, VALUATION_KEYS, 0.0)
+            prev.setdefault("holds", []).append(row_hold)
+            continue
+
         out[symbol] = {
             "symbol": symbol,
             "symbolname": _pick(x, "SymbolName", "symbolname"),
@@ -419,6 +503,7 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
             "hold_id": _pick(x, "HoldID", "hold_id"),
             "execution_id": _pick(x, "ExecutionID", "execution_id"),
             "valuation": _pick_positive_float(x, VALUATION_KEYS, 0.0),
+            "holds": [row_hold],
             "_qty_source": qty_source,
             "_qty_detail": qty_detail,
             "_position_source": "KABU.positions.credit_only",

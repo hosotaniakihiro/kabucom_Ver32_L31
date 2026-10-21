@@ -148,7 +148,7 @@ def resolve_entry_price(
 # 🔵 PUSH限定・板情報取得
 # ============================================================
 
-def get_latest_bid_ask(symbol: str):
+def _get_latest_bid_ask_core(symbol: str):
 
     symbol = normalize_symbol(symbol)
 
@@ -194,18 +194,47 @@ def get_latest_bid_ask(symbol: str):
         if ask is None or bid is None or ask <= 0 or bid <= 0:
             return None
 
+        ask_qty = int(safe_float(row.get("ask_qty"), 0))
+        bid_qty = int(safe_float(row.get("bid_qty"), 0))
+        # 2026-10-01: kabu の BidPrice は売気配・AskPrice は買気配 (名前が逆)。
+        #   push_df は BidPrice -> bid_price と素直に写しているので、ここで向きを直す。
+        #   以前は spread_pct が常に負で、スプレッドガードが一度も効いていなかった。
+        if bid > ask:
+            bid, ask = ask, bid
+            bid_qty, ask_qty = ask_qty, bid_qty
+
         return {
             "symbol": symbol,
             "ask_price": ask,
             "bid_price": bid,
-            "ask_qty": int(safe_float(row.get("ask_qty"), 0)),
-            "bid_qty": int(safe_float(row.get("bid_qty"), 0)),
+            "ask_qty": ask_qty,
+            "bid_qty": bid_qty,
             "source": "push_df",
         }
 
     except Exception:
         logger.error("❌ get_latest_bid_ask error", exc_info=True)
         return None
+
+
+# ------------------------------------------------------------
+# BOARD RETRY (旧 core/startup/board_retry_patch.py の本文化)
+# ------------------------------------------------------------
+# 旧 install() が
+#   utils_common.get_latest_bid_ask = _wrap_get_latest_bid_ask(native)
+# としていた 1 枚を、ここで native に固定した。
+# リトライ本体・REST フォールバック・cooldown は kabu_api/board_retry.py。
+#
+# board_retry を import できない環境 (単体利用など) では素の PUSH 実装に
+# フォールバックする。旧構成でも install 失敗時は native のままだった。
+# ------------------------------------------------------------
+
+def get_latest_bid_ask(symbol: str, *args, **kwargs):
+    try:
+        from kabu_api.board_retry import retry_fetch_board
+    except Exception:
+        return _get_latest_bid_ask_core(symbol)
+    return retry_fetch_board(_get_latest_bid_ask_core, symbol, *args, **kwargs)
 
 
 # ============================================================
@@ -317,6 +346,30 @@ def calculate_qty_by_budget(
 # ============================================================
 # 🔵 Tick Size
 # ============================================================
+
+def get_order_tick_size(price) -> float:
+    """発注価格を丸めるための東証の呼値 (TOPIX100 以外の通常銘柄の表)。
+
+    2026-10-01: get_tick_size は 1,000〜3,000 円を 5 円刻みにしている (旧制度)。
+    これで売り指値を切り上げると 5706 は 気配 2371 -> 2375 になり、
+    買い気配より 4 円上の指値で約定せず 1 秒で取消されていた (売り新規 14 回中 0 約定)。
+    TOPIX100 銘柄はもっと細かいが、この表の刻みは TOPIX100 でも有効な値段になる。
+    """
+    try:
+        p = float(price)
+    except Exception:
+        return 1.0
+    if p <= 0:
+        return 1.0
+    for upper, tick in (
+        (3000, 1.0), (5000, 5.0), (30000, 10.0), (50000, 50.0),
+        (300000, 100.0), (500000, 500.0), (3000000, 1000.0),
+        (5000000, 5000.0), (30000000, 10000.0), (50000000, 50000.0),
+    ):
+        if p <= upper:
+            return tick
+    return 100000.0
+
 
 def get_tick_size(price_or_symbol):
     try:

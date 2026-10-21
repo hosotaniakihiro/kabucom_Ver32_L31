@@ -23,16 +23,18 @@ import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_SYMBOL_FLAGS_DB = Path(
-    r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db"
+    nas_path(r"Basic\symbol_flags.db")
 )
 
 DEFAULT_OPTIONAL_DB = Path(
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabutan\optional_data.db"
+    nas_path(r"raw_data\kabutan\optional_data.db")
 )
 
 DEFAULT_MAX_LINE_CHARS = int(
@@ -285,7 +287,7 @@ def _read_symbol_names_from_db(
         return result
 
     try:
-        with sqlite3.connect(str(db_path), timeout=5) as con:
+        with committing_connect(str(db_path), timeout=5) as con:
             con.row_factory = sqlite3.Row
 
             for table in table_candidates:

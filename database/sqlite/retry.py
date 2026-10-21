@@ -1,13 +1,35 @@
 # ============================================================
 # File   : database/sqlite/retry.py
-# Version: PRODUCTION-STABLE-REV1.0-SQLITE-RETRY
+# Version: PRODUCTION-STABLE-SQLITE-NAS-IO-V1
 # ------------------------------------------------------------
-# Purpose:
-#   SQLite / NAS SQLite の database is locked 対策を共通化する。
+# NAS 上の SQLite で起きる一時的な I/O 障害とロックを吸収する
+# リトライ実装。
+#
+# 旧 database/sqlite/retry_io_patch.py を本文化したもの。
+# 同パッチは import 時に retry モジュールの 6 名前
+# (DEFAULT_BUSY_TIMEOUT_MS / is_lock_error / lock_sleep_seconds /
+#  normal_sleep_seconds / prepare_sqlite_connection /
+#  run_sql_many_with_retry) を丸ごと差し替えていた。
+# 実運用では database/sqlite/__init__.py が retry を import した直後に
+# install していたため、この実装しか使われていなかった
+# (inspector.py / upsert_executor.py / delete_insert_fallback.py の
+#  from-import も、パッケージ __init__ 経由で install 後に解決される)。
+#
+# Handles:
+#   - sqlite3.OperationalError: disk I/O error
+#   - sqlite3.OperationalError: unable to open database file
+#   - SQLAlchemy connection pool が壊れた状態
+#   - BEGIN IMMEDIATE で落ちるケース
+#
+# Policy:
+#   - lock は短め backoff
+#   - NAS I/O は engine.dispose() して長め backoff
+#   - final 失敗時は従来どおり例外を上げる
 # ============================================================
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import random
@@ -16,13 +38,32 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
+from database.sqlite.summary_write_lock import is_summary_target, summary_write_lock
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_BUSY_TIMEOUT_MS = int(os.environ.get("SQLITE_BUSY_TIMEOUT_MS", os.environ.get("SUMMARY_UPSERT_BUSY_TIMEOUT_MS", "15000")))
-LOCK_BACKOFF_MAX_SEC = float(os.environ.get("SQLITE_LOCK_BACKOFF_MAX_SEC", os.environ.get("SUMMARY_UPSERT_LOCK_BACKOFF_MAX_SEC", "4.0")))
-USE_BEGIN_IMMEDIATE_DEFAULT = os.environ.get("SQLITE_USE_BEGIN_IMMEDIATE", os.environ.get("SUMMARY_UPSERT_BEGIN_IMMEDIATE", "1")).strip().lower() not in (
-    "0", "false", "no", "off"
+DEFAULT_BUSY_TIMEOUT_MS = int(
+    os.environ.get(
+        "SQLITE_BUSY_TIMEOUT_MS",
+        os.environ.get("SUMMARY_UPSERT_BUSY_TIMEOUT_MS", "30000"),
+    )
 )
+LOCK_BACKOFF_MAX_SEC = float(
+    os.environ.get(
+        "SQLITE_LOCK_BACKOFF_MAX_SEC",
+        os.environ.get("SUMMARY_UPSERT_LOCK_BACKOFF_MAX_SEC", "4.0"),
+    )
+)
+IO_BACKOFF_MAX_SEC = float(
+    os.environ.get(
+        "SQLITE_IO_BACKOFF_MAX_SEC",
+        os.environ.get("SUMMARY_UPSERT_IO_BACKOFF_MAX_SEC", "10.0"),
+    )
+)
+USE_BEGIN_IMMEDIATE_DEFAULT = os.environ.get(
+    "SQLITE_USE_BEGIN_IMMEDIATE",
+    os.environ.get("SUMMARY_UPSERT_BEGIN_IMMEDIATE", "1"),
+).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def is_lock_error(exc: BaseException) -> bool:
@@ -37,6 +78,23 @@ def is_lock_error(exc: BaseException) -> bool:
     )
 
 
+def is_transient_io_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "disk i/o error" in msg
+        or "unable to open database file" in msg
+        or "i/o error" in msg
+        or "input/output error" in msg
+        or "the specified network name is no longer available" in msg
+        or "the network path was not found" in msg
+        or "network path" in msg
+        or "winerror 59" in msg
+        or "winerror 64" in msg
+        or "winerror 121" in msg
+        or "winerror 10054" in msg
+    )
+
+
 def lock_sleep_seconds(attempt: int, sleep_base: float = 0.45) -> float:
     base = max(0.05, float(sleep_base or 0.45))
     exp = min(6, max(0, int(attempt) - 1))
@@ -44,30 +102,40 @@ def lock_sleep_seconds(attempt: int, sleep_base: float = 0.45) -> float:
     return min(LOCK_BACKOFF_MAX_SEC, base * (1.55 ** exp) + jitter)
 
 
+def io_sleep_seconds(attempt: int, sleep_base: float = 0.75) -> float:
+    base = max(0.20, float(sleep_base or 0.75))
+    exp = min(6, max(0, int(attempt) - 1))
+    jitter = random.random() * min(0.55, base)
+    return min(IO_BACKOFF_MAX_SEC, base * (1.85 ** exp) + jitter)
+
+
 def normal_sleep_seconds(sleep_base: float = 0.45) -> float:
     base = max(0.05, float(sleep_base or 0.45))
     return base + random.random() * 0.20
 
 
-def prepare_sqlite_connection(conn: Any, *, busy_timeout_ms: Optional[int] = None) -> None:
-    """
-    SQLAlchemy Connection に SQLite PRAGMA を設定する。
+def dispose_engine_safely(engine: Any, *, reason: str = "") -> None:
+    try:
+        dispose = getattr(engine, "dispose", None)
+        if callable(dispose):
+            dispose()
+            logger.warning("[SQLITE IO PATCH] engine disposed reason=%s", reason)
+    except Exception:
+        logger.debug("[SQLITE IO PATCH] engine dispose failed reason=%s", reason, exc_info=True)
 
-    注意:
-      - busy_timeout は connection ごとに必要
-      - NAS SQLite では journal_mode は触らない
-    """
+
+def prepare_sqlite_connection(conn: Any, *, busy_timeout_ms: Optional[int] = None) -> None:
     timeout_ms = int(busy_timeout_ms or DEFAULT_BUSY_TIMEOUT_MS)
 
     try:
         conn.execute(text(f"PRAGMA busy_timeout={timeout_ms}"))
     except Exception:
-        logger.debug("[SQLITE RETRY] PRAGMA busy_timeout failed", exc_info=True)
+        logger.debug("[SQLITE IO PATCH] PRAGMA busy_timeout failed", exc_info=True)
 
     try:
         conn.execute(text("PRAGMA synchronous=NORMAL"))
     except Exception:
-        logger.debug("[SQLITE RETRY] PRAGMA synchronous failed", exc_info=True)
+        logger.debug("[SQLITE IO PATCH] PRAGMA synchronous failed", exc_info=True)
 
 
 def run_sql_many_with_retry(
@@ -84,9 +152,6 @@ def run_sql_many_with_retry(
     sleep_base: float = 0.45,
     use_begin_immediate: Optional[bool] = None,
 ) -> None:
-    """
-    executemany を lock retry 付きで実行する。
-    """
     if not params:
         logger.info(
             "%s skipped empty params interval=%s table=%s chunk=%s/%s",
@@ -98,13 +163,21 @@ def run_sql_many_with_retry(
         )
         return
 
+    # NAS一時障害は12回では足りないことがあるため、最低18回に底上げ。
+    retry = max(18, int(retry or 1))
     last_err: Exception | None = None
-    retry = max(1, int(retry or 1))
     use_immediate = USE_BEGIN_IMMEDIATE_DEFAULT if use_begin_immediate is None else bool(use_begin_immediate)
+
+    # 2026-10-19: summary DB は引け後に複数プロセスの書き込みが重なって壊れていた。
+    # 1 トランザクションずつプロセス間 mutex で囲む (summary_write_lock.py 参照)。
+    if is_summary_target(table_name):
+        write_lock = lambda: summary_write_lock(f"{log_prefix} {table_name} chunk={chunk_no}/{total_chunks}")  # noqa: E731
+    else:
+        write_lock = contextlib.nullcontext
 
     for attempt in range(1, retry + 1):
         try:
-            with engine.connect() as conn:
+            with write_lock(), engine.connect() as conn:
                 prepare_sqlite_connection(conn)
 
                 if use_immediate:
@@ -140,6 +213,10 @@ def run_sql_many_with_retry(
         except Exception as e:
             last_err = e
             is_lock = is_lock_error(e)
+            is_io = is_transient_io_error(e)
+
+            if is_io:
+                dispose_engine_safely(engine, reason="transient_io_error")
 
             if is_lock and attempt < retry:
                 sleep_s = lock_sleep_seconds(attempt, sleep_base)
@@ -155,6 +232,25 @@ def run_sql_many_with_retry(
                     retry,
                     sleep_s,
                     str(e).splitlines()[0] if str(e) else type(e).__name__,
+                )
+                time.sleep(sleep_s)
+                continue
+
+            if is_io and attempt < retry:
+                sleep_s = io_sleep_seconds(attempt, max(0.75, sleep_base))
+                logger.warning(
+                    "%s transient-io retry interval=%s table=%s chunk=%s/%s rows=%s attempt=%s/%s sleep=%.2fs err=%s",
+                    log_prefix,
+                    interval,
+                    table_name,
+                    chunk_no,
+                    total_chunks,
+                    len(params),
+                    attempt,
+                    retry,
+                    sleep_s,
+                    str(e).splitlines()[0] if str(e) else type(e).__name__,
+                    exc_info=True,
                 )
                 time.sleep(sleep_s)
                 continue
@@ -193,3 +289,19 @@ def run_sql_many_with_retry(
 
     if last_err is not None:
         raise last_err
+
+
+__all__ = [
+    "DEFAULT_BUSY_TIMEOUT_MS",
+    "LOCK_BACKOFF_MAX_SEC",
+    "IO_BACKOFF_MAX_SEC",
+    "USE_BEGIN_IMMEDIATE_DEFAULT",
+    "is_lock_error",
+    "is_transient_io_error",
+    "lock_sleep_seconds",
+    "io_sleep_seconds",
+    "normal_sleep_seconds",
+    "dispose_engine_safely",
+    "prepare_sqlite_connection",
+    "run_sql_many_with_retry",
+]

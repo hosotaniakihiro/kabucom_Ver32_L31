@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ except AttributeError:  # pragma: no cover - old Python compatibility
 def _spool_dir() -> Path:
     base = os.getenv(
         "SUMMARY_SAVE_SPOOL_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\runtime\summary_save_spool",
+        nas_path(r"runtime\summary_save_spool"),
     )
     p = Path(base)
     p.mkdir(parents=True, exist_ok=True)
@@ -54,7 +55,7 @@ def _spool_dir() -> Path:
 def _summary_db_dir() -> str:
     return os.getenv(
         "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+        nas_path(r"raw_data\kabu_station\summary"),
     )
 
 
@@ -243,7 +244,7 @@ def _read_spool(path: Path) -> tuple[dict, pd.DataFrame]:
     return meta, pd.DataFrame(rows)
 
 
-def _save_direct(df: pd.DataFrame, *, interval: int, source: str, date_yyyymmdd: str) -> int:
+def _save_direct_core(df: pd.DataFrame, *, interval: int, source: str, date_yyyymmdd: str) -> int:
     work = _norm_df(df, source=source)
     if work.empty:
         logger.warning("[SUMMARY SAVE SPOOL] empty dataframe interval=%s source=%s date=%s", interval, source, date_yyyymmdd)
@@ -341,7 +342,7 @@ def _save_direct(df: pd.DataFrame, *, interval: int, source: str, date_yyyymmdd:
                 pass
 
 
-def flush_summary_spool(*, max_files: int = 50) -> dict:
+def flush_summary_spool_core(*, max_files: int = 50) -> dict:
     d = _spool_dir()
     files = sorted(d.glob("summary_spool_*.jsonl.gz"), key=lambda p: p.stat().st_mtime)[:max_files]
     result = {"files": len(files), "flushed_files": 0, "saved_rows": 0, "failed_files": 0, "bad_files": 0}
@@ -393,4 +394,193 @@ def flush_summary_spool(*, max_files: int = 50) -> dict:
     return result
 
 
+# --- summary_spool_quarantine_patch (native化, 元 core/startup/summary_spool_quarantine_patch.py) ---
+# rows=0 の空spoolや古すぎるspoolを毎回リトライし続けて failed_files が減らない問題への対処。
+# flush_summary_spool_core を呼ぶ前に、読めない/空/古いスプールファイルを
+# summary_spool_*.jsonl.gz の glob 対象から先に退避しておく。
+_SUMMARY_SPOOL_QUARANTINE_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+def _summary_spool_quarantine_env_bool(name: str, default: bool = True) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if raw in _SUMMARY_SPOOL_QUARANTINE_TRUE:
+        return True
+    if raw in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+        return False
+    return bool(default)
+
+
+def _summary_spool_quarantine_env_int(name: str, default: int) -> int:
+    try:
+        return int(float(str(os.getenv(name, str(default))).strip()))
+    except Exception:
+        return int(default)
+
+
+def _summary_spool_quarantine_safe_rename_with_suffix(path: Path, suffix: str) -> Path | None:
+    try:
+        dst = path.with_suffix(path.suffix + suffix)
+        if dst.exists():
+            stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            dst = path.with_name(f"{path.name}.{stamp}{suffix}")
+        path.rename(dst)
+        return dst
+    except Exception:
+        logger.exception("[SUMMARY SPOOL QUARANTINE] rename failed path=%s suffix=%s", path, suffix)
+        return None
+
+
+def _summary_spool_quarantine_ymd_from_name_or_meta(path: Path, meta: dict[str, Any]) -> str:
+    try:
+        ymd = str(meta.get("date_yyyymmdd") or "").strip()
+        if len(ymd) == 8 and ymd.isdigit():
+            return ymd
+    except Exception:
+        pass
+    try:
+        parts = path.name.split("_")
+        for part in parts:
+            if len(part) == 8 and part.isdigit():
+                return part
+    except Exception:
+        pass
+    return ""
+
+
+def _summary_spool_quarantine_is_old_ymd(ymd: str, max_age_days: int) -> bool:
+    if max_age_days < 0:
+        return False
+    try:
+        d = dt.datetime.strptime(str(ymd), "%Y%m%d").date()
+        return (dt.date.today() - d).days > int(max_age_days)
+    except Exception:
+        return False
+
+
+def flush_summary_spool(*, max_files: int = 50) -> dict:
+    if not _summary_spool_quarantine_env_bool("SUMMARY_SPOOL_QUARANTINE_ENABLED", True):
+        return flush_summary_spool_core(max_files=max_files)
+
+    max_age_days = _summary_spool_quarantine_env_int("SUMMARY_SPOOL_QUARANTINE_MAX_AGE_DAYS", 2)
+    quarantine_empty = _summary_spool_quarantine_env_bool("SUMMARY_SPOOL_QUARANTINE_EMPTY", True)
+    quarantine_old = _summary_spool_quarantine_env_bool("SUMMARY_SPOOL_QUARANTINE_OLD", True)
+
+    quarantined_empty = 0
+    quarantined_old = 0
+    quarantined_bad = 0
+    try:
+        d = _spool_dir()
+        files = sorted(d.glob("summary_spool_*.jsonl.gz"), key=lambda p: p.stat().st_mtime)[:max_files]
+        for path in files:
+            try:
+                meta, df = _read_spool(path)
+            except _BAD_GZIP_ERRORS as e:
+                dst = _summary_spool_quarantine_safe_rename_with_suffix(path, ".bad")
+                quarantined_bad += 1 if dst is not None else 0
+                logger.error("[SUMMARY SPOOL QUARANTINE] bad spool quarantined path=%s dst=%s err=%r", path, dst, e)
+                continue
+            except Exception:
+                # Unknown read error: leave for original flusher to log/handle.
+                continue
+
+            ymd = _summary_spool_quarantine_ymd_from_name_or_meta(path, meta if isinstance(meta, dict) else {})
+            rows = len(df) if hasattr(df, "__len__") else 0
+            if quarantine_empty and int(rows or 0) <= 0:
+                dst = _summary_spool_quarantine_safe_rename_with_suffix(path, ".empty")
+                quarantined_empty += 1 if dst is not None else 0
+                logger.warning(
+                    "[SUMMARY SPOOL QUARANTINE] empty spool quarantined path=%s dst=%s ymd=%s rows=%s",
+                    path,
+                    dst,
+                    ymd,
+                    rows,
+                )
+                continue
+            if quarantine_old and ymd and _summary_spool_quarantine_is_old_ymd(ymd, max_age_days):
+                dst = _summary_spool_quarantine_safe_rename_with_suffix(path, ".old")
+                quarantined_old += 1 if dst is not None else 0
+                logger.warning(
+                    "[SUMMARY SPOOL QUARANTINE] old spool quarantined path=%s dst=%s ymd=%s max_age_days=%s rows=%s",
+                    path,
+                    dst,
+                    ymd,
+                    max_age_days,
+                    rows,
+                )
+                continue
+    except Exception:
+        logger.exception("[SUMMARY SPOOL QUARANTINE] pre-scan failed")
+
+    result = flush_summary_spool_core(max_files=max_files)
+    try:
+        if isinstance(result, dict):
+            result["quarantined_empty"] = int(quarantined_empty)
+            result["quarantined_old"] = int(quarantined_old)
+            result["quarantined_bad"] = int(quarantined_bad)
+    except Exception:
+        pass
+    return result
+
+
 __all__ = ["spool_summary_df", "flush_summary_spool"]
+
+
+# ============================================================
+# spool flush の bulk-first 化
+# (旧 core/startup/sqlite_memory_pragmas_patch._install_summary_spool_flush_patch
+#  と main_database.py の同内容コピーを本文化)
+# ------------------------------------------------------------
+# 直接 DELETE+INSERT する旧経路は、spool の payload に新しい列や
+# pandas/numpy のスカラ型が混じると失敗し、failed_files が消えなくなる。
+# bulk 経路は列の正規化 / latest_only / owner guard / retry IO を
+# すでに持っているので、先に bulk を試して 0 件のときだけ direct へ落とす。
+#
+# summary_saver_bulk は循環 import を避けるため関数内で import する
+# (旧パッチも install() の中で import していた)。
+#
+# 旧マーカー _summary_spool_flush_bulk_patch を関数属性として立ててある。
+# これにより旧 installer 側 (main_database.py) が残っていても
+# 「すでにラップ済み」と判定して二重ラップしない。
+# ============================================================
+
+
+def _spool_flush_bulk_disabled() -> bool:
+    try:
+        v = os.getenv("DISABLE_SUMMARY_SPOOL_FLUSH_BULK_PATCH")
+        if v is None or str(v).strip() == "":
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return False
+
+
+def _save_direct(df: pd.DataFrame, *, interval: int, source: str, date_yyyymmdd: str) -> int:
+    if _spool_flush_bulk_disabled():
+        return _save_direct_core(df, interval=interval, source=source, date_yyyymmdd=date_yyyymmdd)
+    try:
+        import trading.summary.persistence.summary_saver_bulk as saver
+
+        # Ranking column repair now runs unconditionally inside
+        # summary_saver_bulk._get_table_columns_from_engine itself.
+        saved = saver.bulk_upsert_summary(
+            df,
+            interval=int(interval),
+            lock_timeout_sec=float(os.getenv("SUMMARY_SPOOL_FLUSH_LOCK_TIMEOUT_SEC", "8.0")),
+            skip_if_busy=True,
+            latest_only=True,
+            save_reason="spool_recovery_flush",
+        )
+        if int(saved or 0) > 0:
+            return int(saved)
+    except Exception:
+        logger.exception(
+            "[SUMMARY SAVE SPOOL PATCH] bulk flush failed interval=%s source=%s date=%s -> fallback direct",
+            interval,
+            source,
+            date_yyyymmdd,
+        )
+    return int(_save_direct_core(df, interval=interval, source=source, date_yyyymmdd=date_yyyymmdd) or 0)
+
+
+_save_direct._summary_spool_flush_bulk_patch = True  # type: ignore[attr-defined]
+_save_direct._original = _save_direct_core  # type: ignore[attr-defined]

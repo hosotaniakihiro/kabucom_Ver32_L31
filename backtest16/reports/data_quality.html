@@ -1,0 +1,27 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>データ品質</title><style>
+:root{--bg:#ffffff;--fg:#1b1f24;--mut:#667;--card:#f6f8fa;--bd:#d9dee4;--accent:#2563eb;--pos:#128a4c;--neg:#c0392b}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1317;--fg:#e6edf3;--mut:#9aa7b3;--card:#171c22;--bd:#2b333b;--accent:#5b9bff;--pos:#3fb950;--neg:#f85149}}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,"Segoe UI",Meiryo,sans-serif;background:var(--bg);color:var(--fg);line-height:1.5}
+.wrap{max-width:1200px;margin:0 auto;padding:20px}
+h1{font-size:22px;margin:8px 0}h2{font-size:17px;margin:22px 0 8px;border-bottom:2px solid var(--bd);padding-bottom:4px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:14px 0}
+.kpi{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px}
+.kpi .l{font-size:12px;color:var(--mut)}.kpi .v{font-size:18px;font-weight:700;margin-top:4px}
+.pos{color:var(--pos)}.neg{color:var(--neg)}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid var(--bd);padding:6px 8px;text-align:right}
+th{background:var(--card);cursor:pointer;position:sticky;top:0}td.l,th.l{text-align:left}
+.scroll{overflow-x:auto;border:1px solid var(--bd);border-radius:8px}
+.note{background:var(--card);border-left:4px solid var(--accent);padding:10px 12px;border-radius:6px;margin:10px 0;font-size:13px;color:var(--mut)}
+.controls{margin:10px 0}button,input{font:inherit;padding:5px 10px;border:1px solid var(--bd);border-radius:6px;background:var(--card);color:var(--fg)}
+img{max-width:100%;height:auto;background:#fff;border:1px solid var(--bd);border-radius:8px}
+small{color:var(--mut)}
+</style></head><body><div class="wrap"><h1>🧪 データ品質と約定再現性 (§3/§7)</h1>
+<div class="scroll"><table><tbody><tr><td class='l'>days_processed</td><td>129</td></tr><tr><td class='l'>date_min</td><td>2026-04-20</td></tr><tr><td class='l'>date_max</td><td>2026-10-19</td></tr><tr><td class='l'>avg_symbols_with_bars</td><td>286</td></tr><tr><td class='l'>avg_universe</td><td>361</td></tr><tr><td class='l'>total_signals</td><td>168,260</td></tr><tr><td class='l'>avg_tick_symbols_per_day</td><td>42.0</td></tr><tr><td class='l'>first5_records</td><td>9,905</td></tr></tbody></table></div>
+<h2>信用売建可否 区分(§6.1)</h2>
+<div class="note">区分A(当時の売建可否・数量を確認済)は履歴データが無いため<b>0件</b>。空売り実損益は仮想扱い。</div>
+<div class="scroll"><table><thead><tr><th>区分</th><th>件数</th></tr></thead><tbody>
+<tr><td class="l">D: 適格性自体が不明(仮想)</td><td>97889</td></tr></tbody></table></div>
+<h2>注記</h2><ul><li>約定はA/B/C分離。主たる執行可能モードはC_OHLC(確定1分足)。</li><li>push板ティック(A/B)はシグナル銘柄のごく一部のみ(当日の実データが疎)。</li><li>空売りの売建可否はborrow区分B/Dが中心→空売り実損益は仮想(区分A不可)。</li><li>過去の信用売建可否・売建可能数量の日次履歴が存在しないため、本バックテストの売建可否は区分B/Dが中心(当時の在庫・発注可否は未確認)。区分Aは出せないため、空売りの実損益は『仮想シグナル成績』として扱う。</li></ul>
+<p><small><a href="backtest_16strategies.html">← ダッシュボード</a></small></p></div></body></html>

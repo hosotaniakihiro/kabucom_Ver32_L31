@@ -50,7 +50,7 @@ from typing import Optional
 
 from .constants import RANKING_DB_ROOT, PRIMARY_TABLES, CATEGORY_TABLE_SPECS
 from . import cache
-from .normalizer import _list_tables, _table_row_count
+from .normalizer import _list_tables, _table_has_any_row
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,7 @@ def _today_ranking_db_path(now: Optional[dt.datetime] = None) -> Path:
 # DB inspection
 # ============================================================
 
-def _db_has_usable_ranking_tables(db_path: str) -> bool:
+def _db_has_usable_ranking_tables_core(db_path: str) -> bool:
     """
     ranking DB が実データを持っているかを確認する。
 
@@ -144,32 +144,33 @@ def _db_has_usable_ranking_tables(db_path: str) -> bool:
         return False
 
     try:
-        with sqlite3.connect(str(p), timeout=3.0) as conn:
+        # P0-1/P0-6: `with sqlite3.connect(...)` は close しない (実測でリーク確認)。
+        # ここは「使える DB か」を見るだけの reader なので、
+        # read-only で開き、存在しなければ空 DB も作らない。
+        from database.sqlite_util import readonly_connect
+        with readonly_connect(str(p), timeout=3.0, busy_timeout_ms=3000) as conn:
             tables = set(_list_tables(conn))
 
+            # 判定に必要なのは「1行でもあるか」だけ。COUNT(*) だと当日DBが
+            # 増えるほど NAS 越しの全走査が重くなる (実測: 1分Summary の 1 tick で
+            # 13 秒 / 48 秒がここに消えていた)。
             for table_name in PRIMARY_TABLES:
-                if table_name in tables:
-                    cnt = _table_row_count(conn, table_name)
-                    if cnt > 0:
-                        logger.info(
-                            "[ATS RANKING] usable db hit path=%s table=%s rows=%d",
-                            db_path,
-                            table_name,
-                            cnt,
-                        )
-                        return True
+                if table_name in tables and _table_has_any_row(conn, table_name):
+                    logger.info(
+                        "[ATS RANKING] usable db hit path=%s table=%s",
+                        db_path,
+                        table_name,
+                    )
+                    return True
 
             for table_name, _, _ in CATEGORY_TABLE_SPECS:
-                if table_name in tables:
-                    cnt = _table_row_count(conn, table_name)
-                    if cnt > 0:
-                        logger.info(
-                            "[ATS RANKING] usable db hit path=%s table=%s rows=%d",
-                            db_path,
-                            table_name,
-                            cnt,
-                        )
-                        return True
+                if table_name in tables and _table_has_any_row(conn, table_name):
+                    logger.info(
+                        "[ATS RANKING] usable db hit path=%s table=%s",
+                        db_path,
+                        table_name,
+                    )
+                    return True
 
     except Exception:
         logger.exception("[ATS RANKING] usable db check failed path=%s", db_path)
@@ -497,3 +498,21 @@ __all__ = [
     "get_today_ranking_db_path",
     "invalidate_ranking_db_path_cache",
 ]
+
+
+# ============================================================
+# NAS/SMB sqlite I/O ガード (旧 core/startup/nas_sqlite_io_guard_patch.py)
+# ============================================================
+
+def _db_has_usable_ranking_tables(db_path: str) -> bool:
+    from utils import nas_sqlite_io_guard as _guard
+
+    if db_path and _guard.is_bad(db_path):
+        logger.warning("[NAS SQLITE IO GUARD] skip ats usable check bad path=%s", db_path)
+        return False
+    try:
+        return _db_has_usable_ranking_tables_core(db_path)
+    except Exception as e:
+        if _guard.handle_error(db_path, e):
+            return False
+        raise

@@ -32,16 +32,14 @@ from . import rotation_register as rotation_register
 from . import rotation_logging as rotation_logging
 
 try:
-    from . import rotation_stability_patch as rotation_stability_patch
-    rotation_stability_patch.install()
+    from . import rotation_stability as rotation_stability
 except Exception:
-    logger.exception("[push_stream] rotation_stability_patch install failed")
+    logger.exception("[push_stream] rotation_stability import failed")
 
 try:
-    from . import rotation_liquidity_keep100_patch as rotation_liquidity_keep100_patch
-    rotation_liquidity_keep100_patch.install()
+    from . import rotation_liquidity_keep100 as rotation_liquidity_keep100
 except Exception:
-    logger.exception("[push_stream] rotation_liquidity_keep100_patch install failed")
+    logger.exception("[push_stream] rotation_liquidity_keep100 import failed")
 
 from .transport import (
     set_refresh_callable,
@@ -175,8 +173,17 @@ def _split_mode_main() -> bool:
 
 
 def _main_ws_fallback_enabled() -> bool:
-    # Ver2.2: 明示OFFされない限り、stale時のmemory-only fallback watcherは有効。
-    return _env_bool("AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK", _env_bool("AUTOSTOCK_MAIN_PUSH_WS_STALE_FALLBACK", True))
+    # Ver2.3: 既定 OFF。
+    # kabu Station の PUSH は 1 セッション 1 接続なので、
+    # main.py が「summary が古い」を理由に 2 本目を張ると
+    # 所有プロセス (push_receiver_runner.py) の接続を奪い合い、
+    # かえって PUSH が止まる。2026-08-31 の実測では
+    # main.py が 11:48 に fallback WS を張った直後から
+    # 所有側が 3〜11 秒ごとに切断され generation が 850 まで増えた。
+    # main.py の最新値は latest_price_db_feeder が PUSH DB 経由で供給する。
+    # 単体運用など、どうしても必要な場合だけ
+    # AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK=1 で明示的に有効化する。
+    return _env_bool("AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK", _env_bool("AUTOSTOCK_MAIN_PUSH_WS_STALE_FALLBACK", False))
 
 
 def _main_ws_fallback_allowed_due_to_stale_summary() -> bool:
@@ -200,6 +207,24 @@ def _main_ws_fallback_allowed_due_to_stale_summary() -> bool:
         )
         return False
     if age > stale_sec:
+        # PUSH WebSocket を別プロセスが所有しているなら、
+        # ここで 2 本目を張ると互いを切り合って reconnect storm になる。
+        # summary が古いのは PUSH が届いていない「結果」であって、
+        # 2 本目を張る理由にはならない (2026-08-31 実測: generation 850)。
+        try:
+            from .ws_owner import owned_elsewhere
+
+            elsewhere, holder = owned_elsewhere()
+        except Exception:
+            elsewhere, holder = False, {}
+        if elsewhere:
+            logger.error(
+                "[push_stream][MULTI_WS_DETECTED] main WS fallback refused: "
+                "PUSH WebSocket は別プロセスが所有している age=%.1fs holder=%s "
+                "(2 本目を張ると互いを切り合う)",
+                age, holder,
+            )
+            return False
         logger.warning(
             "[push_stream] main WS fallback allowed: summary stale age=%.1fs stale_sec=%.1f memory_only=True db_write=False rotation=False",
             age,
@@ -330,6 +355,12 @@ def _force_push_writer_env_if_database_process() -> None:
     os.environ["AUTOSTOCK_SKIP_DATA_COLLECTOR_WORK_IN_MAIN"] = "0"
     os.environ["PUSH_STREAM_DB_WRITE"] = "1"
     os.environ.setdefault("PUSH_STREAM_ORDER_BOOK_WRITE", "1")
+    # 直前の _prepare_main_memory_only_ws() が main.py 向けに
+    # PUSH_ROTATION_ENABLED=0 を立てるが、PUSH 所有プロセスでは
+    # A/B ローテーション (50銘柄×2=100銘柄) が必要なので戻す。
+    # 以前は runner が enable_rotate 引数を優先していたため露見しなかった。
+    os.environ["PUSH_ROTATION_ENABLED"] = "1"
+    os.environ["PUSH_STREAM_ENABLE_ROTATION"] = "1"
 
 
 def _ensure_stream_writer_singleton_started() -> Any:
@@ -425,8 +456,8 @@ __all__ = [
     "rotation_symbols",
     "rotation_register",
     "rotation_logging",
-    "rotation_stability_patch",
-    "rotation_liquidity_keep100_patch",
+    "rotation_stability",
+    "rotation_liquidity_keep100",
     "set_refresh_callable",
     "refresh_subscriptions",
     "get_ws_sender",

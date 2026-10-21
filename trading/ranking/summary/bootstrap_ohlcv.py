@@ -80,17 +80,19 @@ def safe_numeric_series(
                 .str.replace(",", "", regex=False)
                 .str.replace("円", "", regex=False)
                 .str.strip()
+                # 文字列 Series へ np.nan を入れると object->float の
+                # 暗黙ダウンキャスト (非推奨) になるので空文字へ寄せる。
+                # 直後の pd.to_numeric(errors="coerce") で同じ NaN になる。
                 .replace(
                     {
-                        "": np.nan,
-                        "None": np.nan,
-                        "none": np.nan,
-                        "NULL": np.nan,
-                        "null": np.nan,
-                        "nan": np.nan,
-                        "NaN": np.nan,
-                        "<NA>": np.nan,
-                        "pd.NA": np.nan,
+                        "None": "",
+                        "none": "",
+                        "NULL": "",
+                        "null": "",
+                        "nan": "",
+                        "NaN": "",
+                        "<NA>": "",
+                        "pd.NA": "",
                     }
                 )
             )
@@ -125,18 +127,18 @@ def _normalize_datetime_text(s: pd.Series) -> pd.Series:
             .str.replace("/", "-", regex=False)
             .str.replace("T", " ", regex=False)
             .str.replace("Z", "", regex=False)
+            # 同上。直後の pd.to_datetime(errors="coerce") で NaT になる。
             .replace(
                 {
-                    "": np.nan,
-                    "None": np.nan,
-                    "none": np.nan,
-                    "NULL": np.nan,
-                    "null": np.nan,
-                    "nan": np.nan,
-                    "NaN": np.nan,
-                    "<NA>": np.nan,
-                    "pd.NA": np.nan,
-                    "NaT": np.nan,
+                    "None": "",
+                    "none": "",
+                    "NULL": "",
+                    "null": "",
+                    "nan": "",
+                    "NaN": "",
+                    "<NA>": "",
+                    "pd.NA": "",
+                    "NaT": "",
                 }
             )
         )

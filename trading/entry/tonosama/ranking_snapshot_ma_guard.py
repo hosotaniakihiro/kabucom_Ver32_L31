@@ -28,6 +28,7 @@ import sqlite3
 from typing import Any
 
 import pandas as pd
+from sqlite_cm import committing_connect
 
 try:
     from database.paths.ranking_paths import resolve_ranking_db_path
@@ -222,7 +223,7 @@ def _load_snapshot_from_db(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     try:
-        with sqlite3.connect(str(db_path), timeout=1.0) as conn:
+        with committing_connect(str(db_path), timeout=1.0) as conn:
             cols = _table_columns(conn, SNAPSHOT_TABLE)
             if not cols:
                 logger.warning("[TONOSAMA RANKING MA] table columns empty db=%s table=%s", db_path, SNAPSHOT_TABLE)

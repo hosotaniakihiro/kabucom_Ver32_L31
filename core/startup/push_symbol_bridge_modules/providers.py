@@ -28,6 +28,7 @@ from .constants import (
 )
 from .import_utils import get_global_data, safe_call
 from .normalize import clean_symbols
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +195,7 @@ def read_sql_symbols(
         return []
 
     try:
-        with sqlite3.connect(str(db_path), timeout=10) as con:
+        with committing_connect(str(db_path), timeout=10) as con:
             con.row_factory = sqlite3.Row
 
             for sql in sql_candidates:

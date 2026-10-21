@@ -17,8 +17,8 @@ from .daily_mtf_loader import (
     load_daily_mtf_latest_df,
     load_daily_mtf_latest_map,
 )
-from .daily_runtime_patch import (
-    install_daily_mtf_runtime_patch,
+from .daily_runtime import (
+    install_daily_mtf_runtime_merge,
     load_daily_mtf_runtime_df,
     merge_daily_mtf_for_ai,
 )
@@ -32,7 +32,7 @@ __all__ = [
     "ensure_daily_mtf_columns_sqlite",
     "load_daily_mtf_latest_df",
     "load_daily_mtf_latest_map",
-    "install_daily_mtf_runtime_patch",
+    "install_daily_mtf_runtime_merge",
     "load_daily_mtf_runtime_df",
     "merge_daily_mtf_for_ai",
 ]

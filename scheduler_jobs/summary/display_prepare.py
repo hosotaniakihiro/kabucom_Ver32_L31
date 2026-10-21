@@ -103,7 +103,12 @@ def _safe_df(df: Any) -> pd.DataFrame:
             )
 
         try:
-            out.replace([np.inf, -np.inf], np.nan, inplace=True)
+            # 全列に replace をかけると object 列で暗黙ダウンキャストになり
+            # FutureWarning (Downcasting behavior in `replace` is deprecated) が出る。
+            # inf は数値列にしか入らないので数値列だけに限定する (値は変わらない)。
+            _num_cols = out.select_dtypes(include=[np.number]).columns
+            if len(_num_cols) > 0:
+                out[_num_cols] = out[_num_cols].replace([np.inf, -np.inf], np.nan)
         except Exception:
             logger.debug(
                 "[summary.display_prepare] inf replace failed",

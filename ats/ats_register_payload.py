@@ -9,9 +9,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
-from typing import List
+from typing import Iterator, List
 
 from global_state import global_data
 
@@ -38,6 +39,31 @@ from .ats_register_logging import (
 logger = logging.getLogger(__name__)
 
 UNREGISTER_WAIT_SEC = 5.0
+
+
+@contextlib.contextmanager
+def _kabu_register_sequence_lock(reason: str) -> "Iterator[None]":
+    """Kabu Station の register リストをプロセス間で直列化する。
+
+    register リストはセッション全体で 50 銘柄が上限の共有資源。
+    ATS の unregister -> wait -> register のすき間に push_receiver_runner の
+    rotation が 50 銘柄登録し、合計 100 になって
+      {"Code":4002006,"Message":"レジスト数エラー"}
+    で落ちていた。push 側が既に使っているロックをそのまま共用する。
+    ロックが使えない環境では従来通り素通しする。
+    """
+    try:
+        from trading.push.subscription_manager.register_ops import registration_sequence_lock
+    except Exception:
+        logger.debug("[ATS] register sequence lock unavailable -> continue without lock", exc_info=True)
+        yield
+        return
+    try:
+        with registration_sequence_lock(reason):
+            yield
+    except Exception:
+        logger.exception("[ATS] register sequence lock failed -> continue without lock reason=%s", reason)
+        yield
 
 
 # ============================================================
@@ -171,17 +197,21 @@ def switch_batch_vendor_style(symbols: List[str], phase: str) -> bool:
         logger.warning("[ATS %s] switch skipped: in 429 cooldown", phase)
         return False
 
-    logger.info("[ATS %s] unregister all start", phase)
-    ok_unreg = unregister_all_vendor()
-    if not ok_unreg:
-        logger.warning("[ATS %s] unregister all failed", phase)
-        return False
+    # unregister から register 完了までを 1 つのクリティカルセクションにする。
+    # 途中に push_receiver_runner の rotation が割り込むと合計 100 銘柄になり
+    # 4002006 レジスト数エラーになる。
+    with _kabu_register_sequence_lock(f"ats_switch_{phase}"):
+        logger.info("[ATS %s] unregister all start", phase)
+        ok_unreg = unregister_all_vendor()
+        if not ok_unreg:
+            logger.warning("[ATS %s] unregister all failed", phase)
+            return False
 
-    logger.info("[ATS %s] wait after unregister all %.1fs", phase, UNREGISTER_WAIT_SEC)
-    time.sleep(UNREGISTER_WAIT_SEC)
+        logger.info("[ATS %s] wait after unregister all %.1fs", phase, UNREGISTER_WAIT_SEC)
+        time.sleep(UNREGISTER_WAIT_SEC)
 
-    logger.info("[ATS %s] register new batch start", phase)
-    return register_symbols_batch(symbols, phase)
+        logger.info("[ATS %s] register new batch start", phase)
+        return register_symbols_batch(symbols, phase)
 
 
 # ============================================================

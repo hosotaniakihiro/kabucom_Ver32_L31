@@ -30,13 +30,14 @@
 from __future__ import annotations
 
 import datetime as dt
+from nas_root import nas_path, nas_root
 
 
 # ============================================================
 # base paths
 # ============================================================
 
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 
 
 # ============================================================

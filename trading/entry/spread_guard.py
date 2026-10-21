@@ -73,6 +73,9 @@ def calc_spread_metrics(quotes: dict | None) -> dict:
         quotes.get('ask_price') or quotes.get('AskPrice') or quotes.get('ask'),
         0.0,
     )
+    # 2026-10-01: kabu の BidPrice=売気配 / AskPrice=買気配 (名前が逆)。逆転していたら入れ替える
+    if bid > 0 and ask > 0 and bid > ask:
+        bid, ask = ask, bid
 
     if bid <= 0 or ask <= 0:
         return {

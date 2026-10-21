@@ -34,13 +34,13 @@ logger = logging.getLogger(__name__)
 
 RANKING_START_CANDIDATES = [
     # DB writer 起動候補。取得job登録は本ファイルで別途行う。
-    ("core.startup.scheduler_ranking_bootstrap", "start_ranking_db_writer_safe"),
+    ("core.startup.scheduler.ranking_bootstrap", "start_ranking_db_writer_safe"),
     ("trading.ranking.ranking_db_writer", "ensure_ranking_writer_started"),
 
     # startup thin wrapper / 旧名候補
-    ("core.startup.scheduler_startup", "start_ranking_db_writer_safe"),
-    ("core.startup.scheduler_startup", "start_ranking_db_writer"),
-    ("core.startup.scheduler_startup", "bootstrap_ranking_db_writer"),
+    ("core.startup.scheduler.startup", "start_ranking_db_writer_safe"),
+    ("core.startup.scheduler.startup", "start_ranking_db_writer"),
+    ("core.startup.scheduler.startup", "bootstrap_ranking_db_writer"),
 
     # ranking writer 旧名候補
     ("trading.ranking.ranking_db_writer", "start_ranking_db_writer"),
@@ -124,11 +124,27 @@ def start_existing_ranking_writer() -> bool:
         return False
 
 
+def _full_tick_due(now: dt.datetime) -> bool:
+    """毎分 tick のうち full で走らせる分か。"""
+    if not _env_bool("RANKING_COLLECTOR_ENABLE_FULL_TICK", False):
+        return False
+    every = _env_int("RANKING_COLLECTOR_FULL_EVERY_MINUTES", 3, min_value=1, max_value=60)
+    return (now.hour * 60 + now.minute) % every == 0
+
+
 def _run_ranking_fast_tick() -> None:
+    # 2026-09-29: full tick を別ジョブ (every(N).minutes) にしていたときは、
+    # 同じ分に毎分 :02 の fast tick が先に走っているため scheduler_core の
+    # same_started_minute で毎回はじかれ、full が一度も走らなかった
+    # (14:33 に FULL_TICK=1 を入れた後も 12 回連続 skip)。
+    # 1 分 1 回の枠の中で、full の分は full として走らせる。
+    now = dt.datetime.now().replace(microsecond=0)
+    if _full_tick_due(now):
+        _run_ranking_full_tick()
+        return
     try:
         from trading.ranking.scheduler_core import job_save_ranking
 
-        now = dt.datetime.now().replace(microsecond=0)
         logger.info("[RANKING RUNTIME] fast tick start now=%s", now)
         ret = job_save_ranking(mode="fast", run_full_postprocess=False, save_legacy=False, force=False)
         logger.info("[RANKING RUNTIME] fast tick done ret=%s", ret)
@@ -175,7 +191,10 @@ def register_ranking_collection_jobs() -> None:
             pass
         logger.info("[RANKING RUNTIME] registered fast ranking collect/save tick every minute at :%02d", at_second)
 
-    if enable_full:
+    if enable_full and enable_fast:
+        # full は毎分 tick の中で分番号から判定する (_full_tick_due)
+        logger.info("[RANKING RUNTIME] full ranking tick runs inside the minute tick every %d minutes", full_every_min)
+    elif enable_full:
         job = schedule.every(full_every_min).minutes.do(_run_ranking_full_tick)
         try:
             job.tag(_REGISTERED_TAG_FULL)

@@ -13,6 +13,7 @@ import pandas as pd
 from pathlib import Path
 
 from config.paths import get_path
+from sqlite_cm import committing_connect
 
 TABLE = "pseudo_summary_1min"
 
@@ -26,7 +27,7 @@ def ensure_table():
     db = _db_path()
     db.parent.mkdir(parents=True, exist_ok=True)
 
-    with sqlite3.connect(db) as con:
+    with committing_connect(db) as con:
         con.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -70,7 +71,7 @@ def insert_pseudo_1m(df: pd.DataFrame):
     d["is_pseudo"] = 1
     d = d[cols + ["is_pseudo"]]
 
-    with sqlite3.connect(db) as con:
+    with committing_connect(db) as con:
         d.to_sql(TABLE, con, if_exists="append", index=False)
 
 
@@ -79,5 +80,5 @@ def load_today_pseudo_1m() -> pd.DataFrame:
     if not db.exists():
         return pd.DataFrame()
 
-    with sqlite3.connect(db) as con:
+    with committing_connect(db) as con:
         return pd.read_sql(f"SELECT * FROM {TABLE}", con)

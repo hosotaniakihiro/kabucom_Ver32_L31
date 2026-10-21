@@ -14,7 +14,7 @@ conf = configparser.ConfigParser()
 conf.read("score_config.ini", encoding="utf-8")
 
 BUY_THRESHOLD = conf.getint("trade", "threshold", fallback=4)
-SELL_THRESHOLD = abs(conf.getint("trade", "sell_threshold", fallback=.-4))
+SELL_THRESHOLD = abs(conf.getint("trade", "sell_threshold", fallback=-4))
 ENTRY_BUDGET = conf.getint("trade", "entry_budget", fallback=500_000)  # 1銘柄50万円
 DEFAULT_MODE = "auto"
 

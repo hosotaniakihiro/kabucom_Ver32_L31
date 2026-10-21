@@ -34,6 +34,7 @@ from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Default paths
 # ============================================================
 
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 DEFAULT_RANKING_DIR = os.path.join(
     DEFAULT_BASE_DIR,
     "raw_data",
@@ -695,33 +696,30 @@ def add_ranking_indicators(
     df = df.dropna(subset=["symbol", "datetime", "close"])
     df = df.sort_values(["symbol", "datetime"]).reset_index(drop=True)
 
-    pieces: list[pd.DataFrame] = []
-
-    for symbol, g in df.groupby("symbol", sort=False):
-        one = g.copy().sort_values("datetime")
-        close = one["close"]
-
-        one["rsi"] = _calc_rsi(close, period=rsi_period)
-
-        macd, sig, hist = _calc_macd(
-            close,
-            fast=macd_fast,
-            slow=macd_slow,
-            signal=macd_signal,
-        )
-        one["macd"] = macd
-        one["macd_signal"] = sig
-        one["macd_hist"] = hist
-
-        one["rsi_slope"] = one["rsi"].diff()
-        one["macd_hist_slope"] = one["macd_hist"].diff()
-
-        pieces.append(one)
-
-    if not pieces:
+    # R18: 旧実装は 562 銘柄を Python ループで回し、銘柄ごとに
+    # g.copy() + sort_values をやり直して最後に 562 フレームを concat していた。
+    # df は既に ["symbol","datetime"] で整列済みなので、
+    # groupby.transform で 1 回に畳む (RSI / MACD の計算式は変えていない)。
+    if df.empty:
         return pd.DataFrame()
 
-    out = pd.concat(pieces, ignore_index=True)
+    out = df
+    grp = out.groupby("symbol", sort=False)["close"]
+
+    out["rsi"] = grp.transform(lambda s: _calc_rsi(s, period=rsi_period))
+
+    def _macd_part(idx: int):
+        return lambda s: _calc_macd(
+            s, fast=macd_fast, slow=macd_slow, signal=macd_signal
+        )[idx]
+
+    out["macd"] = grp.transform(_macd_part(0))
+    out["macd_signal"] = grp.transform(_macd_part(1))
+    out["macd_hist"] = grp.transform(_macd_part(2))
+
+    out["rsi_slope"] = out.groupby("symbol", sort=False)["rsi"].diff()
+    out["macd_hist_slope"] = out.groupby("symbol", sort=False)["macd_hist"].diff()
+
     out = out.sort_values(["symbol", "datetime"]).reset_index(drop=True)
 
     logger.info(
@@ -768,54 +766,54 @@ def add_ranking_indicator_flags(df: pd.DataFrame) -> pd.DataFrame:
         if c not in out.columns:
             out[c] = False
 
-    pieces: list[pd.DataFrame] = []
+    # R18: shift(1) と論理演算だけなので銘柄ループは不要。
+    # groupby.shift で銘柄境界をまたがない前値を 1 回で作る。
+    if out.empty:
+        return out
 
-    for symbol, g in out.groupby("symbol", sort=False):
-        one = g.copy().sort_values("datetime")
+    out = out.sort_values(["symbol", "datetime"]).reset_index(drop=True)
 
-        prev_macd = one["macd"].shift(1)
-        prev_sig = one["macd_signal"].shift(1)
-        prev_hist = one["macd_hist"].shift(1)
-        prev_rsi = one["rsi"].shift(1)
+    g = out.groupby("symbol", sort=False)
+    prev_macd = g["macd"].shift(1)
+    prev_sig = g["macd_signal"].shift(1)
+    prev_hist = g["macd_hist"].shift(1)
+    prev_rsi = g["rsi"].shift(1)
 
-        one["flag_macd_cross"] = (
-            (prev_macd <= prev_sig)
-            & (one["macd"] > one["macd_signal"])
-        )
+    out["flag_macd_cross"] = (
+        (prev_macd <= prev_sig)
+        & (out["macd"] > out["macd_signal"])
+    )
 
-        one["flag_macd_dc"] = (
-            (prev_macd >= prev_sig)
-            & (one["macd"] < one["macd_signal"])
-        )
+    out["flag_macd_dc"] = (
+        (prev_macd >= prev_sig)
+        & (out["macd"] < out["macd_signal"])
+    )
 
-        one["flag_macd_hist_expand"] = (
-            (one["macd_hist"] > 0)
-            & (one["macd_hist"] > prev_hist)
-        )
+    out["flag_macd_hist_expand"] = (
+        (out["macd_hist"] > 0)
+        & (out["macd_hist"] > prev_hist)
+    )
 
-        one["flag_macd_hist_contract"] = (
-            (one["macd_hist"] > 0)
-            & (one["macd_hist"] < prev_hist)
-        )
+    out["flag_macd_hist_contract"] = (
+        (out["macd_hist"] > 0)
+        & (out["macd_hist"] < prev_hist)
+    )
 
-        one["flag_rsi_rebound"] = (
-            (prev_rsi < 40)
-            & (one["rsi"] >= 40)
-        )
+    out["flag_rsi_rebound"] = (
+        (prev_rsi < 40)
+        & (out["rsi"] >= 40)
+    )
 
-        one["flag_rsi_midline_cross"] = (
-            (prev_rsi <= 50)
-            & (one["rsi"] > 50)
-        )
+    out["flag_rsi_midline_cross"] = (
+        (prev_rsi <= 50)
+        & (out["rsi"] > 50)
+    )
 
-        one["flag_rsi_falling"] = one["rsi"] < prev_rsi
+    out["flag_rsi_falling"] = out["rsi"] < prev_rsi
 
-        one["flag_rsi_overbought_70"] = one["rsi"] >= 70
+    out["flag_rsi_overbought_70"] = out["rsi"] >= 70
 
-        pieces.append(one)
-
-    out = pd.concat(pieces, ignore_index=True)
-    return out.sort_values(["symbol", "datetime"]).reset_index(drop=True)
+    return out.reset_index(drop=True)
 
 
 # ============================================================

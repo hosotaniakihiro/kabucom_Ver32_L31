@@ -11,6 +11,7 @@ import pandas as pd
 from .constants import DEFAULT_YAHOO_1MIN_DB_TEMPLATE, YAHOO_REFLECT_DELAY_MINUTES
 from .logging_utils import log_df_profile
 from .time_window import normalize_trade_date_to_yyyymmdd, trade_date_hyphen, resolve_yahoo_reflect_end_dt
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,7 @@ def load_saved_yahoo_1min_for_summary(*, trade_date=None, target_date=None, symb
 
     symbols_list = sorted({str(s).strip() for s in (symbols or []) if str(s).strip()}) if symbols is not None else []
     try:
-        with sqlite3.connect(db_path, timeout=30) as con:
+        with committing_connect(db_path, timeout=30) as con:
             tables = {str(r[0]) for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             table = "yahoo_1min" if "yahoo_1min" in tables else next((c for c in ("yahoo_intraday_1min", "intraday_1min", "stock_1min") if c in tables), None)
             if not table:

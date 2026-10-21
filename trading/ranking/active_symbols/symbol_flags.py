@@ -3,7 +3,7 @@
 # Version: Ver1.1-ACTIVE-SYMBOLS-SYMBOL-FLAGS-CREDIT-TYPE-CACHE
 # ============================================================
 from __future__ import annotations
-import logging, sqlite3
+import logging, os, sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from .config import ACTIVE_ALLOW_BUY_TARGET, ACTIVE_ALLOW_SELL_TARGET, ACTIVE_EXCLUDE_ETF, ACTIVE_REQUIRE_SYMBOL_FLAGS, SYMBOL_FLAGS_DB
@@ -111,6 +111,62 @@ def load_symbol_flags_eligible_symbols(*, db_path: str | Path = SYMBOL_FLAGS_DB,
         return eligible, info_map
 
 
+def _unknown_allow() -> bool:
+    """symbol_flags DB に載っていない銘柄を通すか (既定 True)。
+
+    2026-09-29: この DB は optional/batch/update_symbol_flags.py が
+    daily_watchlist から作るバッチ生成物で、updated_at が全 4,509 件
+    **2026-03-30** のまま (ファイル mtime も 5/22)。
+    そのため 2026-04 以降に上場した銘柄は「登録が無い」だけで、
+    旧実装はそれを「対象外」として落としていた。
+
+    実際に売買できる反証がある: 621A は 2026-09-28 に日計り信用で
+    建てて返済まで完了している (取引明細 -2,298 円) が、DB には無い。
+    627A / 625A / 634A / 646A / 593A / 604A / 259A / 619A も同様に
+    「DB に無い」だけ。これらは値上がり率上位に頻繁に出る銘柄群なので、
+    落とすと最も急騰する銘柄を恒久的に監視対象外にしてしまう。
+
+    一方 396A / 485A は DB にあって buy_target=0 / sell_target=0 なので、
+    こちらは明示的に対象外として落とす。
+
+    ACTIVE_FLAGS_UNKNOWN_ALLOW=0 で従来動作 (DB に無ければ落とす) に戻る。
+    DB を作り直したらこの区別は不要になる。
+    """
+    v = os.environ.get("ACTIVE_FLAGS_UNKNOWN_ALLOW")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "ng", "disabled")
+
+
+_KNOWN_CACHE: Dict[str, Any] = {"ts": 0.0, "known": None}
+
+
+def load_symbol_flags_known_symbols(*, db_path: str | Path = SYMBOL_FLAGS_DB, table: str = "symbol_flags") -> Set[str]:
+    """DB に行が存在する銘柄 (対象/対象外を問わない)。読めなければ空集合。"""
+    import time
+
+    now = time.time()
+    cached = _KNOWN_CACHE.get("known")
+    if cached is not None and now - float(_KNOWN_CACHE.get("ts") or 0.0) < 300.0:
+        return cached
+    known: Set[str] = set()
+    try:
+        p = Path(str(db_path))
+        if _path_exists(p):
+            with _connect_sqlite(p) as conn:
+                if _table_exists(conn, table):
+                    for r in conn.execute(f"SELECT symbol FROM {table}"):
+                        s = normalize_symbol(r[0] if not hasattr(r, "keys") else r["symbol"])
+                        if s:
+                            known.add(s)
+    except Exception:
+        logger.debug("[ACTIVE FLAGS] known symbols load failed", exc_info=True)
+        known = set()
+    _KNOWN_CACHE["known"] = known
+    _KNOWN_CACHE["ts"] = now
+    return known
+
+
 def filter_by_symbol_flags(symbols: Iterable[Any], *, eligible_symbols: Optional[Set[str]] = None, context: str = "") -> List[str]:
     cleaned = dedupe_keep_order(symbols)
     if not ACTIVE_REQUIRE_SYMBOL_FLAGS:
@@ -119,11 +175,22 @@ def filter_by_symbol_flags(symbols: Iterable[Any], *, eligible_symbols: Optional
     if not eligible:
         logger.warning("[ACTIVE FLAGS] eligible empty context=%s before=%d -> return empty", context, len(cleaned))
         return []
-    kept, removed = [], []
+    unknown_allow = _unknown_allow()
+    known = load_symbol_flags_known_symbols() if unknown_allow else set()
+    kept, removed, unknown_kept = [], [], []
     for s in cleaned:
         if s in eligible:
             kept.append(s)
+        elif unknown_allow and known and s not in known:
+            # DB に登録が無いだけ。明示的な対象外ではないので通す。
+            kept.append(s)
+            unknown_kept.append(s)
         else:
             removed.append(s)
-    logger.info("[ACTIVE FLAGS] context=%s before=%d after=%d removed=%d removed_head=%s", context, len(cleaned), len(kept), len(removed), removed[:30])
+    logger.info(
+        "[ACTIVE FLAGS] context=%s before=%d after=%d removed=%d unknown_kept=%d "
+        "known=%d unknown_allow=%s removed_head=%s unknown_head=%s",
+        context, len(cleaned), len(kept), len(removed), len(unknown_kept),
+        len(known), unknown_allow, removed[:30], unknown_kept[:20],
+    )
     return kept

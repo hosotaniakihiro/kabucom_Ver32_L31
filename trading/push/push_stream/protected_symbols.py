@@ -58,6 +58,7 @@ def _env_int(name: str, default: int) -> int:
 ENABLE_PROTECTED_PUSH_SYMBOLS = _env_bool('ENABLE_PROTECTED_PUSH_SYMBOLS', True)
 PROTECTED_PUSH_MAX_SYMBOLS = _env_int('PROTECTED_PUSH_MAX_SYMBOLS', 30)
 PROTECTED_PUSH_INCLUDE_DB_OPEN = _env_bool('PROTECTED_PUSH_INCLUDE_DB_OPEN', True)
+PROTECTED_PUSH_INCLUDE_BROKER_OPEN = _env_bool('PROTECTED_PUSH_INCLUDE_BROKER_OPEN', True)
 
 
 def _normalize(s: Any) -> str | None:
@@ -177,6 +178,44 @@ def _from_global_context_positions() -> list[str]:
     return []
 
 
+def _from_broker_open_positions() -> list[str]:
+    """証券会社の建玉一覧から保有中の信用銘柄を取る。
+
+    2026-09-14: ファイル冒頭の優先順位に「実建玉復元銘柄」と書かれているが
+    未実装だった。他の供給元は
+
+      * positions.db  -> エントリー時に書かれず、決済の 42 分後に CLOSED として
+                         一括記録されるため、保有中は常に空
+      * global_context / runtime / global 属性
+                      -> すべて main.py プロセス内のメモリ。この関数は
+                         push_receiver プロセスで動くので構造上見えない
+
+    という状態で、`[PROTECTED PUSH] resolved empty` (protected=0) が恒常化していた。
+    その結果、保有中の銘柄が 5 秒ごとのローテーションで PUSH 登録から外れ、
+    価格が止まったまま利確・損切りが発火していた。
+
+    実害 (2026-09-14): 4667 を 3683 で建て、PUSH 最終受信 09:09:56 の price=3700 で
+    「+0.462% >= trigger 0.450%」と利確判断したが、実際の市場は 3630 で、
+    成行決済の結果 -5,300 円になった。判断の 12 秒前の価格を見ていた。
+
+    read_kabu_open_positions() は positions_read_cache 経由でキャッシュされるので
+    ここから呼んでも /positions を叩き過ぎない。決済側 (trading.exit.executor の
+    broker patch) が既に同じ経路で建玉を復元できている。
+    """
+    if not PROTECTED_PUSH_INCLUDE_BROKER_OPEN:
+        return []
+    try:
+        from trading.position.kabu_position_reader import read_kabu_open_positions
+        positions = read_kabu_open_positions(caller='protected_symbols')
+        syms = _symbols_from_any(positions)
+        if syms:
+            logger.warning('[PROTECTED PUSH] broker open positions protected symbols=%s', syms[:30])
+        return syms
+    except Exception:
+        logger.debug('[PROTECTED PUSH] broker open positions load failed', exc_info=True)
+    return []
+
+
 def _from_db_open_positions() -> list[str]:
     if not PROTECTED_PUSH_INCLUDE_DB_OPEN:
         return []
@@ -210,6 +249,24 @@ def _from_runtime_pending_orders() -> list[str]:
     return []
 
 
+def _from_candidate_bridge_file() -> list[str]:
+    """main.py が書いたエントリー候補 (trading/entry/candidate_bridge)。
+
+    2026-09-15: 候補は main.py のメモリにあり、この (push_receiver) プロセスからは
+    見えないため P2_PENDING_* が一日中 0 件だった。候補が登録 50 銘柄に入らず、
+    /board が 400 (未登録) を返して BOARD_MISSING、MTF ゲートもデータ無しになっていた。
+    """
+    try:
+        from trading.entry.candidate_bridge import load
+        syms = _dedupe(load())
+        if syms:
+            logger.info('[PROTECTED PUSH] candidate bridge symbols=%s', syms[:30])
+        return syms
+    except Exception:
+        logger.debug('[PROTECTED PUSH] candidate bridge load failed', exc_info=True)
+    return []
+
+
 def _priority_buckets() -> list[tuple[str, list[str]]]:
     """リスク順に保護銘柄を返す。前ほど優先。"""
     position_attrs = (
@@ -236,12 +293,14 @@ def _priority_buckets() -> list[tuple[str, list[str]]]:
     )
 
     buckets = [
+        ('P1_POSITION_BROKER', _from_broker_open_positions()),
         ('P1_POSITION_DB', _from_db_open_positions()),
         ('P1_POSITION_GC', _from_global_context_positions()),
         ('P1_POSITION_RUNTIME', _from_runtime_open_positions()),
         ('P1_POSITION_GLOBAL', _symbols_from_global_attrs(position_attrs, label='P1_POSITION')),
         ('P2_PENDING_RUNTIME', _from_runtime_pending_orders()),
         ('P2_PENDING_GLOBAL', _symbols_from_global_attrs(order_attrs, label='P2_PENDING')),
+        ('P2_CANDIDATE_FILE', _from_candidate_bridge_file()),
         ('P3_RECENT_ENTRY', _symbols_from_global_attrs(entry_attrs, label='P3_RECENT_ENTRY')),
         ('P4_AI_CANDIDATE', _symbols_from_global_attrs(ai_attrs, label='P4_AI')),
     ]
@@ -292,6 +351,17 @@ def merge_protected_first(targets: Iterable[Any], *, max_symbols: int = 100) -> 
     protected = resolve_protected_push_symbols()
     normal = _symbols_from_any(targets)
     merged = _dedupe(list(protected) + list(normal))
+    # 2026-09-16: 上限は kabu Station の登録枠 (PUSH_REGISTER_MAX_KEEP=50) に揃える。
+    #   呼び出し側は DEFAULT_REGISTER_MAX_SYMBOLS=100 を渡してくるため、保護銘柄が
+    #   通常 50 と重ならないと merged=56 のように 50 を超え、rotation が A/B 2 面に
+    #   分割して 5 秒ごとに 39 銘柄を入れ替え → 4001019 が 106 回、受信 1,694 行/分
+    #   (前日 4,112) に落ちた (9/16 09:03〜09:44 実測)。
+    try:
+        keep = int(float(os.getenv("PUSH_REGISTER_MAX_KEEP", "50") or 50))
+    except Exception:
+        keep = 50
+    if keep > 0 and (max_symbols <= 0 or keep < max_symbols):
+        max_symbols = keep
     if max_symbols > 0:
         merged = merged[:max_symbols]
     logger.warning(

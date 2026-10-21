@@ -16,6 +16,8 @@ from global_state import global_data
 from config.paths import get_path
 
 from .constants import MARKET_CODE_TO_LABEL
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +129,23 @@ def _safe_read_sql(conn: sqlite3.Connection, sql: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _table_has_any_row(conn: sqlite3.Connection, table_name: str) -> bool:
+    """テーブルに1行でもあるかだけを O(1) で確かめる。
+
+    「使えるDBか」の判定に COUNT(*) を使うと、当日 ranking DB のように
+    場中ずっと増え続けるテーブル (日中で数十万行) を NAS 越しに全走査する
+    ことになり、呼ぶたびに遅くなる。件数は判定に不要なので LIMIT 1 で足りる。
+    """
+    try:
+        if not _table_exists(conn, table_name):
+            return False
+        row = conn.execute(f"SELECT 1 FROM [{table_name}] LIMIT 1").fetchone()
+        return row is not None
+    except Exception:
+        logger.debug("table row probe failed table=%s", table_name, exc_info=True)
+        return False
+
+
 def _table_row_count(conn: sqlite3.Connection, table_name: str) -> int:
     try:
         if not _table_exists(conn, table_name):
@@ -163,7 +182,7 @@ def _load_market_map(symbols: List[str]) -> Dict[str, str]:
     try:
         db_path = get_path("symbol_flags_db")
     except Exception:
-        db_path = r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db"
+        db_path = nas_path(r"Basic\symbol_flags.db")
 
     try:
         placeholders = ",".join("?" for _ in missing)
@@ -172,7 +191,7 @@ def _load_market_map(symbols: List[str]) -> Dict[str, str]:
             FROM symbol_flags
             WHERE symbol IN ({placeholders})
         """
-        with sqlite3.connect(str(db_path)) as conn:
+        with committing_connect(str(db_path)) as conn:
             rows = conn.execute(sql, missing).fetchall()
 
         for sym, market_type in rows:

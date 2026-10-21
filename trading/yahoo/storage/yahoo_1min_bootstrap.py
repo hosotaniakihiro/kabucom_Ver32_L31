@@ -26,6 +26,7 @@ import pathlib
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 # NAS ROOT
 # ============================================================
 
-RAW_DATA_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\yahoo\intraday"
+RAW_DATA_ROOT = nas_path(r"raw_data\yahoo\intraday")
 
 
 # ============================================================

@@ -8,6 +8,15 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+# volume_speed は「直近1分の出来高増分 / 分」で、下の volume_score では
+# rank_inverse_score (0〜1) に *素の大きさのまま* 足し込まれている。
+# ランキングAPIの単位を正準単位へ揃えた際 (trading/ranking/collectors.py:
+# RANKING_API_VOLUME_TO_SHARES) volume_speed が千株/分から株/分になり
+# 1000倍になるため、この配合比だけが 1000 倍ずれる。
+# スコアの重み付けは今回の修正対象ではないので、従来と同じ大きさになるよう
+# ここで千株/分へ戻してから足す。
+_VOLUME_SPEED_SCORE_UNIT = 1_000.0
+
 
 def apply_scores(x: pd.DataFrame) -> pd.DataFrame:
     if x is None or x.empty:
@@ -27,7 +36,7 @@ def apply_scores(x: pd.DataFrame) -> pd.DataFrame:
     )
     x["volume_score"] = np.where(
         rt.str.contains("売買高", na=False) | rt.str.contains("TICK", na=False),
-        x["rank_inverse_score"] + x["volume_speed"].clip(lower=0),
+        x["rank_inverse_score"] + x["volume_speed"].clip(lower=0) / _VOLUME_SPEED_SCORE_UNIT,
         0.0,
     )
 

@@ -1,0 +1,9 @@
+# 生成物(バックテスト成果物・チェックポイント)はコミットしない。コードのみ版管理。
+data/checkpoints/
+reports/*.html
+reports/*.csv
+reports/*.json
+reports/*.md
+!README.md
+__pycache__/
+*.pyc

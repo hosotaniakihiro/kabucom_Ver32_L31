@@ -67,26 +67,76 @@ _SKIP_ENTRY_RUNTIME_INIT_PATCHES = _core_startup_is_database_context()
 
 
 def _install_entry_runtime_init_patches() -> None:
+    # ============================================================
+    # summary scheduler stale guard の env 既定値
+    # (旧 core/startup/summary_scheduler_unified_stale_guard_patch.py V5 の install() から移設)
+    # ------------------------------------------------------------
+    # ガード本体のロジックは scheduler_jobs/summary/scheduler.py へ本文化済みだが、
+    # env 既定値の設定はこの位置に残す必要がある:
+    #   - SUMMARY_PUSH_BG_ALL_INTERVALS / SUMMARY_PUSH_BG_LONG_INTERVALS は
+    #     他の runtime patch が install 時に読むため設定タイミングが効く。
+    #   - full モードの FORCE_ENABLE_MAIN_SUMMARY_PARENT_TICK=1 は、明示的な
+    #     AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK=1 を打ち消す役割を持つ
+    #     (= 意図的に親tickを復帰させる)。省略すると挙動が変わる。
+    # ============================================================
     try:
-        from .summary_scheduler_unified_stale_guard_patch import install as install_summary_scheduler_unified_stale_guard_patch
+        def _core_stale_guard_env_flag(name: str, default: bool = False) -> bool:
+            raw = str(os.getenv(name, "")).strip().lower()
+            if raw in {"1", "true", "yes", "on", "enable", "enabled"}:
+                return True
+            if raw in {"0", "false", "no", "off", "disable", "disabled"}:
+                return False
+            return bool(default)
 
-        install_summary_scheduler_unified_stale_guard_patch()
+        def _core_stale_guard_main_entry_only() -> bool:
+            if _core_stale_guard_env_flag("AUTOSTOCK_MAIN_DATABASE_PROCESS") or _core_stale_guard_env_flag(
+                "AUTOSTOCK_DATA_COLLECTORS_PROCESS"
+            ):
+                return False
+            role = str(os.getenv("SUMMARY_DB_WRITER_ROLE") or "").strip().lower()
+            argv_main = os.path.basename(str(sys.argv[0])).lower() == "main.py"
+            return (
+                argv_main
+                or _core_stale_guard_env_flag("SUMMARY_MAIN_ENTRY_ONLY")
+                or role in ("entry_only", "main_entry_only", "read_only", "no_save")
+            )
+
+        if _core_stale_guard_main_entry_only():
+            _mode = str(os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE") or "full").strip().lower()
+            # main.py では前回の unified/fallback 残りを早く解放する。
+            os.environ.setdefault("SUMMARY_MAIN_UNIFIED_BG_STALE_SEC", "20")
+            os.environ.setdefault("SUMMARY_PUSH_FALLBACK_STALE_SEC", "25")
+            if _mode not in ("full", "restore", "live", "normal"):
+                os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK", "1")
+                os.environ["ENABLE_PUSH_SUMMARY_FALLBACK_WHEN_UNIFIED_BLOCKED"] = "0"
+                os.environ.setdefault("SUMMARY_PUSH_BG_ALL_INTERVALS", "0")
+                os.environ.setdefault("SUMMARY_PUSH_BG_LONG_INTERVALS", "0")
+                logger.warning(
+                    "[SUMMARY SCHEDULER STALE GUARD] main entry process: parent tick/fallback guarded mode=%s",
+                    _mode,
+                )
+            else:
+                os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK", "0")
+                os.environ.setdefault("FORCE_ENABLE_MAIN_SUMMARY_PARENT_TICK", "1")
+                # full 運用でも previous_unified_bg_still_running からの PUSH fallback 連鎖は止める。
+                os.environ.setdefault("SUMMARY_SUPPRESS_PREVIOUS_UNIFIED_FALLBACK_IN_MAIN", "1")
+                logger.warning(
+                    "[SUMMARY SCHEDULER STALE GUARD] main full mode: parent tick restored mode=%s",
+                    _mode,
+                )
     except Exception:
-        logger.exception("[core.startup] summary scheduler unified stale guard patch install failed")
+        logger.exception("[core.startup] summary scheduler stale guard env defaults failed")
 
-    try:
-        from .ranking_summary_schedule_bg_patch import install as install_ranking_summary_schedule_bg_patch
+    # ranking_summary_schedule_bg_patch は
+    # core/startup/scheduler_bootstrap._run_ranking_summary_all_job_safe へ本文化済み
+    # (BG投入 / timeout cooldown / stale解除)。スコープは同ファイルの
+    # _ranking_bg_scope_enabled() が担う。
+    # schedule 済み job の参照書き換えは、本体側が挙動を持つため不要になった。
 
-        install_ranking_summary_schedule_bg_patch()
-    except Exception:
-        logger.exception("[core.startup] ranking summary schedule bg patch install failed")
-
-    try:
-        from .summary_controller_soft_technical_ready_patch import install as install_summary_controller_soft_technical_ready_patch
-
-        install_summary_controller_soft_technical_ready_patch()
-    except Exception:
-        logger.exception("[core.startup] summary controller soft technical ready patch install failed")
+    # summary_controller_soft_technical_ready_patch は
+    # trading/summary/controller_projection.rebuild_technical_ready へ本文化済み。
+    # DB専用子プロセスへ効かせないスコープは同ファイルの
+    # _soft_technical_ready_enabled() (argv判定 + SUMMARY_SOFT_TECHNICAL_READY_ENABLED) が担う。
 
     # ============================================================
     # summary runner ready-fill-before-save patch
@@ -111,7 +161,7 @@ def _install_entry_runtime_init_patches() -> None:
             before_cols = set(df.columns)
 
             try:
-                from trading.summary.pipeline.indicator_short_history_patch import add_short_history_indicators
+                from trading.summary.pipeline.indicator_short_history import add_short_history_indicators
                 filled = add_short_history_indicators(df, interval=interval)
             except Exception:
                 logger.exception("[SUMMARY RUNNER READY FILL] add_short_history_indicators failed interval=%s source=%s", interval, source)
@@ -150,6 +200,33 @@ def _install_entry_runtime_init_patches() -> None:
             logger.warning("[SUMMARY RUNNER READY FILL] _save_summary_if_owner not callable")
         else:
             def _core_save_summary_if_owner_patched(df, interval: int, *, source: str) -> None:
+                # 旧 core/startup/summary_main_skip_save_for_display_patch.py を本文化。
+                # 旧構成では ready_fill(この関数) の **外側** に display-first ラッパーが
+                # 載っていた (__init__.py はモジュールレベルで先に走り、旧パッチは
+                # startup.py 経由で後だったため)。短絡時は ready_fill も走らない。
+                # 順序を保つため、この関数の冒頭で判定する。
+                try:
+                    from scheduler_jobs.summary.display_first_save import (
+                        should_display_first as _df_should,
+                        submit_async_save as _df_submit,
+                    )
+
+                    if _df_should(interval, source):
+                        try:
+                            _rows = len(df) if hasattr(df, "__len__") else 0
+                        except Exception:
+                            _rows = 0
+                        logger.warning(
+                            "[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] display first; main DB direct save disabled by default interval=%s source=%s rows=%s role=%s direct=%s",
+                            interval, source, _rows,
+                            os.getenv("SUMMARY_DB_WRITER_ROLE", ""),
+                            os.getenv("SUMMARY_MAIN_ASYNC_DIRECT_DB_SAVE", "0"),
+                        )
+                        _df_submit(df, interval, source)
+                        return None
+                except Exception:
+                    logger.exception("[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] display-first check failed; fall through to normal save")
+
                 try:
                     _core_ready_fill_inplace(df, interval=int(interval), source=str(source))
                 except Exception:
@@ -162,9 +239,43 @@ def _install_entry_runtime_init_patches() -> None:
         logger.exception("[core.startup] summary runner ready fill before save patch install failed")
 
     try:
-        from .ranking_entry_volume_unit_patch import install as install_ranking_entry_volume_unit_patch
+        # ranking_entry_volume_unit_patch V4.5 から移設。
+        # volume/turnover の単位補正そのものは
+        # trading/ranking/entry_from_ranking._normalize_ranking_row_for_entry へ本文化済み。
+        # ここに残すのは RANKING_ENTRY_CONFIG の閾値上書きと、
+        # 旧パッチが同時 install していた source prefilter の起動。
+        from config.ranking_entry_config import RANKING_ENTRY_CONFIG as _rank_cfg
 
-        install_ranking_entry_volume_unit_patch()
+        def _rank_env_float(name: str, default: float) -> float:
+            try:
+                v = os.getenv(name)
+                if v is not None and str(v).strip() != "":
+                    return float(v)
+            except Exception:
+                pass
+            return float(default)
+
+        _price_cfg = _rank_cfg.setdefault("PRICE", {})
+        _old_price_min = float(_price_cfg.get("MIN", 300))
+        _price_cfg["MIN"] = _rank_env_float("RANKING_ENTRY_PRICE_MIN", 150.0)  # 2026-10-20: 200 -> 150 (ユーザー判断)
+
+        _vol_cfg = _rank_cfg.setdefault("VOLUME", {})
+        _vol_cfg["MIN_VOLUME"] = _rank_env_float(
+            "RANKING_ENTRY_MIN_VOLUME", float(_vol_cfg.get("MIN_VOLUME", 30000))
+        )
+        _vol_cfg["MIN_TURNOVER"] = _rank_env_float(
+            "RANKING_ENTRY_MIN_TURNOVER", float(_vol_cfg.get("MIN_TURNOVER", 10000000))
+        )
+
+        # ranking_entry_source_prefilter_patch_v2 は
+        # trading/ranking/entry_from_ranking.py へ本文化済み (_rsrc_prefilter)。
+        # 適用スコープ (DBコンテキストは除外、main.py では db fallback 側が
+        # 属性ごと置換していたので不適用) は
+        # entry_from_ranking._rsrc_prefilter_scope_enabled() が再現している。
+        logger.warning(
+            "[RANKING ENTRY UNIT FIX] config applied price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f prefilter=inlined",
+            _old_price_min, _price_cfg["MIN"], _vol_cfg["MIN_VOLUME"], _vol_cfg["MIN_TURNOVER"],
+        )
     except Exception:
         logger.exception("[core.startup] ranking entry volume unit patch install failed")
 
@@ -523,12 +634,10 @@ def _install_entry_runtime_init_patches() -> None:
     except Exception:
         logger.exception("[core.startup] summary AI score env patch install failed")
 
-    try:
-        from .summary_write_gate_runtime_patch import install_summary_write_gate_runtime_patch
-
-        install_summary_write_gate_runtime_patch()
-    except Exception:
-        logger.exception("[core.startup] summary write gate runtime patch install failed")
+    # summary_write_gate_runtime_patch は
+    # trading/summary/persistence/core/upsert_executor.execute_upsert へ本文化済み。
+    # スコープ (DB専用子プロセスには適用しない) は同ファイルの
+    # _write_gate_runtime_enabled() が担う。
 
     # ============================================================
     # ranking summary persistence lock patch (database is locked を warning+skip に緩和)
@@ -615,33 +724,76 @@ def _install_entry_runtime_init_patches() -> None:
     except Exception:
         logger.exception("[core.startup] ranking summary persistence lock patch install failed")
 
-    try:
-        from .allow_orders_runtime_patch import install_allow_orders_runtime_patch
+    # allow_orders_runtime_patch は削除済み (本文化不要)。
+    # 同じ env 解決ロジックが core/global_context/context.py の _resolve_allow_orders()
+    # として本体入りしており、GlobalContext.__init__ が起動時に適用する。
+    # パッチが追加でやっていた global_data.allow_orders への代入は、その後
+    # init_runtime_flags() (startup_config) と market mode 判定 (startup_orchestrator)
+    # が上書きするため実効差が無い。
 
-        install_allow_orders_runtime_patch()
-    except Exception:
-        logger.exception("[core.startup] allow orders runtime patch install failed")
-
-    try:
-        from .exit_limit_board_touch_runtime_patch import install as install_exit_limit_board_touch_patch
-
-        install_exit_limit_board_touch_patch()
-    except Exception:
-        logger.exception("[core.startup] exit board touch limit patch install failed")
+    # exit_limit_board_touch_runtime_patch は
+    # trading/exit/executor._build_kabu_close_payload へ本文化済み
+    # (_apply_exit_limit_board_touch)。スコープは同ファイルの
+    # _exit_board_runtime_enabled() が担う。
 
     try:
-        from .summary_existing_null_repair_patch import install as install_summary_existing_null_repair_patch
+        # 旧 core/startup/summary_existing_null_repair_patch.py。
+        # monkeypatch ではない補修ユーティリティなので
+        # trading/summary/existing_null_repair.py へ移設した。
+        from trading.summary.existing_null_repair import install as install_summary_existing_null_repair
 
-        install_summary_existing_null_repair_patch()
+        install_summary_existing_null_repair()
     except Exception:
         logger.exception("[core.startup] summary existing null repair patch install failed")
 
-    try:
-        from .daily_signal_cache_fast_startup_patch import install as install_daily_signal_cache_fast_startup_patch
+    # daily_signal_cache_fast_startup_patch は startup_orchestrator._warmup_daily_signal_cache_safe
+    # へ本文化済み (main.py での全銘柄同期warmupスキップ / async / 強制実行の env 判定)。
 
-        install_daily_signal_cache_fast_startup_patch()
-    except Exception:
-        logger.exception("[core.startup] daily signal cache fast startup patch install failed")
+
+# ============================================================
+# install 群の冪等ガード (2026-09-03)
+# ------------------------------------------------------------
+# core.startup の import 中に例外が出ると、Python は途中まで作った
+# モジュールを sys.modules から削除する。呼び出し側の try/except が
+# それを飲み込むと、次に誰かが core.startup(.X) を import した時点で
+# **この __init__.py が先頭から再実行され、install 群が丸ごと再走**する。
+#
+# 2026-09-03 の main.py 起動失敗ログで実際に起きていた:
+#   core/startup/__init__.py:599  -> OSError(24) scipy/.../__init__.py
+#   core/startup/__init__.py:650  -> OSError(24) trading/ranking/__init__.py
+#   core/startup/__init__.py:743  -> OSError(24) trading/summary/existing_null_repair.py
+#   sitecustomize.py:182          -> OSError(24) core/startup/__init__.py
+# 1 回の失敗が再 import を呼び、再 import が更に NAS への open を増やして
+# SMB セッション断を悪化させる、という増幅ループになっていた。
+#
+# モジュール変数のフラグは再実行で作り直されるので効かない。
+# プロセス内で確実に生き残る sys 上の属性に置く。
+# _installing は再入 (循環 import 中の再呼び出し) も止める。
+# ============================================================
+_ENTRY_PATCHES_DONE_ATTR = "_autostock_core_startup_entry_patches_installed"
+_ENTRY_PATCHES_BUSY_ATTR = "_autostock_core_startup_entry_patches_installing"
+
+
+def _entry_runtime_init_patches_once() -> None:
+    if getattr(sys, _ENTRY_PATCHES_DONE_ATTR, False):
+        logger.warning(
+            "[core.startup] entry/ranking/summary runtime init patches already installed "
+            "in this process; skipping re-install (module re-execution guard)"
+        )
+        return
+    if getattr(sys, _ENTRY_PATCHES_BUSY_ATTR, False):
+        logger.warning(
+            "[core.startup] entry/ranking/summary runtime init patches are already running "
+            "(re-entrant import detected); skipping nested install"
+        )
+        return
+
+    setattr(sys, _ENTRY_PATCHES_BUSY_ATTR, True)
+    try:
+        _install_entry_runtime_init_patches()
+        setattr(sys, _ENTRY_PATCHES_DONE_ATTR, True)
+    finally:
+        setattr(sys, _ENTRY_PATCHES_BUSY_ATTR, False)
 
 
 if _SKIP_ENTRY_RUNTIME_INIT_PATCHES:
@@ -651,13 +803,88 @@ if _SKIP_ENTRY_RUNTIME_INIT_PATCHES:
         sys.argv,
     )
 else:
-    _install_entry_runtime_init_patches()
+    _entry_runtime_init_patches_once()
 
-from .startup import system_startup
-from .summary_bootstrap import (
-    bootstrap_summary,
-    run_bootstrap_incremental_rebuild_if_available,
-)
+# ============================================================
+# 公開名の遅延解決 (DB 専用子プロセスの起動時間対策)
+# ------------------------------------------------------------
+# 2026-09-03 実測:
+#   sitecustomize.py は全プロセスで core.startup.runtime_env.installer を
+#   import する。その副作用でこのファイルが走り、下の 2 行が
+#   core.startup.startup_orchestrator 経由で取引スタック全体
+#   (約1600 module) を NAS(SMB) から読み込んでいた。
+#
+#     何もしない probe スクリプト    473 秒
+#       site           cum 471.16s
+#       sitecustomize  cum 468.48s
+#       core.startup   cum 450.17s   <- ほぼ全部
+#     SMB 実測: stat 4.2ms/file, read 16.8ms/file
+#
+#   db_prepare_runner / push_receiver_runner / ranking_collector_runner /
+#   summary_database_runner / yahoo_complement_runner は system_startup() も
+#   bootstrap_summary() も呼ばない。import するだけで 5 分近く待たされていた。
+#
+# 方針:
+#   DB 専用プロセス (= _SKIP_ENTRY_RUNTIME_INIT_PATCHES と同じ判定) のときだけ
+#   PEP 562 の module __getattr__ で遅延解決する。
+#   `from core.startup import system_startup` は従来どおり動き、
+#   実際に名前が参照された時点で初めて重い import が走る。
+#
+#   main.py (live trading) は従来どおり即時 import のまま。
+#   そもそも main.py は `from core.startup.startup import system_startup` と
+#   サブモジュールを直接指定しているのでこの分岐の影響を受けない。
+#
+#   CORE_STARTUP_EAGER_EXPORTS=1 で従来の即時 import に戻せる。
+# ============================================================
+_LAZY_EXPORTS = {
+    "system_startup": ("core.startup.startup", "system_startup"),
+    "bootstrap_summary": ("core.startup.summary.bootstrap", "bootstrap_summary"),
+    "run_bootstrap_incremental_rebuild_if_available": (
+        "core.startup.summary.bootstrap",
+        "run_bootstrap_incremental_rebuild_if_available",
+    ),
+}
+
+
+def _core_startup_lazy_exports_enabled() -> bool:
+    try:
+        if str(os.getenv("CORE_STARTUP_EAGER_EXPORTS", "")).strip().lower() in {
+            "1", "true", "yes", "y", "on", "enable", "enabled",
+        }:
+            return False
+    except Exception:
+        pass
+    return bool(_SKIP_ENTRY_RUNTIME_INIT_PATCHES)
+
+
+if _core_startup_lazy_exports_enabled():
+
+    def __getattr__(name: str):
+        target = _LAZY_EXPORTS.get(name)
+        if target is None:
+            raise AttributeError("module %r has no attribute %r" % (__name__, name))
+        module_name, attr = target
+        import importlib
+
+        value = getattr(importlib.import_module(module_name), attr)
+        globals()[name] = value
+        return value
+
+    def __dir__():
+        return sorted(set(list(globals().keys()) + list(_LAZY_EXPORTS)))
+
+    logger.warning(
+        "[core.startup] database-context process detected; deferring %s to first use "
+        "(system_startup / bootstrap_summary の即時 import をやめて起動時間を短縮する。"
+        "CORE_STARTUP_EAGER_EXPORTS=1 で従来動作)",
+        ",".join(sorted(_LAZY_EXPORTS)),
+    )
+else:
+    from .startup import system_startup
+    from .summary.bootstrap import (
+        bootstrap_summary,
+        run_bootstrap_incremental_rebuild_if_available,
+    )
 
 __all__ = [
     "system_startup",

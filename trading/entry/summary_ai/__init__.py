@@ -14,11 +14,8 @@ try:
         run_push_summary_ai_entry,
         run_ranking_summary_ai_entry,
     )
-    try:
-        from .weak_signal_filter_patch import install as _install_weak_signal_filter
-        _install_weak_signal_filter()
-    except Exception:
-        pass
+    # weak_signal_filter_patch は runner.run_ai_gate_for_candidates 本体へ
+    # 本文化した (_wsf_*)。import 時点で効くので install は不要。
 except Exception:
     run_summary_ai_entry_from_df = None
     run_summary_ai_entry = None
