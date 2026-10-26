@@ -98,6 +98,13 @@ def reset(interval: int | None = None) -> None:
             _SHADOW_TICK.pop(int(interval), None)
 
 
+def snapshot(interval: int) -> pd.DataFrame | None:
+    """キャッシュしている素の足のコピー (無ければ None)。DB への補完書き込み用。"""
+    with _LOCK:
+        df = _CACHE.get(int(interval))
+        return None if df is None else df.copy()
+
+
 def cached_rows(interval: int) -> int:
     with _LOCK:
         df = _CACHE.get(int(interval))

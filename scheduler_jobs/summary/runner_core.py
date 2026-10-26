@@ -941,6 +941,15 @@ def _job_summary_original_heavy(interval: int, display: bool = True, now: Option
             _save_summary_if_owner(df, interval, source="push")
     else:
         _save_summary_if_owner(df, interval, source="push")
+    # 2026-10-26: 上の保存は履歴キャッシュの最新1行しか書かず、PUSH の新しい足の
+    #   大半が DB に届いていなかった。確定済みの足を、DB に無い分だけ書き足す。
+    if _summary_save_enabled() and not (_st is not None and _st.should_stop("before_push_bar_backfill")):
+        try:
+            from .push_bar_backfill import backfill_from_bar_cache
+
+            backfill_from_bar_cache(interval, now)
+        except Exception:
+            logger.exception("[summary.runners] push bar backfill failed interval=%s", interval)
     log_job_result("job_summary(PUSH)", interval, df, meta)
     # Entry dispatch は予算切れでも実行する。ここを飛ばすと発注が消えるため、
     # 降りるのは NAS I/O の手前まで。Entry 側は Entry 側の budget で守る。
