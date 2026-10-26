@@ -530,6 +530,85 @@ def _sort_by_recent_move(symbols: list[str], now: _dt.datetime | None = None) ->
     return out
 
 
+_BURST_CACHE: dict[str, Any] = {"at": 0.0, "key": "", "syms": []}
+
+
+def _recent_burst_symbols(now: _dt.datetime) -> list[str]:
+    """直近 3 分で急に動いた銘柄 (2026-10-26 ユーザー要望「登録の遅れを今すぐ直して」)。
+
+    _sort_by_recent_move は 15 分の 1 分平均なので、動き出しが 15 分で薄まる。
+    10/26 の 6203 (豊和工業) は 10:48 1,952 → 10:51 2,010 (+3%) と動き出し 11:05 にストップ高、
+    PUSH 登録は 10:54:41 で、登録時は既に +9% だった。
+    3 分の変化率 (絶対値) が 1.5% 以上かつ 3 分の売買代金 1 億円以上を、変化の大きい順に最大 8 件。
+    10/26 のランキング DB で 1 分あたり平均 1.3 件 (最大 8 件)、6203 は 10:50 に拾える。
+    PUSH_ROTATION_BURST_PRIORITY=0 で無効。
+    """
+    import time as _time
+
+    if not _b("PUSH_ROTATION_BURST_PRIORITY", True):
+        return []
+    win = max(2, _i("PUSH_ROTATION_BURST_MINUTES", 3))
+    min_chg = _f("PUSH_ROTATION_BURST_MIN_CHANGE_PCT", 1.5)
+    min_tv = _f("PUSH_ROTATION_BURST_MIN_TRADING_VALUE", 1e8)
+    max_n = max(0, _i("PUSH_ROTATION_BURST_MAX_SYMBOLS", 8))
+    min_price = _f("PUSH_ROTATION_RECENT_MOVE_MIN_PRICE", 200.0)
+    key = f"{now:%Y%m%d%H%M}-{win}-{min_chg}-{min_tv}-{max_n}"
+    cache_sec = max(0.0, _f("PUSH_ROTATION_BURST_CACHE_SEC", 10.0))
+    if _BURST_CACHE["key"] == key and _time.time() - _BURST_CACHE["at"] < cache_sec:
+        return list(_BURST_CACHE["syms"])
+
+    from trading.ranking.ranking_db_location import ranking_db_path
+
+    path = ranking_db_path(now.date())
+    if not path.exists() or max_n <= 0:
+        return []
+    since = (now - _dt.timedelta(minutes=win + 2)).strftime("%Y-%m-%d %H:%M:%S")
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+    try:
+        rows = con.execute(
+            "SELECT symbol, substr(datetime,1,16), MAX(COALESCE(current_price, price)), MAX(trading_value)"
+            " FROM ranking_snapshot_1min WHERE datetime >= ? AND datetime <= ?"
+            " GROUP BY symbol, substr(datetime,1,16) ORDER BY symbol, 2",
+            (since, now.strftime("%Y-%m-%d %H:%M:%S")),
+        ).fetchall()
+    finally:
+        con.close()
+
+    series: dict[str, list[tuple[_dt.datetime, float, float]]] = {}
+    for sym, t, price, value in rows:
+        try:
+            p = float(price or 0.0)
+            if p <= 0:
+                continue
+            series.setdefault(str(sym).strip().upper(), []).append(
+                (_dt.datetime.strptime(str(t), "%Y-%m-%d %H:%M"), p, float(value or 0.0))
+            )
+        except Exception:
+            continue
+    scored: list[tuple[float, str]] = []
+    for sym, pts in series.items():
+        t1, p1, v1 = pts[-1]
+        if p1 < min_price:
+            continue
+        # 最新点から win 分以内で最も古い点と比べる (ランキングは 1〜2 分おきに抜ける)
+        base = None
+        for t0, p0, v0 in pts:
+            if (t1 - t0).total_seconds() <= win * 60:
+                base = (t0, p0, v0)
+                break
+        if base is None or (t1 - base[0]).total_seconds() < 120:
+            continue
+        chg = (p1 - base[1]) / base[1] * 100.0
+        if abs(chg) >= min_chg and (v1 - base[2]) >= min_tv:
+            scored.append((abs(chg), sym))
+    out = [s for _, s in sorted(scored, reverse=True)[:max_n]]
+    _BURST_CACHE.update(at=_time.time(), key=key, syms=out)
+    if out:
+        logger.info("[PUSH ROTATION TARGET TOPUP] burst first=%s win=%dm min_chg=%.1f%% min_tv=%.0f",
+                    [(s, round(c, 2)) for c, s in sorted(scored, reverse=True)[:max_n]], win, min_chg, min_tv)
+    return out
+
+
 _SPREAD_CACHE: dict[str, Any] = {"at": 0.0, "spreads": {}}
 
 
@@ -635,6 +714,92 @@ def _drop_wide_spread(symbols: list[str], now: _dt.datetime | None = None) -> li
     return out
 
 
+def _latest_price_map(symbols: list[str], now: _dt.datetime) -> dict[str, float]:
+    """銘柄ごとの直近の株価。ランキング DB (ローカル、全銘柄 1ms 未満) を先に見て、
+    無い銘柄 (ETF など) だけ PUSH DB を (symbol, datetime) の索引で引く。"""
+    out: dict[str, float] = {}
+    from trading.ranking.ranking_db_location import ranking_db_path
+
+    rpath = ranking_db_path(now.date())
+    if rpath.exists():
+        con = sqlite3.connect(f"file:{rpath}?mode=ro", uri=True, timeout=1.0)
+        try:
+            for sym in symbols:
+                row = con.execute(
+                    "SELECT COALESCE(current_price, price) FROM ranking_snapshot_1min"
+                    " WHERE symbol=? ORDER BY datetime DESC LIMIT 1",
+                    (sym,),
+                ).fetchone()
+                if row and row[0] and float(row[0]) > 0:
+                    out[sym] = float(row[0])
+        finally:
+            con.close()
+    todo = [s for s in symbols if s not in out]
+    if todo:
+        from trading.push.push_db_location import push_db_path
+
+        ppath = push_db_path(now.date())
+        if ppath.exists():
+            con = sqlite3.connect(f"file:{ppath}?mode=ro", uri=True, timeout=1.0)
+            try:
+                for sym in todo:
+                    row = con.execute(
+                        "SELECT price FROM stream_data_raw WHERE symbol=? ORDER BY datetime DESC LIMIT 1",
+                        (sym,),
+                    ).fetchone()
+                    if row and row[0] and float(row[0]) > 0:
+                        out[sym] = float(row[0])
+            finally:
+                con.close()
+    return out
+
+
+def _drop_over_max_price(symbols: list[str], now: _dt.datetime | None = None) -> list[str]:
+    """売買対象の上限 (既定 7,000 円) を超える銘柄を PUSH 監視から外す (2026-10-26 ユーザー要望)。
+
+    summary の価格条件 (trade_universe_filter: 150 < close <= 7000) で足が作られず、
+    エントリーもできないのに PUSH の 50 枠を使っていた (10/26 前場は 6857/285A/6532 など
+    8 銘柄、受信 57 銘柄の 14%)。外した分は後ろの銘柄が繰り上がる。
+    保有・候補 (protected) と株価が取れない銘柄は残す。
+    PUSH_ROTATION_PRICE_FILTER=0 で無効、上限は PUSH_ROTATION_MAX_PRICE で変えられる。
+    """
+    now = now or _dt.datetime.now()
+    if not symbols or not _b("PUSH_ROTATION_PRICE_FILTER", True):
+        return symbols
+    try:
+        from trading.summary.pipeline.trade_universe_filter import resolve_pipeline_max_price
+
+        default_max = float(resolve_pipeline_max_price())
+    except Exception:
+        default_max = 7000.0
+    max_price = _f("PUSH_ROTATION_MAX_PRICE", default_max)
+    try:
+        prices = _latest_price_map(_d_core(symbols), now)
+    except Exception:
+        logger.debug("[PUSH ROTATION TARGET TOPUP] price map failed", exc_info=True)
+        return symbols
+    over = [s for s in symbols if prices.get(s, 0.0) > max_price]
+    if not over:
+        return symbols
+    try:
+        from .protected_symbols import resolve_protected_push_symbols
+
+        protected = set(_d_core(resolve_protected_push_symbols() or ()))
+    except Exception:
+        protected = set()
+    over_set = {s for s in over if s not in protected}
+    if not over_set:
+        return symbols
+    try:
+        logger.info(
+            "[PUSH ROTATION TARGET TOPUP] over max price dropped n=%d max=%.0f dropped=%s",
+            len(over_set), max_price, [(s, prices[s]) for s in over if s in over_set][:15],
+        )
+    except Exception:
+        pass
+    return [s for s in symbols if s not in over_set]
+
+
 def resolve_monitor_symbols() -> list[str]:
     from . import rotation_core, rotation_symbols
 
@@ -680,6 +845,22 @@ def resolve_monitor_symbols() -> list[str]:
             logger.info("[PUSH ROTATION TARGET TOPUP] theme flow hot first=%s protected=%d", _hot, len(_prot))
     except Exception:
         logger.debug("[PUSH ROTATION TARGET TOPUP] theme flow hot failed", exc_info=True)
+    # 2026-10-26: 直近 3 分で急に動いた銘柄を保有のすぐ後ろへ (テーマ株より前)。保有と合わせて
+    #   PUSH_ROTATION_FIXED_SYMBOLS (15) 以内なら固定枠に入り、A/B 両方で受信する。
+    try:
+        _burst = _d_core(_recent_burst_symbols(_dt.datetime.now()))
+        if _burst:
+            try:
+                from .protected_symbols import resolve_protected_push_symbols
+
+                _prot_b = [s for s in _d_core(resolve_protected_push_symbols() or ()) if s]
+            except Exception:
+                _prot_b = []
+            merged = _d_core(_prot_b + _burst + merged)
+    except Exception:
+        logger.debug("[PUSH ROTATION TARGET TOPUP] burst failed", exc_info=True)
+    # 2026-10-26: 7,000 円超は足もエントリーも無いので外す (切り詰める前に外して枠を埋める)。
+    merged = _drop_over_max_price(merged)
     # 2026-10-05: 直近のスプレッドが 0.20% 超の銘柄は最後のガードで必ず弾かれるので後ろへ回す。
     merged = _drop_wide_spread(merged)[:max_keep]
 
@@ -689,6 +870,8 @@ def resolve_monitor_symbols() -> list[str]:
         from trading.watch import materials_watch as _mw
 
         _pri = _mw.watch_symbols()
+        if _pri:
+            _pri = _drop_over_max_price(_d_core(_pri))
         if _pri:
             merged = _d(list(_pri) + merged)[:max_keep]
             logger.info("[PUSH ROTATION TARGET TOPUP] materials watch first=%s", _pri)
