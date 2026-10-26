@@ -145,6 +145,12 @@ def start_scheduler_stack_before_restore() -> None:
         _register_ma_pullback()
     except Exception:
         logger.exception("[startup.scheduler] ma_pullback register failed")
+    # 2026-10-26: 場中の決算直後の値動きを記録 (売買しない、trading/monitors/earnings_watch.py)
+    try:
+        from trading.monitors.earnings_watch import register_scheduler_safe as _register_earnings_watch
+        _register_earnings_watch()
+    except Exception:
+        logger.exception("[startup.scheduler] earnings_watch register failed")
     # 2026-10-08: テーマ別の資金流入を 5 分ごとに記録 (売買しない、trading/monitors/theme_flow.py)
     try:
         from trading.monitors.theme_flow import register_scheduler_safe as _register_theme_flow
