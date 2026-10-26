@@ -125,6 +125,13 @@ def start_pending_monitor():
                         symbol = info.get("symbol")
                         ts = info.get("timestamp")
 
+                        # 2026-10-26: pending_order_monitor (新規注文の見張り) も同じ global_data.pending_orders に
+                        #   created_at (float) で登録する。timestamp が無いので壊れた行として消していたため、
+                        #   force_cancel_loop が「見張り中」と分からず 60 秒待ちの買いを 10〜20 秒で取消していた
+                        #   (10/26 12:52〜14:36 は発注 21 件中 19 件)。見張り側の行には触らない。
+                        if symbol and ts is None and info.get("created_at") is not None:
+                            continue
+
                         if not symbol or not isinstance(ts, dt.datetime):
                             pending_orders.pop(order_id, None)
                             continue
