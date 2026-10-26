@@ -52,3 +52,58 @@ def test_to5_uses_first_close_as_open():
     b = _to5(rows)["1"]
     assert b[0] == ["09:00", 100.0, 105.0, 99.0, 104.0]
     assert b[1][0] == "09:05"
+
+
+# ---- 発注と決済 (2026-10-26 夜) ----
+import datetime as dt  # noqa: E402
+
+import trading.strategies.ma_pullback as mp  # noqa: E402
+
+SIG = {"ma25": 1000.0, "far_pct": 3.5, "close": 1005.0, "open": 1000.0, "high": 1006.0, "low": 1001.0}
+NOW = dt.datetime(2026, 10, 27, 10, 0, 20)
+
+
+def _patch_order(monkeypatch, bid, ask):
+    sent = []
+    monkeypatch.setattr(mp, "_board", lambda s: {"bid": bid, "ask": ask})
+    import trading.handlers.entry_handler as eh
+    monkeypatch.setattr(eh, "place_entry_buy", lambda *a, **k: sent.append((a, k)) or "OID1")
+    return sent
+
+
+def test_try_entry_orders_with_lot(monkeypatch):
+    sent = _patch_order(monkeypatch, 1004.0, 1005.0)
+    st = {"orders": {}}
+    res, why, d = mp._try_entry("1234", SIG, st, NOW, mp.cfg())
+    assert (res, why) == ("ordered", "ok")
+    assert sent[0][1]["qty"] == 400 and sent[0][0][2] == 1005.0   # 50 万円 / 1005 円 -> 400 株
+    assert st["orders"]["1234"]["order_id"] == "OID1"
+    assert mp._try_entry("1234", SIG, st, NOW, mp.cfg())[1] == "already_ordered_today"
+
+
+def test_try_entry_skips_wide_spread_and_bounce(monkeypatch):
+    sent = _patch_order(monkeypatch, 1000.0, 1005.0)
+    assert mp._try_entry("1", SIG, {"orders": {}}, NOW, mp.cfg())[1] == "spread_too_wide"
+    _patch_order(monkeypatch, 1015.0, 1016.0)
+    assert mp._try_entry("1", SIG, {"orders": {}}, NOW, mp.cfg())[1] == "already_bounced"
+    assert not sent
+
+
+def test_handle_exit_time_and_not_mine(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    st = {"done": {}, "trades": [], "orders": {"1234": {"order_ts": "2026-10-27 10:00:20", "order_id": "X"}}}
+    monkeypatch.setattr(mp, "_load", lambda: st)
+    monkeypatch.setattr(mp, "_save", lambda s: None)
+    import trading.exit.exit_position_runner as epr
+    import trading.exit.exit_price_source as eps
+    import trading.exit.exit_finalize as ef
+    monkeypatch.setattr(epr, "_resolve_entry_price", lambda p: 1005.0)
+    monkeypatch.setattr(eps, "get_latest_exit_price", lambda s: (1010.0, {}))
+    done = []
+    monkeypatch.setattr(ef, "finalize_exit", lambda **k: done.append(k))
+    pos = {"side": "BUY"}
+    assert mp.handle_exit("9999", pos, NOW) is None
+    assert mp.handle_exit("1234", pos, NOW + dt.timedelta(minutes=10)) is False
+    assert mp.handle_exit("1234", pos, NOW + dt.timedelta(minutes=31)) is True
+    assert done[0]["reason"].startswith("MA_PULLBACK_TIME")
+    assert st["orders"]["1234"]["closed"] is True

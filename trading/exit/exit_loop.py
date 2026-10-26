@@ -120,6 +120,13 @@ def exit_loop_5s() -> None:
                         continue
                 except Exception:
                     logger.exception("[EXIT LOOP] selling_climax handle_exit failed symbol=%s", symbol)
+                # 2026-10-26: 5 分足 25MA 押し目買いの建玉は 30 分の時間決済 (急落 -3% だけ切る) で扱う
+                try:
+                    from trading.strategies.ma_pullback import handle_exit as _ma_pullback_handle_exit
+                    if _ma_pullback_handle_exit(symbol, pos, now) is not None:
+                        continue
+                except Exception:
+                    logger.exception("[EXIT LOOP] ma_pullback handle_exit failed symbol=%s", symbol)
                 # 2026-10-03: 殿様イナゴ由来の買い建玉は 損切り 1.5% / 60 分 で扱う
                 try:
                     from trading.strategies.tonosama_exit import handle_exit as _tonosama_handle_exit

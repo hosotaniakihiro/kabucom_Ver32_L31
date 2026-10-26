@@ -1,9 +1,11 @@
 # ============================================================
 # File   : trading/strategies/ma_pullback.py
-# 2026-10-26: 5 分足 25MA への押し目買い (MA_PULLBACK) — 記録だけ (発注しない)
+# 2026-10-26: 5 分足 25MA への押し目買い (MA_PULLBACK)
 # ------------------------------------------------------------
-# 25MA より上に離れていた株価が 25MA まで下りてきて、その足が陽線で 25MA の上で引けたら買う想定で、
-# シグナルと仮想の決済 (30 分・60 分) を記録する。実気配で取れるか確かめてから発注を足す (ユーザー判断 10/26)。
+# 25MA より上に離れていた株価が 25MA まで下りてきて、その足が陽線で 25MA の上で引けたら買う。
+# 全シグナルの仮想決済 (30 分・60 分) を記録し、離れ 3% 以上・スプレッド 0.15% 以下は実際に発注する
+# (10/26 夜ユーザー判断「入れて」)。決済は 30 分の時間決済だけ (損切りを入れると検証で悪化)。
+# 万一の急落だけ -3% で切る。handle_exit() を exit_loop の先頭で呼び、通常の決済ルールは通さない。
 #
 # シグナル (5 分足の確定値。1 分足は当日の summary DB、25MA は前日の 5 分足からつなぐ):
 #   - 直前 12 本 (60 分) のどこかで 高値が 25MA から +2% 以上離れていた (far_pct を記録、3% 以上が本命)
@@ -19,7 +21,8 @@
 #   売り (戻り売り) は全部マイナスなので見ない。
 #
 # 状態は %LOCALAPPDATA%\autostock\runtime\ma_pullback_YYYYMMDD.json。
-# 止め方: MA_PULLBACK_ENABLED=0。
+# 止め方: MA_PULLBACK_ENABLED=0 (検知・記録も止まる。保有中の決済は続く)。
+#         発注だけ止める: MA_PULLBACK_ORDER_ENABLED=0 (記録は続く)。
 # ============================================================
 from __future__ import annotations
 
@@ -56,6 +59,17 @@ def cfg() -> Dict[str, Any]:
         "mid_min": _env_f("MA_PULLBACK_MID_MIN", 30.0),
         "max_quote_age": _env_f("MA_PULLBACK_MAX_QUOTE_AGE_SEC", 30.0),
         "force_close": _hm("MA_PULLBACK_FORCE_CLOSE", "15:20"),
+        # 発注 (2026-10-26 夜)
+        "order_enabled": _env_on("MA_PULLBACK_ORDER_ENABLED", True),
+        "order_far_pct": _env_f("MA_PULLBACK_ORDER_FAR_PCT", 3.0),
+        "max_spread_pct": _env_f("MA_PULLBACK_MAX_SPREAD_PCT", 0.15),
+        "max_bounce_pct": _env_f("MA_PULLBACK_MAX_BOUNCE_PCT", 0.5),   # 足の終値より売気配がこれ以上高ければ乗り遅れ
+        "lot_yen": _env_f("MA_PULLBACK_LOT_YEN", 500000.0),
+        "max_yen": _env_f("MA_PULLBACK_MAX_YEN", 800000.0),
+        "order_hold_min": _env_f("MA_PULLBACK_ORDER_HOLD_MIN", 30.0),
+        "crash_stop_pct": _env_f("MA_PULLBACK_CRASH_STOP_PCT", 3.0),
+        "max_per_day": int(_env_f("MA_PULLBACK_MAX_PER_DAY", 10)),
+        "max_open": int(_env_f("MA_PULLBACK_MAX_OPEN", 2)),
     }
 
 
@@ -84,7 +98,7 @@ def _load() -> Dict[str, Any]:
             return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         logger.warning("[MA PULLBACK] state read failed path=%s", p, exc_info=True)
-    return {"done": {}, "trades": []}
+    return {"done": {}, "trades": [], "orders": {}}
 
 
 def _save(st: Dict[str, Any]) -> None:
@@ -281,9 +295,17 @@ def run_cycle(now: Optional[dt.datetime] = None) -> None:
                          spread_pct=round((ask / bid - 1) * 100, 3), quote_age=round(age, 1),
                          prev_bars=len(_FEED.prev5(sym)), status="open", **sig)
                 trades.append(t); last_sig[sym] = t["entry_ts"]; changed = True
-                logger.warning("[MA PULLBACK] SIGNAL (record only) symbol=%s bar=%s close=%.1f ma25=%.1f far=%.2f%% "
+                logger.warning("[MA PULLBACK] SIGNAL symbol=%s bar=%s close=%.1f ma25=%.1f far=%.2f%% "
                                "ask=%.1f bid=%.1f spread=%.3f%%", sym, k, sig["close"], sig["ma25"], sig["far_pct"],
                                ask, bid, t["spread_pct"])
+                if c["order_enabled"] and sig["far_pct"] >= c["order_far_pct"]:
+                    try:
+                        result, reason, detail = _try_entry(sym, sig, st, now, c)
+                    except Exception as ex:
+                        logger.exception("[MA PULLBACK] entry failed symbol=%s", sym)
+                        result, reason, detail = "skipped", "exception", {"error": repr(ex)[:120]}
+                    t.update(order_status=result, order_reason=reason)
+                    logger.warning("[MA PULLBACK] %s symbol=%s reason=%s detail=%s", result.upper(), sym, reason, detail)
         # 2) 仮想決済 (買い気配で返す)
         for t in trades:
             if t.get("status") != "open":
@@ -309,6 +331,117 @@ def run_cycle(now: Optional[dt.datetime] = None) -> None:
             _save(st)
 
 
+# ------------------------------------------------------------
+# 発注
+# ------------------------------------------------------------
+def _open_count(st: Dict[str, Any], now: dt.datetime, hold_min: float) -> int:
+    n = 0
+    for o in (st.get("orders") or {}).values():
+        if o.get("closed"):
+            continue
+        try:
+            if now - _pt(o["order_ts"]) <= dt.timedelta(minutes=hold_min + 10):
+                n += 1
+        except Exception:
+            pass
+    return n
+
+
+def _board(symbol: str) -> Optional[Dict[str, Any]]:
+    try:
+        from trading.handlers.entry_order_builder import _rfb_fetch_board
+        return _rfb_fetch_board(symbol, force=True)
+    except Exception:
+        logger.debug("[MA PULLBACK] board failed symbol=%s", symbol, exc_info=True)
+        return None
+
+
+def _try_entry(sym: str, sig: Dict[str, Any], st: Dict[str, Any], now: dt.datetime, c: Dict[str, Any]):
+    orders = st.setdefault("orders", {})
+    if sym in orders:
+        return "skipped", "already_ordered_today", {}
+    if len(orders) >= c["max_per_day"]:
+        return "skipped", "max_per_day", {"orders": len(orders)}
+    if _open_count(st, now, c["order_hold_min"]) >= c["max_open"]:
+        return "skipped", "max_open", {}
+    try:
+        from trading.entry.daily_risk_guard import should_allow_new_entry
+        dec = should_allow_new_entry(sym)
+        if not getattr(dec, "allow", True):
+            return "skipped", f"daily_risk:{getattr(dec, 'reason', '')}", {}
+    except Exception:
+        logger.debug("[MA PULLBACK] daily risk guard failed", exc_info=True)
+    # ENTRY_PAUSE ファイルは send_order 側で効く
+    bd = _board(sym)
+    if not bd:
+        return "skipped", "board_unavailable", {}
+    bid, ask = float(bd.get("bid") or 0), float(bd.get("ask") or 0)
+    if not (ask > bid > 0):
+        return "skipped", "board_invalid", {"bid": bid, "ask": ask}
+    spread_pct = (ask - bid) / ((ask + bid) / 2) * 100
+    detail = {"bid": bid, "ask": ask, "spread_pct": round(spread_pct, 3)}
+    if spread_pct > c["max_spread_pct"]:
+        return "skipped", "spread_too_wide", detail
+    if ask > float(sig["close"]) * (1 + c["max_bounce_pct"] / 100.0):
+        return "skipped", "already_bounced", {**detail, "bar_close": sig["close"]}
+    qty = int(c["lot_yen"] // (ask * 100)) * 100 or 100
+    if ask * qty > c["max_yen"]:
+        return "skipped", "too_expensive", {**detail, "qty": qty}
+    from trading.handlers.entry_handler import place_entry_buy
+    oid = place_entry_buy(sym, sym, ask, "MA_PULLBACK", order_type="LIMIT", qty=qty)
+    detail["qty"] = qty
+    if not oid:
+        return "skipped", "send_failed", detail
+    orders[sym] = {"order_ts": _ts(now), "order_id": str(oid), "price": ask, "qty": qty,
+                   "signal": {k: sig[k] for k in ("ma25", "far_pct", "close")}, **detail}
+    return "ordered", "ok", {**detail, "order_id": str(oid)}
+
+
+# ------------------------------------------------------------
+# 決済 (exit_loop から呼ぶ)
+# ------------------------------------------------------------
+def handle_exit(symbol: str, pos: Dict[str, Any], now: Optional[dt.datetime] = None) -> Optional[bool]:
+    """この戦略の建玉なら True/False を返す (呼び出し側は以降の決済ルールを通さない)。そうでなければ None。"""
+    try:
+        with _LOCK:
+            o = dict(((_load().get("orders") or {}).get(str(symbol))) or {})
+        if not o or o.get("closed"):
+            return None
+        if not str((pos or {}).get("side") or "").upper().startswith("BUY"):
+            return None
+        c = cfg()
+        now = now or dt.datetime.now()
+        from trading.exit.exit_position_runner import _resolve_entry_price
+        from trading.exit.exit_price_source import get_latest_exit_price
+        entry = float(_resolve_entry_price(pos) or 0)
+        price = float((get_latest_exit_price(symbol) or (0, None))[0] or 0)
+        if entry <= 0 or price <= 0:
+            return False
+        reason = None
+        if price <= entry * (1 - c["crash_stop_pct"] / 100.0):
+            reason = f"MA_PULLBACK_STOP pct={c['crash_stop_pct']:.1f} entry={entry:.1f} price={price:.1f}"
+        elif now >= _pt(o["order_ts"]) + dt.timedelta(minutes=c["order_hold_min"]):
+            reason = f"MA_PULLBACK_TIME hold={c['order_hold_min']:.0f}m entry={entry:.1f} price={price:.1f}"
+        elif now.time() >= c["force_close"]:
+            reason = f"MA_PULLBACK_FORCE_CLOSE at={c['force_close']} entry={entry:.1f} price={price:.1f}"
+        if not reason:
+            return False
+        from trading.exit.exit_finalize import finalize_exit
+        finalize_exit(symbol=symbol, price=price, reason=reason, cluster_id=0, regime=0, inago_state=0,
+                      pnl=price - entry, collapse_prob=0.0, ctx=None)
+        logger.warning("[MA PULLBACK] EXIT symbol=%s reason=%s pnl_per_share=%.1f", symbol, reason, price - entry)
+        with _LOCK:
+            st = _load()
+            oo = st.get("orders", {}).get(str(symbol))
+            if oo is not None:
+                oo.update(closed=True, entry_fill=entry, exit_ts=_ts(now), exit_price=price, exit_reason=reason.split()[0])
+                _save(st)
+        return True
+    except Exception:
+        logger.exception("[MA PULLBACK] handle_exit failed symbol=%s", symbol)
+        return None
+
+
 def _run_guarded() -> None:
     try:
         from core.startup.scheduler.market_guard import is_market_time_for_entry
@@ -327,7 +460,7 @@ def register_scheduler_safe() -> bool:
             return True
         every = int(_env_f("MA_PULLBACK_INTERVAL_SEC", 20))
         schedule.every(every).seconds.do(_run_guarded).tag("ma_pullback", "entry")
-        logger.warning("[MA PULLBACK] scheduler registered (record only) every=%ss cfg=%s", every,
+        logger.warning("[MA PULLBACK] scheduler registered every=%ss cfg=%s", every,
                        {k: (str(v) if isinstance(v, dt.time) else v) for k, v in cfg().items()})
         return True
     except Exception:
@@ -335,4 +468,4 @@ def register_scheduler_safe() -> bool:
         return False
 
 
-__all__ = ["run_cycle", "register_scheduler_safe", "cfg", "detect"]
+__all__ = ["run_cycle", "handle_exit", "register_scheduler_safe", "cfg", "detect"]
