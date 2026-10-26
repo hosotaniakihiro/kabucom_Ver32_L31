@@ -1124,6 +1124,21 @@ def add_pending(entry: Dict) -> bool:
     _pm = _ap_sys.modules[__name__]
     _cdp_rejected = False
 
+    # --- 0層目: ETF / ETN / REIT は候補にしない (2026-10-26) --------------
+    #   候補にすると PUSH の保護枠に入るので、下の protect push も通さずに返す。
+    try:
+        from trading.entry.etf_guard import reject_reason as _etf_reject_reason
+
+        _etf = _etf_reject_reason(entry)
+        if _etf:
+            logger.warning(
+                "[ENTRY ETF GUARD] reject symbol=%s source=%s type=%s reason=%s",
+                entry.get("symbol"), entry.get("source"), entry.get("entry_type"), _etf,
+            )
+            return False
+    except Exception:
+        logger.debug("[ENTRY ETF GUARD] check failed; fail-open", exc_info=True)
+
     # --- 1層目: common day position guard -------------------------------
     try:
         if isinstance(entry, dict) and _cdp_source_enabled(entry):
