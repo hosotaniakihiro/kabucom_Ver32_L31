@@ -980,6 +980,11 @@ def build_protected_rotation_batches(targets: list[str]):
     b = _d(fixed + pool[slots:slots * 2])[:chunk]
     if fixed and not b and pool:
         b = _d(fixed + pool[:slots])[:chunk]
+    # 2026-10-21: B に入れ替える銘柄が無い(固定だけ / A と同じ)なら B を回さない。
+    #   回すと A の可変銘柄(約 36)を毎サイクル 約 5 秒 外して付け直すだけになり、その間 PUSH が途切れていた
+    #   (実測 10/21 後場: A=50 / B=固定 14 のみ)。
+    if b and not (set(b) - set(a)):
+        b = []
     logger.warning("[PUSH ROTATION STABILITY] batches fixed=%d pool=%d A=%d B=%d", len(fixed), len(pool), len(a), len(b))
     return a, b, fixed
 

@@ -34,7 +34,15 @@ from .transport import is_transport_error, mark_transport_broken
 logger = logging.getLogger(__name__)
 
 REGISTER_CHUNK_SIZE = 50
-REGISTER_LIMIT = 50
+# 2026-10-22: 枠 50 のうち既定で 2 つ空けて 48 までしか登録しない。
+#   後場の実測で、kabu の RegistList が 48 件なのに 2 件の登録が 4002006、全解除の直後(RegistList=[])でも
+#   50 件の登録が 4002006 になった(一覧に出ない形で枠が 1〜2 個使われている瞬間がある)。
+#   そのたびに全解除 → 再登録も失敗 → 次の周期まで登録ゼロで、12:35 と 12:46 に PUSH が約 3 分ずつ全部止まった。
+#   PUSH_REGISTER_HEADROOM=0 で従来(50)に戻る。
+REGISTER_HEADROOM = max(0, min(10, int(os.environ.get("PUSH_REGISTER_HEADROOM", "2") or 0)))
+REGISTER_LIMIT = 50 - REGISTER_HEADROOM
+# 全解除のあとの登録も 4002006 で断られたとき、次の周期まで待たずに何件減らして入れ直すか(0 で入れ直さない)。
+REGISTER_COUNT_ERROR_SHRINK = max(0, int(os.environ.get("PUSH_REGISTER_COUNT_ERROR_SHRINK", "5") or 0))
 DEFAULT_EXCHANGE = 1
 
 DEFAULT_UNREGISTER_TO_REGISTER_WAIT_SEC = float(os.environ.get("KABU_REGISTER_UNREGISTER_WAIT_SEC", "0.5"))
@@ -46,6 +54,31 @@ DEFAULT_UNREGISTER_ALL_URL = f"{DEFAULT_BASE_URL}/unregister/all"
 DEFAULT_UNREGISTER_URL = f"{DEFAULT_BASE_URL}/unregister"
 
 _SEQUENCE_LOCK = threading.RLock()
+
+# 2026-10-22: kabu の応答(register / unregister / unregister/all の RegistList)を「今の登録」の正とする。
+#   差分登録はこれまでプログラム側の記憶(last_registered_symbols)を current にしていたが、
+#   部分失敗を成功扱いにした後などに実際の登録とずれ、10/21 は
+#   「current=1 なのに kabu には 46 登録 → add=49 で 4002006」「RegistList mismatch → 全解除」が起きていた
+#   (4002006 131 回・4001019 49 回・unregister/all 242 回。全解除のたびに全銘柄の PUSH が止まる)。
+#   応答の一覧を覚えておき、次の差分の current に使う。PUSH_REGISTER_VENDOR_LIST_ENABLED=0 で従来どおり。
+_VENDOR_LOCK = threading.Lock()
+_VENDOR_REGISTERED: Optional[list] = None
+
+
+def _note_vendor_list(content: Any) -> None:
+    global _VENDOR_REGISTERED
+    if isinstance(content, dict) and isinstance(content.get("RegistList"), list):
+        syms = _registered_symbols_from_content(content)
+        with _VENDOR_LOCK:
+            _VENDOR_REGISTERED = list(syms)
+
+
+def vendor_registered_symbols() -> Optional[list]:
+    """直近の kabu 応答に載っていた登録銘柄。まだ応答が無い・無効なら None。"""
+    if not _env_bool("PUSH_REGISTER_VENDOR_LIST_ENABLED", True):
+        return None
+    with _VENDOR_LOCK:
+        return None if _VENDOR_REGISTERED is None else list(_VENDOR_REGISTERED)
 _FILE_LOCK_HANDLE: Any = None
 
 
@@ -857,6 +890,8 @@ def run_unregister_all() -> bool:
         return False
     ok, content = _http_json_request(url=url, method="PUT", payload=None, api_key=api_key)
     logger.info("[SUB MANAGER] unregister_all done vendor_body=None ok=%s content=%r", ok, content)
+    if ok:
+        _note_vendor_list(content)
     return ok
 
 
@@ -875,6 +910,8 @@ def run_unregister_symbols(symbols: Sequence[str]) -> bool:
     payload = {"Symbols": make_symbol_objects(normalized)}
     ok, content = _http_json_request(url=url, method="PUT", payload=payload, api_key=api_key)
     logger.info("[SUB MANAGER] unregister_symbols done count=%d ok=%s content=%r", len(normalized), ok, content)
+    if ok:
+        _note_vendor_list(content)
     return ok
 
 
@@ -889,6 +926,8 @@ def _register_once_with_content(symbols: Sequence[str], *, exchange: int = DEFAU
     payload = {"Symbols": make_symbol_objects(normalized, exchange=exchange)}
     ok, content = _http_json_request(url=url, method="PUT", payload=payload, api_key=api_key)
     logger.info("[SUB MANAGER] register done size=%d ok=%s content=%r", len(normalized), ok, content)
+    if ok:
+        _note_vendor_list(content)
     if not ok:
         # 2026-09-16: 4001019 (一部の銘柄が登録できませんでした) は応答に銘柄が含まれない。
         #   どの銘柄が弾かれたかを後から特定できるよう、送った銘柄を必ず残す
@@ -960,6 +999,14 @@ def _try_differential_register(
 
     current = _normalize_symbols(current_symbols)
     target = _truncate_to_register_limit(target_symbols)
+    vendor = vendor_registered_symbols()
+    if vendor is not None and set(vendor) != set(current):
+        logger.warning(
+            "[SUB MANAGER][DIFF REGISTER] current を kabu の直近 RegistList に合わせる program=%d vendor=%d "
+            "only_program=%s only_vendor=%s",
+            len(current), len(vendor), sorted(set(current) - set(vendor))[:10], sorted(set(vendor) - set(current))[:10],
+        )
+        current = vendor
     if not current or not target:
         return None
 
@@ -982,6 +1029,10 @@ def _try_differential_register(
         len(current), len(target), len(keep), len(to_remove), len(to_add),
     )
 
+    # 2026-10-22: 解除→登録は待たずに続けて撃つ(kabu は解除の応答を返した時点で RegistList から消えている)。
+    #   解除の応答の一覧で追加分を計算し直し、枠(50)を超えないことを確かめてから登録する。
+    t0 = time.perf_counter()
+    t_unreg = t0
     if to_remove:
         if not run_unregister_symbols(to_remove):
             logger.warning(
@@ -989,11 +1040,30 @@ def _try_differential_register(
                 len(to_remove),
             )
             return None
+        t_unreg = time.perf_counter()
+        after = vendor_registered_symbols()
+        if after is not None:
+            after_set = set(after)
+            to_add = [s for s in target if s not in after_set]
+            if len(after) + len(to_add) > REGISTER_LIMIT:
+                logger.warning(
+                    "[SUB MANAGER][DIFF REGISTER] 解除後も枠が足りない registered=%d add=%d limit=%d -> 全解除→全登録へ",
+                    len(after), len(to_add), REGISTER_LIMIT,
+                )
+                return None
 
     if not to_add:
         return True
 
+    t_reg0 = time.perf_counter()
     ok, content = _register_once_with_content(to_add, exchange=exchange)
+    t_reg1 = time.perf_counter()
+    logger.info(
+        "[SUB MANAGER][DIFF REGISTER][TIMING] unregister_ms=%.1f gap_ms=%.1f register_ms=%.1f "
+        "unregister_to_register_done_ms=%.1f remove=%d add=%d ok=%s",
+        (t_unreg - t0) * 1000, (t_reg0 - t_unreg) * 1000, (t_reg1 - t_reg0) * 1000,
+        (t_reg1 - t0) * 1000, len(to_remove), len(to_add), ok,
+    )
     if not ok:
         if _is_partial_register_error(content):
             logger.warning(
@@ -1219,6 +1289,19 @@ def _run_refresh_sequence_core(
                 if st is not None:
                     st.mark_registered_confirmed(normalized_target, label=reason, source="count_error_retry_partial")
                 return True
+            # 2026-10-22: ここで諦めると次の周期(約 3 分後)まで登録ゼロのままになる。
+            #   件数を減らしてすぐ入れ直す(先頭は保有・発注中の固定銘柄なので、落ちるのは順位の低い末尾)。
+            if _is_register_count_error(content2) and REGISTER_COUNT_ERROR_SHRINK > 0 and len(normalized_target) > 1:
+                shrunk = normalized_target[: max(1, len(normalized_target) - REGISTER_COUNT_ERROR_SHRINK)]
+                ok3, content3 = _register_once_with_content(shrunk, exchange=exchange)
+                logger.warning(
+                    "[SUB MANAGER] register retry shrunk size=%d->%d ok=%s content=%r",
+                    len(normalized_target), len(shrunk), ok3, str(content3)[:200],
+                )
+                if ok3 or _is_partial_register_error(content3):
+                    if st is not None:
+                        st.mark_registered_confirmed(shrunk, label=reason, source="count_error_retry_shrunk")
+                    return True
             if st is not None:
                 st.note_register_failed(label=reason, reason="register_count_error_retry_failed")
             _restore_last_good_batch(f"{reason}/count_error", exchange=exchange)
@@ -1243,6 +1326,7 @@ __all__ = [
     "registration_sequence_lock",
     "REGISTER_CHUNK_SIZE",
     "REGISTER_LIMIT",
+    "REGISTER_HEADROOM",
     "DEFAULT_EXCHANGE",
     "DEFAULT_UNREGISTER_TO_REGISTER_WAIT_SEC",
     "make_symbol_objects",

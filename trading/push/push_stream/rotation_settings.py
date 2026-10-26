@@ -62,6 +62,21 @@ os.environ.setdefault("PUSH_ROTATION_LIQ_GUARD_TIMEOUT_FAIL_OPEN", "1")
 os.environ.setdefault("PUSH_ROTATION_TARGET_MAX_KEEP", "50")
 os.environ.setdefault("PUSH_REGISTER_MAX_KEEP", "50")
 
+# 2026-10-21 (ユーザー判断): 50 銘柄ずつのローテーション(A=1〜50 番目 / B=51〜100 番目を交互に登録)。
+#   中継(2 つ目の口座)がつながっていないと 51〜100 番目はどこでも受信されず、
+#   順位の低い銘柄は「直近の動き順」で上位 50 に入ったときしか PUSH が来なかった
+#   (例: 3436 は 9:40〜15:00 の 320 分のうち約 200 分途切れ、上昇の 10:03〜10:44 を丸ごと逃した)。
+#   9/11 の 4001019 (同じサイクルで 48 解除と 48 登録 → 一瞬 98 登録) を避けるため、
+#   A→B の入れ替えは rotation_core で「両方に共通の銘柄だけ残す(=解除) → 待つ → 登録」の 2 段にする。
+#   PUSH_ROTATION_AB50_ENABLED=0 で従来(上位 50 + 固定だけの B)に戻る。
+# 2026-10-23: 既定を 0 に戻す。AB50 を有効にした 10/22 から、9:00〜11:30 の WS 切断中の割合が
+#   0〜5% (10/19〜10/21) → 28% (10/22) → 42% (10/23) に増えた (kabu 側からの reset_by_peer、接続から数秒で切れる)。
+#   PUSH_ROTATION_AB50_ENABLED=1 で再び有効になる。
+AB50_ENABLED = str(os.environ.get("PUSH_ROTATION_AB50_ENABLED", "0")).strip().lower() not in ("0", "false", "no", "off")
+if AB50_ENABLED:
+    os.environ["PUSH_ROTATION_TARGET_MAX_KEEP"] = os.environ.get("PUSH_ROTATION_AB50_TARGET_MAX_KEEP", "100")
+os.environ.setdefault("PUSH_ROTATION_AB50_SWAP_WAIT_SEC", "0.3")
+
 # subscription_manager.register_ops 用。
 # rotation側は PUSH_ROTATION_UNREGISTER_WAIT_SEC=0.2 を優先する。
 # startup等のrotation以外は安全側の既定値を維持する。
@@ -90,4 +105,5 @@ __all__ = [
     "UNREGISTER_TO_REGISTER_WAIT_SEC",
     "WS_WAIT_LOG_INTERVAL_SEC",
     "REGISTER_TIMEOUT_SEC",
+    "AB50_ENABLED",
 ]

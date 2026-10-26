@@ -26,6 +26,7 @@ from . import state, transport
 from .rotation_logging import log_register_targets_with_names
 from .rotation_register import run_one_batch_with_timeout
 from .rotation_settings import (
+    AB50_ENABLED,
     DEFAULT_REGISTER_CHUNK_SIZE,
     REGISTER_TIMEOUT_SEC,
     ROTATE_HOLD_SEC,
@@ -373,6 +374,61 @@ def _run_rotation_side(*, label: str, symbols: list[str], failure_count: int = 0
     return True
 
 
+def _relay_connected() -> bool:
+    try:
+        from trading.push import push_relay_server as _relay
+
+        return bool(_relay._started and _relay.is_connected())
+    except Exception:
+        return False
+
+
+def _split_targets(targets: list[str]) -> list[str]:
+    """中継(2 つ目の口座)がつながっていれば従来どおり 51〜100 番目を中継へ回し、自分は 50 だけ。
+    つながっていなければ、50 銘柄ずつのローテーション(A50/B50)のため 100 銘柄のまま返す。"""
+    if AB50_ENABLED and not _relay_connected():
+        return list(targets or [])[: 2 * max(1, int(DEFAULT_REGISTER_CHUNK_SIZE or 50))]
+    try:
+        from trading.push.push_relay_server import split_targets_for_relay
+
+        return split_targets_for_relay(list(targets or []))
+    except Exception:
+        logger.exception("[push_stream] push relay split failed")
+        return list(targets or [])
+
+
+def plan_swap_prep(prev_registered: list[str], next_symbols: list[str]) -> list[str]:
+    """A→B の入れ替えで「解除」と「登録」が両方あるとき、先に両方に共通の銘柄だけを残す登録をして
+    解除を済ませる(4001019 対策)。共通が無い・解除か登録の片方だけなら空リスト(準備不要)。"""
+    prev, nxt = list(prev_registered or []), list(next_symbols or [])
+    ps, ns = set(prev), set(nxt)
+    keep = [s for s in nxt if s in ps]
+    if not keep or not (ps - ns) or not (ns - ps):
+        return []
+    return keep
+
+
+def _swap_prep_enabled() -> bool:
+    """2026-10-22: 既定は使わない。差分登録が 1 回の呼び出しの中で「解除→(待たずに)登録」をし、
+    kabu の応答の一覧で枠を確かめるようになったので、2 段に分けて 0.3 秒待つ必要が無くなった
+    (2 段だと解除から登録完了まで 0.3 秒以上 + スレッド起動 2 回分かかっていた)。
+    PUSH_ROTATION_AB50_SWAP_PREP=1 で 10/21 の 2 段方式に戻る。"""
+    return AB50_ENABLED and str(os.environ.get("PUSH_ROTATION_AB50_SWAP_PREP", "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _run_swap_prep(label: str, keep: list[str]) -> None:
+    try:
+        setattr(state, "_rotation_register_in_progress", True)
+        ok = run_one_batch_with_timeout(label=f"{label}_SWAP", symbols=keep, timeout_sec=REGISTER_TIMEOUT_SEC)
+        logger.info("[push_stream][AB50] swap prep before %s keep=%d ok=%s", label, len(keep), ok)
+    finally:
+        try:
+            setattr(state, "_rotation_register_in_progress", False)
+        except Exception:
+            pass
+    _sleep_or_stop(_env_float("PUSH_ROTATION_AB50_SWAP_WAIT_SEC", 0.3))
+
+
 def _rotation_worker() -> None:
     # PUSH の register リストはセッション共有資源なので、
     # WebSocket を所有していないプロセスは rotation してはいけない。
@@ -411,6 +467,10 @@ def _rotation_worker() -> None:
     last_ws_wait_log_ts = 0.0
     next_label = "A"
     failure_count = 0
+    last_registered: list[str] = []
+    logger.info("[push_stream][AB50] enabled=%s relay_connected=%s target_max_keep=%s swap_wait=%ss",
+                AB50_ENABLED, _relay_connected(), os.environ.get("PUSH_ROTATION_TARGET_MAX_KEEP"),
+                os.environ.get("PUSH_ROTATION_AB50_SWAP_WAIT_SEC"))
 
     while not state._stop_event.is_set():
         try:
@@ -430,11 +490,8 @@ def _rotation_worker() -> None:
             ws_wait_count = 0
             targets = resolve_register_targets()
             # 2026-10-03: 2 つ目の口座の中継があれば 51〜100 番目をそちらに回し、ここは先頭 50 だけ登録する
-            try:
-                from trading.push.push_relay_server import split_targets_for_relay
-                targets = split_targets_for_relay(list(targets or []))
-            except Exception:
-                logger.exception("[push_stream] push relay split failed")
+            # 2026-10-21: 中継がつながっていなければ 100 のまま A50/B50 で回す(_split_targets)
+            targets = _split_targets(list(targets or []))
             if not targets:
                 empty_count += 1
                 if empty_count == 1 or empty_count % 15 == 0:
@@ -459,21 +516,31 @@ def _rotation_worker() -> None:
             )
 
             if next_label == "A" or not second:
+                prep = plan_swap_prep(last_registered, list(first)) if _swap_prep_enabled() else []
+                if prep:
+                    _run_swap_prep("A", prep)
                 ok = _run_rotation_side(label="A", symbols=list(first), failure_count=failure_count + 1)
                 if ok:
                     failure_count = 0
+                    last_registered = list(first)
                     next_label = "B" if second else "A"
                 else:
                     failure_count += 1
+                    last_registered = []
                     next_label = "A"
                 continue
 
+            prep = plan_swap_prep(last_registered, list(second)) if _swap_prep_enabled() else []
+            if prep:
+                _run_swap_prep("B", prep)
             ok = _run_rotation_side(label="B", symbols=list(second), failure_count=failure_count + 1)
             if ok:
                 failure_count = 0
+                last_registered = list(second)
                 next_label = "A"
             else:
                 failure_count += 1
+                last_registered = []
                 next_label = "B"
 
         except Exception:
