@@ -67,7 +67,95 @@ def _as_dir_root(root: str) -> str:
     return r
 
 
+# ============================================================
+# 2026-10-24: 場中は NAS を使わない (ローカルのデータ root)
+# ------------------------------------------------------------
+# NAS の SMB が劣化すると (Errno 24 / Mup 139) summary DB を書けなくなり
+# 発注が 0 になる (10/23 13:00〜13:45)。summary だけでなく Basic・daily_db・
+# yahoo status・trade_guard なども nas_root() 基準で約 100 箇所が組み立てて
+# いるので、個別に直さず root そのものをローカルの写しへ向ける。
+#
+#   - ローカル root は NAS と同じ並び (raw_data\kabu_station\summary ...)。
+#     push / ranking / positions / order_book はジャンクションで既存の
+#     ローカル置き場 (%LOCALAPPDATA%\autostock\push 等) を指す。
+#   - root に READY_MARKER があるときだけ使う。写しが終わる前や、
+#     マーカーを消したときは従来どおり NAS を返す (戻し方 = マーカー削除)。
+#   - NAS への複製は ops/local_run/local_data_sync.py と各 *_db_location の
+#     sync_to_nas() が real_nas_root() / to_real_nas() で行う。
+#
+# ENV:
+#   AUTOSTOCK_LOCAL_DATA        0 で無効 (従来どおり NAS)。既定 1
+#   AUTOSTOCK_LOCAL_DATA_ROOT   ローカル root (既定 %LOCALAPPDATA%\autostock\nas_local)
+# ============================================================
+READY_MARKER = "_LOCAL_DATA_READY.txt"
+
+_LOCAL_CACHE: Optional[str] = None
+_LOCAL_DECIDED = False
+
+
+def default_local_data_root() -> str:
+    explicit = str(os.getenv("AUTOSTOCK_LOCAL_DATA_ROOT", "")).strip()
+    if explicit:
+        return explicit.rstrip("\\/")
+    base = os.getenv("LOCALAPPDATA") or os.getenv("TEMP") or r"C:\Temp"
+    return os.path.join(base, "autostock", "nas_local")
+
+
+def local_data_root() -> Optional[str]:
+    """使えるローカル root を返す。無効・未準備なら None (プロセス内で 1 回だけ判定)。"""
+    global _LOCAL_CACHE, _LOCAL_DECIDED
+    if _LOCAL_DECIDED:
+        return _LOCAL_CACHE
+    with _LOCK:
+        if _LOCAL_DECIDED:
+            return _LOCAL_CACHE
+        flag = str(os.getenv("AUTOSTOCK_LOCAL_DATA", "1")).strip().lower()
+        root = default_local_data_root()
+        if flag in {"0", "false", "no", "off"}:
+            _LOCAL_CACHE = None
+        elif _probe(os.path.join(root, READY_MARKER)):
+            _LOCAL_CACHE = root
+            logger.warning("[NAS ROOT] ローカルのデータ root を使う root=%s", root)
+        else:
+            _LOCAL_CACHE = None
+            logger.warning("[NAS ROOT] ローカルのデータ root が未準備 (%s なし)。NAS を使う", os.path.join(root, READY_MARKER))
+        _LOCAL_DECIDED = True
+        return _LOCAL_CACHE
+
+
 def nas_root() -> str:
+    """データの root。ローカルの写しが準備済みならそれ、無ければ NAS (real_nas_root)。"""
+    local = local_data_root()
+    if local:
+        return local
+    return real_nas_root()
+
+
+def to_real_nas(path) -> str:
+    """ローカル root 配下のパスを、NAS 上の同じ位置へ読み替える。それ以外はそのまま返す。
+
+    *_db_location の「NAS 側の置き場所」は config.paths / nas_path() から作るので、
+    ローカル root が有効だとローカルを指してしまう (複製が自分自身へ上書きになる)。
+    """
+    s = str(path)
+    local = local_data_root()
+    if not local:
+        return s
+    lr = local.rstrip("\\/")
+    if s.lower() == lr.lower() or s.lower().startswith(lr.lower() + "\\") or s.lower().startswith(lr.lower() + "/"):
+        tail = s[len(lr):].strip("\\/")
+        return real_nas_path(tail)
+    return s
+
+
+def real_nas_path(*parts: str) -> str:
+    """NAS (real_nas_root) からの相対パス。ローカル root の有無に関係なく NAS を指す。"""
+    root = real_nas_root()
+    tail = "\\".join(str(p).strip("\\/") for p in parts if str(p).strip("\\/"))
+    return (root.rstrip("\\/") + "\\" + tail) if tail else root
+
+
+def real_nas_root() -> str:
     """到達可能な NAS root 表記を返す (プロセス内で 1 回だけ判定)。
 
     優先順:
@@ -130,9 +218,14 @@ def nas_path(*parts: str) -> str:
 
 
 def reset_cache_for_test() -> None:
-    global _CACHE
+    global _CACHE, _LOCAL_CACHE, _LOCAL_DECIDED
     with _LOCK:
         _CACHE = None
+        _LOCAL_CACHE = None
+        _LOCAL_DECIDED = False
 
 
-__all__ = ["nas_root", "nas_path", "reset_cache_for_test", "UNC_ROOT", "DEFAULT_FALLBACK"]
+__all__ = [
+    "nas_root", "nas_path", "reset_cache_for_test", "UNC_ROOT", "DEFAULT_FALLBACK",
+    "real_nas_root", "real_nas_path", "to_real_nas", "local_data_root", "default_local_data_root", "READY_MARKER",
+]

@@ -394,7 +394,8 @@ def _rsrc_resolve_db_path() -> Optional[str]:
 
     try:
         today = dt.datetime.now().strftime("%Y%m%d")
-        p = rf"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking\ranking{today}.db"
+        from nas_root import nas_path  # 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
+        p = nas_path(r"raw_data\kabu_station\ranking", f"ranking{today}.db")
         if os.path.exists(p):
             logger.warning(
                 "[RANKING ENTRY SOURCE DB FALLBACK] ローカルを解決できず NAS へ落ちた path=%s "

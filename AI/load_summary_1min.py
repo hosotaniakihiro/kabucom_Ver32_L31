@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 # summary DB ルート（★ 実環境に合わせる）
 # ============================================================
 
-SUMMARY_ROOT = Path(r"X:\raw_data\kabu_station\summary")
+# 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
+from nas_root import nas_path as _nas_path  # noqa: E402
+SUMMARY_ROOT = Path(_nas_path(r"raw_data\kabu_station\summary"))
 
 
 # ============================================================

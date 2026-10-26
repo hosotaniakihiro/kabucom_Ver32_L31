@@ -32,7 +32,9 @@ logger = logging.getLogger(__name__)
 # SYMBOL FLAGS DB
 # ============================================================
 
-SYMBOL_FLAGS_DB = r"X:\Basic\symbol_flags.db"
+# 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
+from nas_root import nas_path as _nas_path  # noqa: E402
+SYMBOL_FLAGS_DB = _nas_path(r"Basic\symbol_flags.db")
 
 
 def _load_symbol_flags():

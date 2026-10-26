@@ -106,9 +106,10 @@ def nas_ranking_db_dir() -> Path:
     if explicit and str(explicit).strip():
         return Path(str(explicit).strip())
     try:
-        from nas_root import nas_path
+        from nas_root import real_nas_path
 
-        return Path(nas_path(r"raw_data\kabu_station\ranking"))
+        # 2026-10-24: nas_path はローカルのデータ root を指しうるので、複製先は real_nas_path
+        return Path(real_nas_path(r"raw_data\kabu_station\ranking"))
     except Exception:
         logger.debug("[RANKING DB LOC] nas_root を読めない", exc_info=True)
         return Path(r"X:\raw_data\kabu_station\ranking")

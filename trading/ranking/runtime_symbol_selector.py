@@ -283,7 +283,7 @@ def _resolve_ranking_db_path(target_date: Optional[dt.date] = None) -> Optional[
         pass
 
     candidates.extend([
-        rf"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking\ranking{ymd}.db",
+        nas_path(r"raw_data\kabu_station\ranking", f"ranking{ymd}.db"),  # 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
         rf"Y:\AutoStockBuyAndSell\raw_data\kabu_station\ranking\ranking{ymd}.db",
         rf"Y:\stock_ranking\ranking{ymd}.db",
     ])
@@ -319,7 +319,7 @@ def _resolve_summary_db_path(target_date: Optional[dt.date] = None) -> Optional[
         pass
 
     candidates.extend([
-        rf"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary\summary{ymd}.db",
+        nas_path(r"raw_data\kabu_station\summary", f"summary{ymd}.db"),  # 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
         rf"Y:\AutoStockBuyAndSell\raw_data\kabu_station\summary\summary{ymd}.db",
     ])
 

@@ -55,9 +55,13 @@ REM handler raises UnicodeEncodeError for every such line. It does not stop
 REM the batch but floods the log, so force UTF-8 for stdout/stderr.
 set "PYTHONIOENCODING=utf-8"
 
-if not exist logs mkdir logs
+REM 2026-10-24: write the log on this PC and copy it to the NAS at the end
+REM   (ops\local_run\copy_logs_to_nas.ps1). Writing straight to the NAS
+REM   loses the log when SMB hangs.
+set "LOG_DIR=%LOCALAPPDATA%\autostock\logs\night_yahoo"
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 
-set LOG_FILE=%PROJECT_ROOT%\logs\night_yahoo_full_summary.log
+set "LOG_FILE=%LOG_DIR%\night_yahoo_full_summary.log"
 
 echo.>> "%LOG_FILE%"
 echo ============================================================>> "%LOG_FILE%"
@@ -105,10 +109,16 @@ REM ends and progress cannot be checked.
 >> "%LOG_FILE%" 2>&1
 
 set RET=%ERRORLEVEL%
-popd
 
 echo ============================================================>> "%LOG_FILE%"
 echo END %date% %time% exit=%RET%>> "%LOG_FILE%"
 echo ============================================================>> "%LOG_FILE%"
+
+REM 2026-10-24: the batch writes summary / daily DBs to the local data root
+REM   (nas_root.py). Copy what changed to the NAS (no-op if not in use).
+"%PROJECT_ROOT%\.venv\Scripts\python.exe" -u "%PROJECT_ROOT%\ops\local_run\local_data_sync.py" to-nas --days 2 >> "%LOG_FILE%" 2>&1
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_ROOT%\ops\local_run\copy_logs_to_nas.ps1" -Days 7 >> "%LOG_FILE%" 2>&1
+popd
 
 exit /b %RET%

@@ -152,9 +152,10 @@ def build_periodic_symbol_start_map(symbols: list[str], target_date: dt.date, en
 
 def _summary_db_candidates(target_date: dt.date) -> list[str]:
     ymd = target_date.strftime("%Y%m%d")
+    from nas_root import nas_path  # 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
     return [
-        fr"\\192.168.0.22\AutoStockBuyAndSell\summary\summary{ymd}.db",
-        fr"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary\summary{ymd}.db",
+        nas_path("summary", f"summary{ymd}.db"),
+        nas_path(r"raw_data\kabu_station\summary", f"summary{ymd}.db"),
     ]
 
 

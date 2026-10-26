@@ -47,7 +47,8 @@ def _push_db_path(day: Optional[dt.date] = None) -> Optional[Path]:
     la = os.getenv("LOCALAPPDATA", "")
     if la:
         cands.append(Path(la) / "autostock" / "push" / f"push{d}.db")
-    cands.append(Path(r"X:\raw_data\kabu_station\push") / f"push{d}.db")
+    from nas_root import nas_path  # 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
+    cands.append(Path(nas_path(r"raw_data\kabu_station\push")) / f"push{d}.db")
     for p in cands:
         try:
             if p.exists():

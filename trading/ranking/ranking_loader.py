@@ -161,10 +161,11 @@ def _candidate_ranking_paths() -> list[Path]:
 
     # 3) NAS日付別既定候補
     today = dt.datetime.now().strftime("%Y%m%d")
+    from nas_root import nas_path  # 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
     nas_candidates = [
-        Path(fr"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking\ranking{today}.db"),
-        Path(fr"\\192.168.0.22\AutoStockBuyAndSell\ranking\ranking{today}.db"),
-        Path(fr"\\192.168.0.22\AutoStockBuyAndSell\raw_data\ranking\ranking{today}.db"),
+        Path(nas_path(r"raw_data\kabu_station\ranking", f"ranking{today}.db")),
+        Path(nas_path("ranking", f"ranking{today}.db")),
+        Path(nas_path(r"raw_data\ranking", f"ranking{today}.db")),
     ]
     out.extend(nas_candidates)
 

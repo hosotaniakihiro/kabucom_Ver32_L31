@@ -23,3 +23,16 @@ $left = Get-CimInstance Win32_Process | Where-Object {
     $_.CommandLine -notmatch 'TaskSchedule'
 }
 Write-Host ("left={0}" -f @($left).Count)
+
+# 2026-10-24: データ (summary 等) はこの PC のローカル root に書き、止めたあとで NAS へ写す
+# (local_data_sync.py。ローカル root を使っていなければ何もしない)
+$py = $env:KABU_PYTHON_EXE
+if (-not $py -or -not (Test-Path $py)) { $py = 'C:\autostock\venv\Scripts\python.exe' }
+if (Test-Path $py) {
+    & $py (Join-Path $PSScriptRoot 'local_data_sync.py') to-nas --days 1
+} else {
+    Write-Host "[STOP_ALL] python not found; local_data_sync skipped"
+}
+
+# 2026-10-24: ログはこの PC に書き、止めたあとで NAS へ写す
+& (Join-Path $PSScriptRoot 'copy_logs_to_nas.ps1')

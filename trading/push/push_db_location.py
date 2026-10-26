@@ -110,13 +110,15 @@ def nas_push_db_dir() -> Path:
         return Path(str(explicit).strip())
     try:
         from config.paths import get_path
+        from nas_root import to_real_nas
 
-        return Path(get_path("raw_push"))
+        # 2026-10-24: config.paths はローカルのデータ root を指しうるので NAS 上へ読み替える
+        return Path(to_real_nas(get_path("raw_push")))
     except Exception:
         logger.debug("[PUSH DB LOC] config.paths を読めないので nas_root へ退避", exc_info=True)
-        from nas_root import nas_path
+        from nas_root import real_nas_path
 
-        return Path(nas_path(r"raw_data\kabu_station\push"))
+        return Path(real_nas_path(r"raw_data\kabu_station\push"))
 
 
 def _local_push_db_dir() -> Path:

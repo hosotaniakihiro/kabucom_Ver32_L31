@@ -97,9 +97,10 @@ def _resolve_db_path_from_project() -> Optional[str]:
     try:
         now = datetime.now()
         ymd = now.strftime("%Y%m%d")
+        from nas_root import nas_path  # 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
         candidates.extend([
-            rf"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking\ranking{ymd}.db",
-            rf"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking\ranking_{ymd}.db",
+            nas_path(r"raw_data\kabu_station\ranking", f"ranking{ymd}.db"),
+            nas_path(r"raw_data\kabu_station\ranking", f"ranking_{ymd}.db"),
         ])
     except Exception:
         pass

@@ -97,8 +97,10 @@ def nas_order_book_db_dir() -> Path:
     if explicit and str(explicit).strip():
         return Path(str(explicit).strip())
     from config.paths import get_path
+    from nas_root import to_real_nas
 
-    return Path(get_path("raw_order_book"))
+    # 2026-10-24: config.paths はローカルのデータ root を指しうるので NAS 上へ読み替える
+    return Path(to_real_nas(get_path("raw_order_book")))
 
 
 def _local_order_book_db_dir() -> Path:

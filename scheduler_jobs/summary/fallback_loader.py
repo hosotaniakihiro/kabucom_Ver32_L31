@@ -399,7 +399,7 @@ def today_summary_db_path(*, now: Optional[dt.datetime] = None) -> Optional[Path
             pass
 
     base_date = today_date(now=now)
-    candidates.append(rf"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary\summary{base_date:%Y%m%d}.db")
+    candidates.append(nas_path(r"raw_data\kabu_station\summary", f"summary{base_date:%Y%m%d}.db"))  # 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
 
     for raw in candidates:
         try:

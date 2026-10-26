@@ -11,7 +11,7 @@ paths:
   # 空文字なら supervisor.py の 1 つ上（= ソースコード直下）を使う
   project_dir: ""
   # console_tee.py が書き出す NAS 上のログディレクトリ
-  log_dir: "//192.168.0.22/AutoStockBuyAndSell/Logs/console"
+  log_dir: "C:/Users/hosot/AppData/Local/autostock/logs/console"  # 2026-10-24: NAS の写しでなくローカルの本体を読む
   # プロジェクトの venv。第3段階（compileall / pytest）で使う
   python: ".venv/Scripts/python.exe"
 

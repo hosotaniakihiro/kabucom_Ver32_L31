@@ -62,7 +62,9 @@ def local_staging_enabled() -> bool:
 
 def nas_positions_db_path() -> Path:
     from config.paths import get_path
-    return get_path("runtime_positions") / "positions.db"
+    from nas_root import to_real_nas
+    # 2026-10-24: config.paths はローカルのデータ root を指しうるので NAS 上へ読み替える
+    return Path(to_real_nas(get_path("runtime_positions") / "positions.db"))
 
 
 def local_positions_db_dir() -> Path:

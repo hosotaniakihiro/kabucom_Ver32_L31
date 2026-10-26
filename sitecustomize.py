@@ -148,7 +148,11 @@ _pin_nas_root_spelling()
 from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
-BOOT_EVIDENCE_DIR = Path(nas_path(r"Logs\boot_evidence"))
+# 2026-10-24: この PC に書き、NAS (Logs\boot_evidence) へは ops/local_run/copy_logs_to_nas.ps1 が写す
+BOOT_EVIDENCE_DIR = Path(
+    os.environ.get("KABU_BOOT_EVIDENCE_DIR")
+    or Path(os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or r"C:\Temp") / "autostock" / "logs" / "boot_evidence"
+)
 
 
 def _ensure_project_root() -> str:

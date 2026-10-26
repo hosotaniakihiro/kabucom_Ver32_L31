@@ -243,7 +243,8 @@ def _pushdb_read_now() -> Optional[dt.datetime]:
     「PUSH が止まっている」と誤判定する。
     """
     import sqlite3
-    path = os.path.join(r"X:\raw_data\kabu_station\push",
+    from nas_root import nas_path  # 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
+    path = os.path.join(nas_path(r"raw_data\kabu_station\push"),
                         "push%s.db" % dt.datetime.now().strftime("%Y%m%d"))
     try:
         from trading.push import push_db_location

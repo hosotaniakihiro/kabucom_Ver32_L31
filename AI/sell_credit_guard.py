@@ -36,7 +36,9 @@ logger = logging.getLogger(__name__)
 MAX_MARGIN_RATE = 2.0   # 200% 以上は危険
 
 # 信用銘柄マスターDB。Excel が無くても、このDBの short_ok=1 を正として使う。
-SYMBOL_FLAGS_DB_PATH = Path(r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db")
+# 2026-10-24: NAS 直書きをやめ nas_path() 経由 (ローカルのデータ root を使えるように)
+from nas_root import nas_path as _nas_path  # noqa: E402
+SYMBOL_FLAGS_DB_PATH = Path(_nas_path(r"Basic\symbol_flags.db"))
 SYMBOL_FLAGS_TABLE = "symbol_flags"
 SYMBOL_FLAGS_CACHE_TTL_SEC = 300.0
 
