@@ -719,13 +719,23 @@ def _last_same_day_exit_price(symbol: Any, side_u: str, today: Optional[dt.date]
     if not os.path.exists(db):
         return None
     day = (today or dt.date.today()).strftime("%Y-%m-%d")
+    # 2026-10-26 (ユーザー判断「決済から15分たったら外す」): 593A は 09:41 に 2,050 で決済したあと
+    #   午後 13:50〜14:50 の +5% の上げを全部止めていた。決済から ENTRY_REENTRY_CHASE_WINDOW_MIN
+    #   (既定 15 分) より前の決済は見ない。0 で従来どおり当日全部。
+    since = day
+    try:
+        window = float(os.getenv("ENTRY_REENTRY_CHASE_WINDOW_MIN", "15") or 0.0)
+    except Exception:
+        window = 15.0
+    if window > 0:
+        since = max(day, (dt.datetime.now() - dt.timedelta(minutes=window)).strftime("%Y-%m-%d %H:%M:%S"))
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
         try:
             row = con.execute(
                 "SELECT exit_price FROM positions WHERE symbol=? AND status='CLOSED' AND side LIKE ? "
                 "AND exit_price > 0 AND exit_time >= ? ORDER BY exit_time DESC LIMIT 1",
-                (str(symbol), f"{side_u}%", day),
+                (str(symbol), f"{side_u}%", since),
             ).fetchone()
         finally:
             con.close()
@@ -745,7 +755,8 @@ def _reentry_chase_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any)
     10/1〜10/22 の positions DB: 前回決済より 0.5% 超不利に入り直した 34 件は平均 -0.24% / 勝率 41%、
     有利な側で入り直した 53 件は +0.19%。買い(32 件 -0.18%)・売り(2 件 -1.16%)とも同じ向き。
     例: 436A 13:55 に 1951 で利確 → 14:15 に 1981 (+1.5%) で買い直し → 14:24 に 1963 で -1,800 円。
-    0 で無効。判定価格や positions DB が取れないときは通す (fail-open)。"""
+    0 で無効。判定価格や positions DB が取れないときは通す (fail-open)。
+    2026-10-26: 見るのは決済から 15 分以内だけ (ENTRY_REENTRY_CHASE_WINDOW_MIN)。"""
     try:
         max_pct = float(os.getenv("ENTRY_REENTRY_CHASE_MAX_PCT", "0.5") or 0.0)
     except Exception:

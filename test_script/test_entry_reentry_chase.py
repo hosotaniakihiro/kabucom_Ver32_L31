@@ -10,6 +10,11 @@ from trading.position import positions_db_location as PDL
 TODAY = dt.date.today().strftime("%Y-%m-%d")
 
 
+def ago(minutes):
+    # 2026-10-26: 決済から 15 分以内だけ見るので、時刻は今からの相対で作る
+    return (dt.datetime.now() - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
 @pytest.fixture
 def posdb(tmp_path, monkeypatch):
     db = tmp_path / "positions.db"
@@ -33,7 +38,7 @@ def guard(symbol, side, close):
 
 
 def test_436a_rebuy_above_last_exit_is_blocked(posdb):
-    posdb("436A", "BUY_CREDIT", 1951.0, f"{TODAY} 13:55:25.730")
+    posdb("436A", "BUY_CREDIT", 1951.0, ago(5))
     ng = guard("436A", "BUY", 1981.0)                       # +1.54% 上で買い直し
     assert ng is not None and ng["reason"] == "REENTRY_CHASE"
     assert guard("436A", "BUY", 1960.0) is None             # +0.46% までは通す
@@ -41,25 +46,35 @@ def test_436a_rebuy_above_last_exit_is_blocked(posdb):
 
 
 def test_uses_latest_exit_same_side_and_today_only(posdb):
-    posdb("436A", "BUY_CREDIT", 1900.0, f"{TODAY} 10:00:00")
-    posdb("436A", "BUY_CREDIT", 1990.0, f"{TODAY} 14:00:00")     # 最後の決済が基準
-    posdb("436A", "SELL_CREDIT", 1700.0, f"{TODAY} 14:30:00")    # 逆方向は見ない
+    posdb("436A", "BUY_CREDIT", 1900.0, ago(12))
+    posdb("436A", "BUY_CREDIT", 1990.0, ago(8))     # 最後の決済が基準
+    posdb("436A", "SELL_CREDIT", 1700.0, ago(3))    # 逆方向は見ない
     posdb("7203", "BUY_CREDIT", 1000.0, "2026-01-05 10:00:00")    # 前日以前は見ない
     assert guard("436A", "BUY", 1995.0) is None
     assert guard("7203", "BUY", 2000.0) is None
 
 
 def test_sell_is_mirrored(posdb):
-    posdb("3697", "SELL_CREDIT", 1000.0, f"{TODAY} 10:00:00")
+    posdb("3697", "SELL_CREDIT", 1000.0, ago(5))
     assert guard("3697", "SELL", 990.0) is not None         # 1% 下で売り直し = 不利
     assert guard("3697", "SELL", 1010.0) is None
 
 
 def test_disabled_and_fail_open(posdb, monkeypatch):
-    posdb("436A", "BUY_CREDIT", 1951.0, f"{TODAY} 13:55:25")
+    posdb("436A", "BUY_CREDIT", 1951.0, ago(5))
     monkeypatch.setenv("ENTRY_REENTRY_CHASE_MAX_PCT", "0")
     assert guard("436A", "BUY", 1981.0) is None
     monkeypatch.delenv("ENTRY_REENTRY_CHASE_MAX_PCT")
     assert EOB._reentry_chase_guard(symbol="436A", side="BUY", source="X", entry_row={}) is None   # 判定価格なし
     monkeypatch.setattr(PDL, "positions_db_path", lambda: "C:/no/such/positions.db")
     assert guard("436A", "BUY", 1981.0) is None
+
+
+def test_window_15min_releases_old_exit(posdb, monkeypatch):
+    """2026-10-26: 593A は 09:41 の決済で午後の上げを全部止めていた。決済から 15 分を過ぎたら外す。"""
+    posdb("593A", "BUY_CREDIT", 2050.0, ago(20))
+    assert guard("593A", "BUY", 2131.0) is None              # 20 分前の決済は見ない
+    monkeypatch.setenv("ENTRY_REENTRY_CHASE_WINDOW_MIN", "0")  # 0 で従来どおり当日全部
+    assert guard("593A", "BUY", 2131.0)["reason"] == "REENTRY_CHASE"
+    monkeypatch.setenv("ENTRY_REENTRY_CHASE_WINDOW_MIN", "30")
+    assert guard("593A", "BUY", 2131.0)["reason"] == "REENTRY_CHASE"
