@@ -933,6 +933,33 @@ def _frl_scope_enabled() -> bool:
     return enabled
 
 
+def _recent_push_traded_volume(symbol: str, window_sec: float = 180.0):
+    """直近 window_sec 秒に PUSH で実際に出来た株数 (累計出来高の最大 - 最小)。読めなければ None (従来どおり救済)。"""
+    try:
+        import sqlite3 as _sq
+        from trading.push.push_db_location import push_db_path
+
+        p = push_db_path()
+        if not p.exists():
+            return None
+        now = dt.datetime.now()
+        since = (now - dt.timedelta(seconds=window_sec)).strftime("%Y-%m-%dT%H:%M:%S")
+        con = _sq.connect(f"file:{p}?mode=ro", uri=True, timeout=1.0)
+        try:
+            r = con.execute(
+                "SELECT COUNT(*), MAX(volume) - MIN(volume) FROM stream_data_raw WHERE symbol=? AND datetime>=? AND volume>0",
+                (str(symbol).strip().upper(), since),
+            ).fetchone()
+        finally:
+            con.close()
+        if not r or not r[0]:
+            return 0.0
+        return float(r[1] or 0.0)
+    except Exception:
+        logger.debug("[ENTRY FINAL LIQ PENDING FALLBACK] push recent volume read failed symbol=%s", symbol, exc_info=True)
+        return None
+
+
 def _final_recent_liquidity_layer1_pending_fallback(symbol: str, side: str):
     ok, reason, detail = _final_recent_liquidity_ok_core(symbol, side)
     if ok:
@@ -950,6 +977,18 @@ def _final_recent_liquidity_layer1_pending_fallback(symbol: str, side: str):
     p_ok, p_reason, p_detail = _plf_pending_liq_ok(symbol, side)
     merged = dict(detail or {})
     merged["pending_row_check"] = p_detail
+    # 2026-10-23 (ユーザー判断): 出来高不足からの救済は、PUSH の直近 3 分で実際に出来た株数 (累計出来高の増分) で確かめる。
+    #   保留行の volume は当日の累計なので、直近の足の出来高が 0 でも必ず通っていた (186A: 400 万株で救済)。
+    if rescue_candidates and p_ok and ("VOLUME_LOW" in reason_s or "TURNOVER_LOW" in reason_s):
+        recent = _recent_push_traded_volume(symbol)
+        merged["push_recent_volume"] = recent
+        need = _plf_env_float("ENTRY_RESCUE_MIN_RECENT_PUSH_VOLUME", 30000.0)
+        if recent is not None and recent < need:
+            logger.warning(
+                "[ENTRY FINAL LIQ PENDING FALLBACK] no rescue symbol=%s side=%s original=%s push_recent_volume=%.0f<%.0f",
+                symbol, side, reason, recent, need,
+            )
+            return ok, reason, merged
     if rescue_candidates and p_ok:
         logger.warning(
             "[ENTRY FINAL LIQ PENDING FALLBACK] rescue symbol=%s side=%s original=%s pending=%s version=%s",

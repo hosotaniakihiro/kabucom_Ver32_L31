@@ -95,6 +95,8 @@ _LAST_GET_ORDERS_MONO = 0.0
 # 1=Received, 2=Accepted, 3=Working, 4=PartiallyContracted
 # ------------------------------------------------------------
 CANCELABLE_STATES = {1, 2, 3, 4}
+# 2026-10-23: 見張り役の受け持ち期限を過ぎてから消すまでの猶予 (秒)。
+_WATCHED_ORDER_GRACE_SEC = float(os.getenv("FORCE_CANCEL_WATCHED_GRACE_SEC", "15") or 15)
 _LAST_TOKEN_WARN_AT = 0.0
 _LAST_429_WARN_AT = 0.0
 
@@ -433,6 +435,17 @@ def start_force_cancel_loop(interval_sec=30):
                 try:
                     from trading.strategies.overext_short import protected_order_ids as _overext_protected
                     if str(order_id) in _overext_protected():
+                        continue
+                except Exception:
+                    pass
+
+                # 2026-10-23: 新規注文の見張り (pending_order_monitor) が待ち時間ごと受け持つ注文は、
+                #   その期限 + 猶予までは消さない。空売りの 60 秒待ち (sell_wait) が 3〜30 秒で消され、
+                #   10/23 は受け付けた空売り 7 件が全部未約定で終わった。見張りが止まっていても猶予後は消す。
+                try:
+                    from trading.handlers.pending_order_monitor import watched_order_deadline
+                    _dl = watched_order_deadline(order_id)
+                    if _dl is not None and time.time() < _dl + _WATCHED_ORDER_GRACE_SEC:
                         continue
                 except Exception:
                     pass

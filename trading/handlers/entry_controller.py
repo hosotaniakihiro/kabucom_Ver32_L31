@@ -2321,7 +2321,8 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[st
     stop_after_first_loss = _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", False)
     stop_after_first_loss_only_net_negative = _env_bool("ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE", True)
     global_max_loss = _env_float("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", -50000.0)
-    global_max_trades = _env_int("ENTRY_GLOBAL_MAX_DAILY_TRADES", 30)
+    # 2026-10-23 (ユーザー判断): 30 -> 100。10/23 は 14:33 に 30 回に届き、以後の候補 89 回分を止めていた。
+    global_max_trades = _env_int("ENTRY_GLOBAL_MAX_DAILY_TRADES", 100)
     global_max_consec_losses = _env_int("ENTRY_GLOBAL_MAX_CONSECUTIVE_LOSSES", 20)
 
     entry_count = int(srow.get("entry_count") or 0)

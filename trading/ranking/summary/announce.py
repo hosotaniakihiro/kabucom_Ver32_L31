@@ -613,6 +613,13 @@ def _resolve_score_for_sell(df: pd.DataFrame) -> tuple[pd.DataFrame, str, bool]:
                 x[c] = pd.to_numeric(x[c], errors="coerce")
             except Exception:
                 pass
+            # 2026-10-23: 列はあっても全部 0 / 空 (main 側は score_sell を 0 で埋めている) なら点数が無いのと同じ。
+            #   そのまま並べると best_rank 順になり、SELL TOP が BUY TOP と同じ銘柄・同じ順になっていた。
+            try:
+                if not (x[c].fillna(0) != 0).any():
+                    continue
+            except Exception:
+                pass
             return x, c, True
 
     if "score_buy" in x.columns:

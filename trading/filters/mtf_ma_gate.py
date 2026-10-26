@@ -306,6 +306,10 @@ def mtf_ma_gate(symbol: Any, side: Any, entry_row: Optional[Dict[str, Any]] = No
     base_tf = int(base_tf_s.rstrip("m")) if base_tf_s else 0
     confirm_tfs = tuple(int(str(x).rstrip("m")) for x in os.getenv("MTF_MA_GATE_CONFIRM_TFS", "3m,5m").split(",") if x.strip())
     confirm_mode = os.getenv("MTF_MA_GATE_CONFIRM_MODE", "ANY").strip().upper()  # 2026-09-15 夕: ALL→ANY (9/15 は 3m と 5m の両方成立が 261 件中 14 件)
+    # 2026-10-21: 売りは 3m と 5m の両方を必須にする (ユーザー判断)。5803 が 3m だけ通って
+    #   5m が RSI 52.6 (売り条件 20〜50 の外) のまま、40 分下げた後の底で空売りし -0.93% で損切り。
+    if side_u == "SELL":
+        confirm_mode = os.getenv("MTF_MA_GATE_SELL_CONFIRM_MODE", "ALL").strip().upper()
     require_order = _env_bool("MTF_MA_GATE_REQUIRE_ORDER", True)
     allow_no_data = _env_bool("MTF_MA_GATE_ALLOW_NO_DATA", False)
 

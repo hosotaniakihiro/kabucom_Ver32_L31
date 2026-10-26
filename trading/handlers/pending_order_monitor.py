@@ -117,6 +117,21 @@ def is_watched_order(order_id: str) -> bool:
     return isinstance(info, dict) and bool(info.get("mode")) and not info.get("cancel_requested")
 
 
+def watched_order_deadline(order_id: str) -> float | None:
+    """この監視が受け持つ注文なら、取消を任せてよい期限 (time.time() 基準) を返す (2026-10-23)。
+
+    force_cancel_loop (30 秒周期で未約定の指値を全部消す) が、待ち時間 60 秒の注文
+    (空売りの sell_wait など) を 3〜30 秒で消していたので、期限までは手を出さないようにする。
+    """
+    info = _ensure_pending_orders().get(str(order_id or "").strip())
+    if not isinstance(info, dict) or info.get("cancel_requested"):
+        return None
+    try:
+        return float(info.get("created_at")) + float(info.get("cancel_after_sec") or ENTRY_UNFILLED_CANCEL_SECONDS)
+    except Exception:
+        return None
+
+
 def _now() -> float:
     return time.time()
 

@@ -689,16 +689,102 @@ def _price_drift_max_pct() -> float:
 
         # 2026-10-19: 0.5 -> 1.0。急騰中は判定から 2 秒で 0.6% 動き、634A を 2 回逃した。
         # 2026-10-21: 1.0 -> 1.5。4382 の再エントリーを 1.01% で逃した。
-        return float(os.getenv("ENTRY_PRICE_DRIFT_MAX_PCT", "1.5") or 1.5)
+        # 2026-10-22 (ユーザー判断): 1.5 -> 0.2。10 月の約定 294 件で、判定した確定足の終値から
+        #   0.2% 超不利に約定した 26 件は 15 分後 -0.44%〜-2.0% (0.2% 以下は ±0.1%)。前半・後半とも同じ向き。
+        #   急騰の取り逃しは増える (1.0% 超の 1 件は +4.9% だった)。
+        return float(os.getenv("ENTRY_PRICE_DRIFT_MAX_PCT", "0.2") or 0.2)
     except Exception:
         return 0.5
+
+
+def _price_drift_favorable_max_pct() -> float:
+    """有利な向き (BUY で下、SELL で上) の許容乖離 (%)。0 以下なら有利側は見ない (2026-10-23)。"""
+    try:
+        import os
+
+        v = float(os.getenv("ENTRY_PRICE_DRIFT_FAVORABLE_MAX_PCT", "1.5") or 1.5)
+        return v if v > 0 else float("inf")
+    except Exception:
+        return 1.5
+
+
+def _last_same_day_exit_price(symbol: Any, side_u: str, today: Optional[dt.date] = None) -> Optional[float]:
+    """当日・同銘柄・同方向で最後に決済したときの約定価格 (positions DB)。無ければ None。"""
+    try:
+        from trading.position.positions_db_location import positions_db_path
+
+        db = str(positions_db_path())
+    except Exception:
+        return None
+    if not os.path.exists(db):
+        return None
+    day = (today or dt.date.today()).strftime("%Y-%m-%d")
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+        try:
+            row = con.execute(
+                "SELECT exit_price FROM positions WHERE symbol=? AND status='CLOSED' AND side LIKE ? "
+                "AND exit_price > 0 AND exit_time >= ? ORDER BY exit_time DESC LIMIT 1",
+                (str(symbol), f"{side_u}%", day),
+            ).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        logger.debug("[ENTRY REENTRY CHASE] positions db read failed symbol=%s", symbol, exc_info=True)
+        return None
+    try:
+        return float(row[0]) if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _reentry_chase_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any):
+    """2026-10-22 (ユーザー指示「追いかけ買いを止める」): 同じ日に同じ銘柄・同じ方向で、
+    前回の決済価格より ENTRY_REENTRY_CHASE_MAX_PCT (既定 0.5%) 以上不利な価格では入り直さない。
+
+    10/1〜10/22 の positions DB: 前回決済より 0.5% 超不利に入り直した 34 件は平均 -0.24% / 勝率 41%、
+    有利な側で入り直した 53 件は +0.19%。買い(32 件 -0.18%)・売り(2 件 -1.16%)とも同じ向き。
+    例: 436A 13:55 に 1951 で利確 → 14:15 に 1981 (+1.5%) で買い直し → 14:24 に 1963 で -1,800 円。
+    0 で無効。判定価格や positions DB が取れないときは通す (fail-open)。"""
+    try:
+        max_pct = float(os.getenv("ENTRY_REENTRY_CHASE_MAX_PCT", "0.5") or 0.0)
+    except Exception:
+        max_pct = 0.5
+    side_u = str(side or "").upper()
+    if max_pct <= 0 or side_u not in ("BUY", "SELL"):
+        return None
+    try:
+        judged = _epi_safe_float(
+            _epi_first(entry_row, ("close_price", "close", "price", "current_price"), 0.0), 0.0
+        )
+    except Exception:
+        judged = 0.0
+    if judged <= 0:
+        return None
+    last_exit = _last_same_day_exit_price(symbol, side_u)
+    if not last_exit:
+        return None
+    worse = (judged - last_exit) / last_exit * 100.0
+    if side_u == "SELL":
+        worse = -worse
+    if worse <= max_pct:
+        return None
+    logger.warning(
+        "[ENTRY REENTRY CHASE] reject symbol=%s side=%s source=%s last_exit=%.1f now=%.1f worse=%+.2f%% max=%.2f%% "
+        "(前回の決済より不利な所で入り直さない)",
+        symbol, side_u, source, last_exit, judged, worse, max_pct,
+    )
+    return _ng(
+        "REENTRY_CHASE", symbol=symbol, side=side_u,
+        last_exit_price=last_exit, now_price=judged, worse_pct=round(worse, 3), max_pct=max_pct,
+    )
 
 
 def _price_drift_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any):
     """判定時の価格と発注時の板価格が離れすぎていたら _ng を返す (2026-09-25)。
 
-    不利な方向 (BUY なら上、SELL なら下) に max_pct 以上離れたときだけ却下する。
-    有利な方向に動いた場合は通す。判定価格が取れないときは通す (fail-open)。
+    不利な方向 (BUY なら上、SELL なら下) は max_pct、有利な方向は
+    _price_drift_favorable_max_pct() を超えたら却下する。判定価格が取れないときは通す (fail-open)。
     """
     max_pct = _price_drift_max_pct()
     if max_pct <= 0:
@@ -734,17 +820,21 @@ def _price_drift_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any):
     # 2026-09-25: 両方向で見る。BUY で下がっていても「安く買える」のではなく
     #   下落トレンドを拾うことになる (625A)。SELL も同様。
     drift = (now_px - judged) / judged * 100.0
-    if abs(drift) <= max_pct:
+    adverse = drift if side_u == "BUY" else -drift
+    # 2026-10-23 (ユーザー判断): 有利な向きは別の上限にする。10/22 に上限を 0.2% へ下げた検証は
+    #   不利な向きだけだったが、両方向に効いて「安く買える」注文まで止めていた (10/23 朝 10 件中 5 件)。
+    limit = max_pct if adverse > 0 else _price_drift_favorable_max_pct()
+    if abs(drift) <= limit:
         return None
 
     logger.warning(
-        "[ENTRY PRICE DRIFT] reject symbol=%s side=%s judged=%.1f now=%.1f drift=%+.2f%% max=%.2f%% "
+        "[ENTRY PRICE DRIFT] reject symbol=%s side=%s judged=%.1f now=%.1f drift=%+.2f%% max=%.2f%% %s "
         "(判定した価格から離れすぎ。急騰の最中に遅れて飛び乗るのを防ぐ)",
-        symbol, side_u, judged, now_px, drift, max_pct,
+        symbol, side_u, judged, now_px, drift, limit, "adverse" if adverse > 0 else "favorable",
     )
     return _ng(
         "PRICE_DRIFT_TOO_LARGE", symbol=symbol, side=side_u,
-        judged_price=judged, now_price=now_px, drift_pct=round(drift, 3), max_pct=max_pct,
+        judged_price=judged, now_price=now_px, drift_pct=round(drift, 3), max_pct=limit,
     )
 
 def _five_sec_pre_entry_guard(symbol: str, side: str, source: str) -> Optional[Dict[str, Any]]:
@@ -1226,6 +1316,11 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
     _drift_ng = _price_drift_guard(symbol=symbol, side=side, source=source, entry_row=entry_row)
     if _drift_ng is not None:
         return _drift_ng
+
+    # 2026-10-22: 同じ日に前回の決済より不利な所で入り直さない (全経路共通)。
+    _reentry_ng = _reentry_chase_guard(symbol=symbol, side=side, source=source, entry_row=entry_row)
+    if _reentry_ng is not None:
+        return _reentry_ng
 
     # 2026-09-25: 当日すでに上がりきった所での BUY を止める (全経路共通)。
     #   9/25 の負け 4 件のうち 627A(+18.3%) / 6904(+18.8%) / 625A(+9.2%) は

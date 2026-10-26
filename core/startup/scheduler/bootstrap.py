@@ -1187,6 +1187,18 @@ def _run_ranking_summary_all_job_safe(*args: Any, **kwargs: Any):
     """
     global _RANKING_BG_RUNNING, _RANKING_BG_STARTED_AT
 
+    # 2026-10-23: main.py ではランキング集計を止められるようにする (MAIN_RANKING_SUMMARY_ENABLED=0)。
+    #   場中に 1 回 231 秒かかり、同じ時間帯に main の 1 分足の更新も 288 秒かかって
+    #   STALE DROP after=0 (発注ゼロ) になった。ランキング経路の ENTRY許可 は当日 23 件 / 約 2,000 件。
+    try:
+        if os.path.basename(sys.argv[0] or "").lower() == "main.py" and str(
+            os.getenv("MAIN_RANKING_SUMMARY_ENABLED", "1")
+        ).strip().lower() in ("0", "false", "no", "off"):
+            logger.info("[RANKING SUMMARY BG] skipped in main.py by MAIN_RANKING_SUMMARY_ENABLED=0")
+            return None
+    except Exception:
+        pass
+
     # 旧 fast_startup_runtime_patch._patch_ranking_bootstrap() が掛けていた
     # 「戻り値を捨てて None を返す」ラッパーを本文へ畳み込んである。
     # schedule 側へ CancelJob 相当の戻り値が渡ってジョブが消えるのを防ぐ。

@@ -539,6 +539,14 @@ def _ai_final_entry_check_core(row: dict) -> dict:
         except Exception:
             pass
 
+    # 2026-10-23 (ユーザー判断): 3 分足も 5 分足も付いていない候補は止める (ENTRY_MTF_DATA_REQUIRE=both_missing)。
+    #   10/23 は AI_OK の 3,469 件が両方 NA (片方だけ NA は 2,303 件で通す)。any=片方でも無ければ止める / off=止めない。
+    _mtf_req = str(os.getenv("ENTRY_MTF_DATA_REQUIRE", "both_missing") or "").strip().lower()
+    if (_mtf_req == "any" and not (has_3m and has_5m)) or (_mtf_req == "both_missing" and not has_3m and not has_5m):
+        logger.info("[ENTRY GATE] block mtf_data_not_ready symbol=%s source=%s interval=%s 3m=%s 5m=%s mode=%s",
+                    symbol, source, interval, txt_3m, txt_5m, _mtf_req)
+        return _block(f"mtf_data_not_ready:3m={txt_3m}|5m={txt_5m}", final_conf, "MTF_DATA")
+
     lot_multiplier = max(0.5, min(2.0, 0.5 + final_conf))
     if final_conf > ENTRY_SCORE_MAX + 1e-9:
         logger.error(
