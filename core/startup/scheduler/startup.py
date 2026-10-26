@@ -139,6 +139,12 @@ def start_scheduler_stack_before_restore() -> None:
         _register_limitup_fade()
     except Exception:
         logger.exception("[startup.scheduler] limitup_fade register failed")
+    # 2026-10-26: 5 分足 25MA への押し目買い (記録だけ、trading/strategies/ma_pullback.py)
+    try:
+        from trading.strategies.ma_pullback import register_scheduler_safe as _register_ma_pullback
+        _register_ma_pullback()
+    except Exception:
+        logger.exception("[startup.scheduler] ma_pullback register failed")
     # 2026-10-08: テーマ別の資金流入を 5 分ごとに記録 (売買しない、trading/monitors/theme_flow.py)
     try:
         from trading.monitors.theme_flow import register_scheduler_safe as _register_theme_flow
