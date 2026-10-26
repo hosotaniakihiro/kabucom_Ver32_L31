@@ -29,13 +29,22 @@ from .ats_register_payload import (
     build_ats_payload,
     keep_last_good_batch,
     restore_last_good_batch,
-    register_payload,
+    switch_batch_minimal,
+    finalize_registration,
 )
 from .ats_register_logging import _print_current_ats_registered_symbols
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_SEC = 20
+
+# ローテーション時間設計(壁時計合わせ):
+#   5 秒スロットで A/B を交互登録し、毎分の秒を 5 で割った境界にスナップする。
+#     A = :00,:10,:20,:30,:40,:50   (スロット番号が偶数)
+#     B = :05,:15,:25,:35,:45,:55   (スロット番号が奇数)
+#   各境界で unregister/all -> 対象グループ register を連続実行して切替。
+#   銘柄プール(A/B の中身)は毎分先頭(:00 スロット)で 1 回だけ再構築する。
+SLOT_SEC = 5.0            # 1 スロットの長さ(= 切替間隔)
 
 
 def build_cycle_targets(rotator: ATSRotationManager) -> List[str]:
@@ -195,29 +204,46 @@ def ats_register_loop(*args, **kwargs):
         interval_sec = int(kwargs["interval_sec"])
 
     logger.info(
-        "🚀 ats_register_loop START (interval=%s sec / batch50 unregister-all vendor-style / ranking-only targets)",
-        interval_sec,
+        "🚀 ats_register_loop START (clock-aligned %.1fs slots / A=:00,:10.. B=:05,:15.. "
+        "/ batch50 unregister-all->register / ranking-only targets)",
+        SLOT_SEC,
     )
 
     rotator = ATSRotationManager(batch_size=100, shift=50)
 
-    phase = 0
     registerable_targets = []
     batch_a = []
     batch_b = []
+    last_pool_minute = None
+
+    def _sleep_until_next_slot():
+        """次の SLOT_SEC 境界(:00,:05,:10..)までスリープし、壁時計に再整列する。"""
+        now = time.time()
+        next_boundary = (int(now // SLOT_SEC) + 1) * SLOT_SEC
+        wait = next_boundary - now
+        if wait < 0.0:
+            wait = 0.0
+        time.sleep(wait)
 
     while True:
         try:
+            now = time.time()
+            slot = int(now // SLOT_SEC)
+            minute = int(now // 60)
+            # スロット偶数 -> A(:00,:10,:20,:30,:40,:50) / 奇数 -> B(:05,:15,..)
+            phase_name = "A" if slot % 2 == 0 else "B"
+
             if is_in_429_cooldown():
                 logger.warning(
-                    "[ATS LOOP] in 429 cooldown -> keep last good and sleep %ss",
-                    interval_sec,
+                    "[ATS LOOP] in 429 cooldown -> keep last good, skip %s slot, realign",
+                    phase_name,
                 )
                 keep_last_good_batch(reason_phase="COOLDOWN")
-                time.sleep(interval_sec)
+                _sleep_until_next_slot()
                 continue
 
-            if not registerable_targets or phase == 0:
+            # 銘柄プール(A/B の中身)は毎分先頭で 1 回だけ再構築する
+            if not registerable_targets or minute != last_pool_minute:
                 registerable_targets = build_registerable_symbol_pool(
                     rotator=rotator,
                     target_size=ATS_BATCH_SIZE,
@@ -225,9 +251,10 @@ def ats_register_loop(*args, **kwargs):
                 )
 
                 batch_a, batch_b = split_batches_50(registerable_targets)
+                last_pool_minute = minute
 
                 logger.info(
-                    "[ATS CYCLE] registerable batchA=%d batchB=%d total=%d",
+                    "[ATS CYCLE] pool rebuilt batchA=%d batchB=%d total=%d",
                     len(batch_a),
                     len(batch_b),
                     len(registerable_targets),
@@ -241,52 +268,56 @@ def ats_register_loop(*args, **kwargs):
                 except Exception:
                     logger.debug("[ATS LOOP] global_data reflect failed", exc_info=True)
 
-            if phase == 0:
-                current_symbols = batch_a
-                phase_name = "A"
-            else:
-                current_symbols = batch_b
-                phase_name = "B"
+            current_symbols = batch_a if phase_name == "A" else batch_b
 
             if not current_symbols:
-                if phase == 1 and batch_a:
+                if phase_name == "B" and batch_a:
                     logger.warning(
-                        "[ATS %s] current batch empty but batchA exists -> keep/reuse batchA",
-                        phase_name,
+                        "[ATS B] batchB empty but batchA exists -> reuse batchA this slot",
                     )
                     current_symbols = batch_a
                     phase_name = "A-reuse"
                 else:
                     logger.warning(
-                        "[ATS %s] current batch empty -> keep last good and reset cycle",
+                        "[ATS %s] batch empty -> keep last good, force rebuild next minute",
                         phase_name,
                     )
                     keep_last_good_batch(reason_phase=f"{phase_name}-EMPTY")
                     registerable_targets = []
-                    batch_a = []
-                    batch_b = []
-                    phase = 0
-                    time.sleep(interval_sec)
+                    last_pool_minute = None
+                    _sleep_until_next_slot()
                     continue
 
-            ok = register_payload(current_symbols, phase=phase_name, apply_all_filters=apply_all_filters)
+            # 境界で切替: 50 銘柄上限のため A/B 同時不可 -> unregister/all してから register。
+            # 無登録時間を最小化するため、フィルタ/payload は旧グループ登録中(窓の外)で
+            # 済ませ、クリティカルセクションは解除API+登録APIの 2 本だけにする。
+            ok, registered = switch_batch_minimal(
+                current_symbols,
+                phase=phase_name,
+                apply_all_filters=apply_all_filters,
+            )
 
             if ok:
+                # ログ/DB保存は登録済み状態(窓の外)で実施 -> PUSH は途切れない
+                finalize_registration(registered, phase_name)
                 logger.info(
-                    "[ATS %s] active batch applied size=%d",
+                    "[ATS %s] switched size=%d @slot%+d (sec_in_min=%.1f)",
                     phase_name,
-                    len(sanitize_symbols(current_symbols)),
+                    len(registered),
+                    slot % 12,
+                    now % 60.0,
                 )
             else:
                 logger.warning(
-                    "[ATS %s] apply failed -> last_good_phase=%s size=%d",
+                    "[ATS %s] switch failed -> last_good_phase=%s size=%d (keep)",
                     phase_name,
                     get_last_good_phase(),
                     len(get_last_good_batch()),
                 )
+                keep_last_good_batch(reason_phase=f"{phase_name}-REGFAIL")
 
-            time.sleep(interval_sec)
-            phase = 1 - phase
+            # 次の 5 秒境界まで待って壁時計に再整列
+            _sleep_until_next_slot()
 
         except Exception:
             logger.exception("❌ ats_register_loop error")
@@ -302,5 +333,5 @@ def ats_register_loop(*args, **kwargs):
             registerable_targets = []
             batch_a = []
             batch_b = []
-            phase = 0
-            time.sleep(interval_sec)
+            last_pool_minute = None
+            _sleep_until_next_slot()

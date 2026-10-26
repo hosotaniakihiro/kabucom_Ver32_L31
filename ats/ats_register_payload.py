@@ -308,6 +308,120 @@ def register_payload(symbols: List[str], phase: str, apply_all_filters) -> bool:
     return keep_last_good_batch(reason_phase=phase)
 
 
+def register_only(symbols: List[str], phase: str, apply_all_filters) -> bool:
+    """unregister を伴わない register。
+
+    「登録 -> 保持 -> 解除 -> インターバル」ローテーション用。
+    直前サイクルで unregister_all 済みで register リストが空である前提のため、
+    switch_batch_vendor_style のような事前 unregister/all は行わない。
+
+    register リストは push と共有の 50 銘柄上限資源なので、register の瞬間だけ
+    sequence lock を取り、push rotation の割り込みによる
+    {"Code":4002006,"レジスト数エラー"} を防ぐ。
+    """
+    if is_in_429_cooldown():
+        logger.warning("[ATS %s] register_only skipped: in 429 cooldown", phase)
+        return False
+
+    symbols = sanitize_symbols(apply_all_filters(symbols))
+    payload = build_ats_payload(symbols, limit=REGISTER_LIMIT)
+
+    if not payload:
+        logger.warning("[ATS %s] register_only payload empty -> skip", phase)
+        return False
+
+    symbols_only = unique_keep_order([p["Symbol"] for p in payload])
+
+    log_registered_symbols(symbols_only, phase=phase)
+    save_ats_register_log(symbols_only)
+
+    with _kabu_register_sequence_lock(f"ats_register_only_{phase}"):
+        ok = register_symbols_batch(symbols_only, phase)
+
+    if ok:
+        set_registered_symbols(symbols_only)
+        set_last_good_batch(symbols_only, phase)
+        set_active_phase(phase, symbols_only)
+        _print_current_ats_registered_symbols(symbols_only, phase=phase)
+        return True
+
+    logger.warning("[ATS %s] register_only failed", phase)
+    return False
+
+
+def switch_batch_minimal(symbols, phase, apply_all_filters=None):
+    """解除 -> 登録の「無登録時間」を最小化する切替。
+
+    設計:
+      - フィルタ / payload 生成 / 銘柄確定は、まだ旧グループが登録中のうちに
+        (= 無登録の窓の外で) 済ませる。
+      - クリティカルセクション内は API 2 本 (unregister/all -> register) だけ。
+        ログ・DB保存・状態更新は一切やらない (呼び出し側が register 完了後に
+        finalize_registration() で行う)。
+      - unregister と register を 1 つの sequence lock で囲い、間に push rotation が
+        割り込んで合計 100 銘柄 (4002006) になるのを防ぐ。
+
+    戻り値: (ok: bool, registered_symbols: list[str])
+    """
+    # ---- 窓の外: 重い前処理はここで (旧グループはまだ登録中) ----
+    if apply_all_filters is not None:
+        try:
+            symbols = apply_all_filters(symbols)
+        except Exception:
+            logger.exception("[ATS %s] minimal switch filter failed", phase)
+    symbols = sanitize_symbols(symbols)
+
+    payload = build_ats_payload(symbols, limit=REGISTER_LIMIT)
+    symbols_only = unique_keep_order([p["Symbol"] for p in payload])
+
+    if not symbols_only:
+        logger.warning("[ATS %s] minimal switch payload empty -> skip", phase)
+        return False, []
+
+    if is_in_429_cooldown():
+        logger.warning("[ATS %s] minimal switch skipped: in 429 cooldown", phase)
+        return False, symbols_only
+
+    # ---- ここから無登録の窓 (API 2 本のみ) ----
+    with _kabu_register_sequence_lock(f"ats_switch_min_{phase}"):
+        if not unregister_all_vendor():
+            logger.warning("[ATS %s] minimal switch unregister/all failed", phase)
+            return False, symbols_only
+        ok = register_symbols_batch(symbols_only, phase)
+    # ---- ここまで無登録の窓 ----
+
+    return ok, symbols_only
+
+
+def finalize_registration(symbols_only, phase) -> None:
+    """register 成功後の後処理 (無登録の窓の外で呼ぶこと)。
+
+    状態更新 + ログ出力 + ats_registered_log.db への保存。いずれも登録済みの
+    状態で走るので、多少時間がかかっても PUSH は途切れない。
+    """
+    try:
+        set_registered_symbols(symbols_only)
+        set_last_good_batch(symbols_only, phase)
+        set_active_phase(phase, symbols_only)
+    except Exception:
+        logger.exception("[ATS %s] finalize state update failed", phase)
+
+    try:
+        log_registered_symbols(symbols_only, phase=phase)
+    except Exception:
+        logger.exception("[ATS %s] finalize log failed", phase)
+
+    try:
+        save_ats_register_log(symbols_only)
+    except Exception:
+        logger.exception("[ATS %s] finalize save log failed", phase)
+
+    try:
+        _print_current_ats_registered_symbols(symbols_only, phase=phase)
+    except Exception:
+        logger.exception("[ATS %s] finalize print failed", phase)
+
+
 __all__ = [
     "build_ats_payload",
     "unregister_symbols",
@@ -317,4 +431,7 @@ __all__ = [
     "keep_last_good_batch",
     "restore_last_good_batch",
     "register_payload",
+    "register_only",
+    "switch_batch_minimal",
+    "finalize_registration",
 ]
