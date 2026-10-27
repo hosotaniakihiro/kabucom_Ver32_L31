@@ -8,7 +8,7 @@
 # 損切り 1.5% + 60 分) だった定義をそのまま実装する:
 #   - PUSH の 1 分足 (累計出来高の差分)。前の足と 1 分ずつ連続している足だけ有効。
 #   - 3 分足 / 5 分足 (時計の区切り)。出来高 / 直前 5 本平均 (3 本以上) >= 10 倍。
-#   - 足の騰落 (直前 1 分足の終値から) が +0.2〜+1.2%。
+#   - 足の騰落 (直前 1 分足の終値から) が +0.2〜+3.0% (2026-10-27 に 1.2% から広げた。TONOSAMA_MAX_BAR_CHANGE_PCT)。
 #   - 足の形: 終値位置 <= 90%、上ヒゲ <= 45%。
 #   - 足の終わり時刻が 09:05〜11:30 / 12:40〜14:30。
 #   - 直近 1 分足の売買代金 >= 2,000 万円。株価 >= TONOSAMA_MIN_PRICE。
@@ -152,8 +152,13 @@ def signals(m1: pd.DataFrame) -> pd.DataFrame:
     ratio_min = _env_f("TONOSAMA_MIN_VOLUME_SURGE_RATIO", 10.0)
     turn_min = _env_f("TONOSAMA_MIN_LATEST_TURNOVER", 20_000_000.0)
     price_min = _env_f("TONOSAMA_MIN_PRICE", 300.0)
+    # 2026-10-27: 上限 1.2% -> 3.0% (ユーザー判断で発注まで有効)。backtest 8/17〜9/25・10 倍・3 分足・
+    #   損切り 1.5% + 60 分 (終値ベース、足の形の条件なし): +1.2〜2% は n=31 +0.15%、+2〜3% は n=18 +1.35%
+    #   (前半 +2.06% / 後半 +0.63%)。+3〜5% は n=24 -2.25%、+5% 以上は n=15 -4.52% なので 3% で切る。
+    #   件数が少なく実気配では未確認。成績は [TONOSAMA VALIDATED] signal の chg= で追う。
+    pchg_max = _env_f("TONOSAMA_MAX_BAR_CHANGE_PCT", 3.0)
     s = pd.concat([_mk_bars(m1, 3), _mk_bars(m1, 5)])
-    s = s[(s.ratio >= ratio_min) & (s.pchg >= 0.2) & (s.pchg <= 1.2)]
+    s = s[(s.ratio >= ratio_min) & (s.pchg >= 0.2) & (s.pchg <= pchg_max)]
     s = s[(s.cpos <= 90) & (s.uwick <= 45) & (s.close >= price_min)]
     s = s.rename(columns={"bend": "t"})
     hm = s.t.dt.hour * 100 + s.t.dt.minute
