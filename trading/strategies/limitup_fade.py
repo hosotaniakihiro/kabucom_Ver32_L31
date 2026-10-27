@@ -1,6 +1,8 @@
 # ============================================================
 # File   : trading/strategies/limitup_fade.py
 # 2026-10-07: ストップ高タッチ後の崩れ売り (LIMITUP_FADE) — 記録だけ (発注しない)
+# 2026-10-27: 発注する (ユーザー判断)。発注と決済は SURGE_SHORT の仕組み (place_short_from_signal / handle_exit)。
+#   止め方: LIMITUP_FADE_ORDER_ENABLED=0 (記録だけに戻る)。
 # ------------------------------------------------------------
 # ストップ高に「触れただけ」で張り付かなかった銘柄が、ストップ高から 4% 以上崩れたら空売りする想定で、
 # シグナルと仮想の決済を記録する。実気配で取れるか確かめてから発注を足す (ユーザー判断 10/7)。
@@ -33,7 +35,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from trading.strategies.surge_short import _env_f, _env_on, _hm, _ts, _pt, limit_up_price
+from trading.strategies.surge_short import _env_f, _env_on, _hm, _ts, _pt, limit_up_price  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,11 @@ def cfg() -> Dict[str, Any]:
         "take_profit_pct": _env_f("LIMITUP_FADE_TAKE_PROFIT_PCT", 5.0),
         "force_close": _hm("LIMITUP_FADE_FORCE_CLOSE", "15:20"),
         "max_publish": int(_env_f("LIMITUP_FADE_MAX_PUBLISH", 8)),
+        # 2026-10-27: 発注する (ユーザー判断)。実気配の仮想 12 件 (10/8〜10/27) は -0.24% だったが、
+        #   SURGE_SHORT と同じ条件 (スプレッド 0.30% / プレミアム 0.40% / 300 円以上 / 1 回 5,000 円) で絞った 5 件は +0.47%。
+        #   発注と決済は surge_short.place_short_from_signal -> surge_short.handle_exit。仮想の記録は比較のため続ける。
+        "order_enabled": _env_on("LIMITUP_FADE_ORDER_ENABLED", True),
+        "order_min_price": _env_f("LIMITUP_FADE_ORDER_MIN_PRICE", 300.0),
     }
 
 
@@ -259,9 +266,21 @@ def run_cycle(now: Optional[dt.datetime] = None) -> None:
                     x.update(status="virtual_open", entry_ts=_ts(now), bar=k, bar_close=last, entry=entry,
                              ask=ask, bid=bid, quote_age=round(_FEED.age(sym, now), 1), best=entry,
                              marginpremium=prem, drop_pct=round((1 - last / lu) * 100, 2))
-                    logger.warning("[LIMITUP FADE] SIGNAL (record only) symbol=%s bar=%s close=%.1f limit_up=%.1f bid=%s ask=%s "
-                                   "drop=%.2f%% touch=%s premium=%s", sym, k, last, lu, bid, ask,
-                                   x["drop_pct"], x["touch_ts"], prem)
+                    logger.warning("[LIMITUP FADE] SIGNAL symbol=%s bar=%s close=%.1f limit_up=%.1f bid=%s ask=%s "
+                                   "drop=%.2f%% touch=%s premium=%s order=%s", sym, k, last, lu, bid, ask,
+                                   x["drop_pct"], x["touch_ts"], prem, c["order_enabled"])
+                    if c["order_enabled"]:
+                        if entry < c["order_min_price"]:
+                            res = ("skipped", "price_too_low", {"price": entry})
+                        else:
+                            try:
+                                from trading.strategies.surge_short import place_short_from_signal
+                                res = place_short_from_signal(sym, "LIMITUP_FADE", limit_up=lu, ref_price=entry, now=now)
+                            except Exception as e:
+                                logger.exception("[LIMITUP FADE] order failed symbol=%s", sym)
+                                res = ("skipped", "order_exception", {"error": repr(e)})
+                        x["order"] = {"result": res[0], "reason": res[1], "detail": res[2]}
+                        logger.warning("[LIMITUP FADE] ORDER %s symbol=%s reason=%s detail=%s", res[0].upper(), sym, res[1], res[2])
                     break
             # 仮想決済
             if x["status"] == "virtual_open" and q:
@@ -312,7 +331,7 @@ def register_scheduler_safe() -> bool:
             return True
         every = int(_env_f("LIMITUP_FADE_INTERVAL_SEC", 20))
         schedule.every(every).seconds.do(_run_guarded).tag("limitup_fade", "entry")
-        logger.warning("[LIMITUP FADE] scheduler registered (record only) every=%ss cfg=%s", every,
+        logger.warning("[LIMITUP FADE] scheduler registered every=%ss cfg=%s", every,
                        {k: (str(v) if isinstance(v, dt.time) else v) for k, v in cfg().items()})
         return True
     except Exception:

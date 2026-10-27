@@ -293,6 +293,9 @@ def run_cycle(now: Optional[dt.datetime] = None) -> None:
 
 def _try_entry(sym: str, v: Dict[str, Any], st: Dict[str, Any], now: dt.datetime, c: Dict[str, Any]):
     """('ordered'|'skipped'|'retry', reason, detail)"""
+    # 2026-10-27: 同じ日に LIMITUP_FADE が先に売った銘柄は売らない (trades は銘柄ごとに 1 件。上書きすると決済が壊れる)
+    if sym in (st.get("trades") or {}):
+        return "skipped", "already_traded", {"strategy": (st["trades"][sym] or {}).get("strategy", "SURGE_SHORT")}
     entries = sum(1 for t in (st.get("trades") or {}).values())
     if entries >= c["max_per_day"]:
         return "skipped", "max_per_day", {"entries": entries}
@@ -377,6 +380,80 @@ def _try_entry(sym: str, v: Dict[str, Any], st: Dict[str, Any], now: dt.datetime
     st.setdefault("trades", {})[sym] = {"order_ts": _ts(now), "order_id": str(oid), "price": sell_px, "qty": qty,
                                         "limit_up": limit_up_price(prev_close) if prev_close > 0 else 0.0, **detail}
     return "ordered", "ok", {**detail, "order_id": str(oid)}
+
+
+def place_short_from_signal(sym: str, strategy: str, *, limit_up: float, ref_price: float,
+                            now: Optional[dt.datetime] = None):
+    """別の戦略 (LIMITUP_FADE) の合図で、この戦略と同じ発注・決済の仕組みで空売りする。
+    ('ordered'|'skipped', reason, detail) を返す。建玉は trades に strategy 付きで入り、
+    決済は handle_exit (証券会社の逆指値 = 建値 +5% とストップ高の 1 刻み手前の低い方 / トレール / 30 分 / 15:20) が扱う。
+    条件はこの戦略と同じ: スプレッド・プレミアム料・株価・1 回の損失上限・1 日の回数と同時保有 (2 つの戦略で合算)。"""
+    c = cfg()
+    now = now or dt.datetime.now()
+    with _LOCK:
+        st = _load()
+        trades = st.setdefault("trades", {})
+        if sym in trades:
+            return "skipped", "already_traded", {"strategy": (trades[sym] or {}).get("strategy", "SURGE_SHORT")}
+        if sum(1 for _ in trades.values()) >= c["max_per_day"]:
+            return "skipped", "max_per_day", {}
+        if _open_count(st, now, c["hold_min"]) >= c["max_open"]:
+            return "skipped", "max_open", {}
+        if ref_price < c["min_price"]:
+            return "skipped", "price_too_low", {"price": ref_price}
+        try:
+            from trading.entry.daily_risk_guard import should_allow_new_entry
+            dec = should_allow_new_entry(sym)
+            if not getattr(dec, "allow", True):
+                return "skipped", f"daily_risk:{getattr(dec, 'reason', '')}", {}
+        except Exception:
+            logger.debug("[SURGE SHORT] daily risk guard failed", exc_info=True)
+        mp = _margin_premium(sym)
+        if mp is None:
+            return "skipped", "marginpremium_unavailable", {}
+        if mp.get("MarginPremiumType") is None:
+            return "skipped", "no_daytrade_short", {"marginpremium": mp}
+        prem = float(mp.get("MarginPremium") or 0.0)
+        prem_pct = prem / ref_price * 100 if ref_price > 0 else 999
+        if prem_pct > c["max_premium_pct"]:
+            return "skipped", "premium_too_high", {"premium_yen": prem, "premium_pct": round(prem_pct, 3)}
+        bd = _board(sym)
+        if not bd:
+            return "skipped", "board_unavailable", {}
+        bid, ask = float(bd.get("bid") or 0), float(bd.get("ask") or 0)
+        if not (ask > bid > 0):
+            return "skipped", "board_invalid", {"bid": bid, "ask": ask}
+        spread_pct = (ask - bid) / ((ask + bid) / 2) * 100
+        if spread_pct > c["max_spread_pct"]:
+            return "skipped", "spread_too_wide", {"spread_pct": round(spread_pct, 3)}
+        if limit_up > 0 and bid >= limit_up * 0.997:
+            return "skipped", "at_limit_up", {"bid": bid, "limit_up": limit_up}
+        qty = int(c["max_yen"] // (bid * 100)) * 100
+        if qty <= 0:
+            return "skipped", "too_expensive", {"bid": bid, "max_yen": c["max_yen"]}
+        if c["max_loss_yen"] > 0:
+            qty = min(qty, int(c["max_loss_yen"] // (bid * c["stop_pct"] / 100.0 * 100)) * 100)
+            if qty <= 0:
+                return "skipped", "loss_cap_too_small", {"bid": bid, "max_loss_yen": c["max_loss_yen"],
+                                                          "loss_per_100": round(bid * c["stop_pct"], 1)}
+        from trading.handlers.entry_handler import place_entry_sell
+        from kabu_api.send_order import premium_cap_override
+        sell_px = bid
+        if _env_on("SURGE_SHORT_SELL_ABOVE", True):
+            from trading.handlers.entry_order_builder import note_sell_wait, sell_above_price
+            sell_px = sell_above_price(ask, bid)
+            note_sell_wait(sym, ask)
+        with premium_cap_override(c["max_premium_pct"]):
+            oid = place_entry_sell(sym, sym, sell_px, strategy, order_type="LIMIT", qty=qty)
+        detail = {"bid": bid, "ask": ask, "sell_px": sell_px, "spread_pct": round(spread_pct, 3), "qty": qty,
+                  "premium_pct": round(prem_pct, 3)}
+        if not oid:
+            return "skipped", "send_failed", detail
+        trades[sym] = {"order_ts": _ts(now), "order_id": str(oid), "price": sell_px, "qty": qty,
+                       "limit_up": float(limit_up or 0), "strategy": strategy, **detail}
+        _save(st)
+        logger.warning("[SURGE SHORT] ORDERED for %s symbol=%s detail=%s", strategy, sym, detail)
+        return "ordered", "ok", {**detail, "order_id": str(oid)}
 
 
 # ------------------------------------------------------------
