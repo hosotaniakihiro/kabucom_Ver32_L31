@@ -2315,8 +2315,10 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[st
 
     # 2026-10-14: 同じ銘柄の制限を緩和 (ユーザー判断)。回数 2->4 (勝ち銘柄 4->6)、1 回負けたら停止 -> 停止しない、
     #   銘柄ごとの損失上限 -1,500 -> -5,000 円 (10/14 夜に -3,000 円 + 1 日 2 敗で停止へ締め直し)、発注回数 6->10。
-    max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 4)
-    winning_max_entries = _env_int("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES", 6)
+    # 2026-10-27: ユーザー指示で 1 銘柄 1 日の新規回数の上限を撤廃 (旧 4 回 / 勝ち越し銘柄 6 回)。0 = 上限なし。
+    #   4498 が前場 4 回で上限に達し、後場の上昇に入れなかった。損失側の上限 (2 敗 / -3,000 円 / 発注 10 回) は残す。
+    max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 0)
+    winning_max_entries = _env_int("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES", 0)
     symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -3000.0)
     stop_after_first_loss = _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", False)
     stop_after_first_loss_only_net_negative = _env_bool("ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE", True)
