@@ -50,14 +50,55 @@ BLOWOFF_TREND_HOLD_DAY_UP_PCT = float(
 _DAY_OPEN_CACHE: Dict[str, float] = {}
 
 
+def _day_open_from_summary(sym: str) -> float:
+    """summary DB の当日最初の足 (5 分足、無ければ 1 分足) の始値。取れなければ 0.0。"""
+    try:
+        import sqlite3
+        from data_collectors.config import summary_db_path
+        p = summary_db_path()
+        if not p.exists():
+            return 0.0
+        import datetime as _dt
+        # 8:35〜 の寄り前気配の足も入っているので 9:00 以降に限る (6203 は寄り前 2,053 円・寄り 2,179 円)
+        session_start = _dt.date.today().strftime("%Y-%m-%d") + " 09:00:00"
+        con = sqlite3.connect("file:" + str(p) + "?mode=ro", uri=True, timeout=1.0)
+        try:
+            for table in ("stock_summary_5min", "stock_summary_1min"):
+                row = con.execute(
+                    f"SELECT open FROM {table} WHERE symbol=? AND open > 0 AND datetime >= ? "
+                    "ORDER BY datetime LIMIT 1", (sym, session_start)
+                ).fetchone()
+                if row and row[0]:
+                    return float(row[0])
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    except Exception:
+        logger.debug("[BLOWOFF] day_open summary lookup failed symbol=%s", sym, exc_info=True)
+    return 0.0
+
+
 def _day_open_price(symbol: str) -> float:
-    """当日始値。ranking DB のその日最初のスナップショット。取れなければ 0.0。"""
+    """当日始値。summary DB の当日最初の足の始値。取れなければ ranking DB の最初のスナップショット。
+
+    2026-10-27: ranking DB の最初の値は「ランキングに初めて載った時刻の価格」で始値ではなかった
+    (4498 は 9:01 の 2,595 円、実際の始値は 2,467 円。当日 124 銘柄中 41 銘柄が 1% 超ずれ)。
+    当日上昇率を +7.2% でなく +1.9% と見て勢いなしと判断し、FULL_TAKE で早降りしていた。
+    """
     sym = str(symbol or "").strip()
     if not sym:
         return 0.0
     if sym in _DAY_OPEN_CACHE:
         return _DAY_OPEN_CACHE[sym]
-    val = 0.0
+    val = _day_open_from_summary(sym)
+    if val > 0:
+        _DAY_OPEN_CACHE[sym] = val
+        if len(_DAY_OPEN_CACHE) > 1024:
+            _DAY_OPEN_CACHE.clear()
+        return val
+    # summary に足がまだ無い時だけ旧来の ranking DB を使う (キャッシュしない: 後で summary が取れたらそちらを使う)
     try:
         import sqlite3
         from trading.ranking.ranking_db_location import ranking_db_path
@@ -80,10 +121,6 @@ def _day_open_price(symbol: str) -> float:
     except Exception:
         logger.debug("[BLOWOFF] day_open lookup failed symbol=%s", sym, exc_info=True)
         val = 0.0
-    if val > 0:
-        _DAY_OPEN_CACHE[sym] = val
-        if len(_DAY_OPEN_CACHE) > 1024:
-            _DAY_OPEN_CACHE.clear()
     return val
 
 
