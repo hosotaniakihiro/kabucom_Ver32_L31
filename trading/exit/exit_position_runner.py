@@ -818,6 +818,7 @@ def _judge_entry_trail_retrace_exit(*, symbol: str, pos: Dict[str, Any], side: s
             logger.info("[ENTRY_TRAIL_RETRACE_EXIT] reset state symbol=%s old_key=%s old_hold=%s new_key=%s new_hold=%s old_high=%s old_low=%s", symbol, st.get("key"), old_hold, key, hold, st.get("highest"), st.get("lowest"))
         st.clear()
         st["key"] = key
+        st["since"] = dt.datetime.now().timestamp()
     if hold:
         st["hold"] = hold
     old_high = _et3_f(st.get("highest"))
@@ -827,8 +828,20 @@ def _judge_entry_trail_retrace_exit(*, symbol: str, pos: Dict[str, Any], side: s
     ctx_high = _et3_f(getattr(ctx, "highest", 0.0)) if ctx is not None and not fresh else 0.0
     ctx_low = _et3_f(getattr(ctx, "lowest", 0.0)) if ctx is not None and not fresh else 0.0
 
-    high = max(x for x in [entry, cur, old_high, pos_high, ctx_high] if x > 0)
-    low = min(x for x in [entry, cur, old_low, pos_low, ctx_low] if x > 0)
+    # 2026-10-27: 約定直後の数秒は、約定前に付いた値 (5 秒足の終値) が current として来る。
+    #   4493 は 14:26:37 に 3,575 円で約定したが、14:26:30 の 3,595 円が高値に入り、決済ラインが建値より上になった。
+    #   新しい建玉を最初に見てから EXIT_TRAIL_IGNORE_FIRST_SEC 秒 (既定 5) は current を高値/安値に入れない
+    #   (ctx.entry_time は銘柄単位で使い回され、入り直しでは前の建玉の時刻になるので使わない)。
+    cur_hl = cur
+    try:
+        _ign = float(os.getenv("EXIT_TRAIL_IGNORE_FIRST_SEC", "5") or 0)
+        _since = float(st.get("since") or 0)
+        if _ign > 0 and _since > 0 and dt.datetime.now().timestamp() - _since < _ign:
+            cur_hl = 0.0
+    except Exception:
+        cur_hl = cur
+    high = max(x for x in [entry, cur_hl, old_high, pos_high, ctx_high] if x > 0)
+    low = min(x for x in [entry, cur_hl, old_low, pos_low, ctx_low] if x > 0)
 
     st["highest"] = high
     st["lowest"] = low
