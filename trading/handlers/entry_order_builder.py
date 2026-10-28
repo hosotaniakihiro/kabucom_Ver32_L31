@@ -682,6 +682,42 @@ def _entry_min_trading_value_hard() -> float:
     except Exception:
         return 1_000_000_000.0
 
+
+# 東証の立会時間 (前場 9:00-11:30 / 後場 12:30-15:30) の合計分数
+_SESSION_TOTAL_MIN = 330.0
+
+
+def _session_elapsed_min(now: dt.datetime | None = None) -> float:
+    """当日の立会経過分数 (昼休みを除く)。寄り前は 0、大引け後は 330。"""
+    now = now or dt.datetime.now()
+    m = now.hour * 60 + now.minute + now.second / 60.0
+    am = min(max(m - 9 * 60, 0.0), 150.0)
+    pm = min(max(m - (12 * 60 + 30), 0.0), 180.0)
+    return am + pm
+
+
+def _entry_trading_value_day_equiv(trading_value: float, now: dt.datetime | None = None) -> float:
+    """当日累計の売買代金を「このペースで 1 日続いた場合」の金額に換算する (2026-10-28)。
+
+    ENTRY_MIN_TRADING_VALUE_HARD は 1 日分の金額で決めた下限なのに、累計と比べていたので
+    寄り直後はほぼ全銘柄が落ちていた。10/28 の 3778 (決算で急騰) は 9:23 に 8.4 億
+    (1 日換算 120 億) で LOW_LIQUIDITY_HARD になり、空売りを逃した。
+    9/28 の 7883 は 13:27 に 4.6 億 = 1 日換算 7.3 億なので引き続き止まる。
+    寄り付き直後は板寄せの出来高で膨らむため、経過分数は
+    ENTRY_MIN_TRADING_VALUE_HARD_MIN_ELAPSED_MIN (既定 15 分) を下限にする。
+    ENTRY_MIN_TRADING_VALUE_HARD_PACE=0 で従来どおり累計と比べる。
+    """
+    if os.getenv("ENTRY_MIN_TRADING_VALUE_HARD_PACE", "1").strip() in ("0", "false", "False", "off"):
+        return float(trading_value or 0.0)
+    try:
+        min_elapsed = max(1.0, float(os.getenv("ENTRY_MIN_TRADING_VALUE_HARD_MIN_ELAPSED_MIN", "15") or 15))
+    except Exception:
+        min_elapsed = 15.0
+    elapsed = max(_session_elapsed_min(now), min_elapsed)
+    if elapsed >= _SESSION_TOTAL_MIN:
+        return float(trading_value or 0.0)
+    return float(trading_value or 0.0) * _SESSION_TOTAL_MIN / elapsed
+
 def _price_drift_max_pct() -> float:
     """判定価格からの許容乖離 (%)。0 で無効。"""
     try:
@@ -1454,15 +1490,20 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
     # 2026-09-28: 薄い銘柄は最小ロットでも発注しない。
     #   7883 は当日売買代金 4.6 億で 700 株を成行売りし -4,000 円。
     #   既存の 800 万未満 -> MIN_ENTRY_QTY では全く止まらなかった。
+    #   2026-10-28: 累計ではなく 1 日換算 (時間あたりの売買代金) で比べる。
     _min_tv_hard = _entry_min_trading_value_hard()
-    if _min_tv_hard > 0 and 0 < float(trading_value or 0.0) < _min_tv_hard:
+    _tv_day_equiv = _entry_trading_value_day_equiv(float(trading_value or 0.0))
+    if _min_tv_hard > 0 and 0 < float(trading_value or 0.0) and _tv_day_equiv < _min_tv_hard:
         logger.warning(
-            "[ENTRY LIQUIDITY HARD] reject symbol=%s side=%s trading_value=%.0f min=%.0f "
+            "[ENTRY LIQUIDITY HARD] reject symbol=%s side=%s trading_value=%.0f day_equiv=%.0f "
+            "elapsed_min=%.1f min=%.0f "
             "(薄い銘柄は決済の滑りで値幅を失う。9/28 の 7883 は 4.6 億で -4,000 円)",
-            symbol, side, float(trading_value or 0.0), _min_tv_hard,
+            symbol, side, float(trading_value or 0.0), _tv_day_equiv,
+            _session_elapsed_min(), _min_tv_hard,
         )
         return _ng("LOW_LIQUIDITY_HARD", symbol=symbol, side=side,
-                   trading_value=float(trading_value or 0.0), min_trading_value=_min_tv_hard)
+                   trading_value=float(trading_value or 0.0),
+                   trading_value_day_equiv=_tv_day_equiv, min_trading_value=_min_tv_hard)
 
     forced_min_qty = False
     if qty_override is not None:
