@@ -1100,6 +1100,13 @@ def _execute_exit_single(symbol: str, reason: str, exit_price: float) -> bool:
             pos["updated_at"] = dt.datetime.now()
             logger.warning("✅ EXIT COMPLETE symbol=%s pnl=%.4f reason=%s order_id=%s", symbol, pnl, reason, order_id)
             _remove_from_memory_positions(symbol)
+            # 2026-10-28: 損切り (0.3%) の後は戻り始めを見て入り直す (trading/strategies/stop_reentry.py)
+            if str(reason or "").startswith("ENTRY_PRICE_STOP"):
+                try:
+                    from trading.strategies.stop_reentry import register as _stop_reentry_register
+                    _stop_reentry_register(symbol, side, qty, exit_price, reason)
+                except Exception:
+                    logger.exception("[EXIT_EXECUTOR] stop_reentry register failed symbol=%s", symbol)
             return True
         except Exception:
             logger.exception("[EXIT_EXECUTOR_FATAL] symbol=%s", symbol)

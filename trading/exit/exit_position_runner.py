@@ -674,6 +674,8 @@ def _et3_abs_stop_pct(current_default: float = 0.35) -> float:
 #   EXIT_STOP_DAILY_ATR_ENABLED=0 で従来の一律に戻る。
 # 2026-10-28: 上限を 1.5% → 3.0% に (ユーザー判断)。3042 (日足 ATR 18.8%) が 1.5% で
 #   10 秒の下ひげに切られ、25 秒後に買値を回復・5 分後に +3.4%。EXIT_STOP_MAX_PCT で戻せる。
+# 2026-10-28 15 時: 上限を 0.3% に (ユーザー判断)。ノイズで切られる分は、戻り始めで入り直して取り返す
+#   (trading/strategies/stop_reentry.py)。下限・日足なしの値も上限を超えないようにする。
 # ------------------------------------------------------------
 _DAILY_ATR_CACHE: Dict[str, Any] = {}
 
@@ -715,10 +717,11 @@ def _et3_stop_pct_for(symbol: str, fallback: float) -> tuple[float, str]:
     if str(os.getenv("EXIT_STOP_DAILY_ATR_ENABLED", "1")).strip().lower() in ("0", "false", "no", "off"):
         return fallback, "fixed"
     mult = _et3_env_float("EXIT_STOP_DAILY_ATR_MULT", 0.15)
-    lo, hi = _et3_env_float("EXIT_STOP_MIN_PCT", 0.5), _et3_env_float("EXIT_STOP_MAX_PCT", 3.0)
+    hi = _et3_env_float("EXIT_STOP_MAX_PCT", 0.3)
+    lo = min(_et3_env_float("EXIT_STOP_MIN_PCT", 0.5), hi)
     datr = _daily_atr_pct(symbol)
     if datr is None:
-        return _et3_env_float("EXIT_STOP_NO_DAILY_ATR_PCT", 0.8), "no_daily_atr"
+        return min(_et3_env_float("EXIT_STOP_NO_DAILY_ATR_PCT", 0.8), hi), "no_daily_atr"
     return min(max(datr * mult, lo), hi), f"daily_atr={datr:.2f}"
 
 

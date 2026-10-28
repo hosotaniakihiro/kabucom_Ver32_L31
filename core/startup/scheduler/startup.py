@@ -145,6 +145,12 @@ def start_scheduler_stack_before_restore() -> None:
         _register_ma_pullback()
     except Exception:
         logger.exception("[startup.scheduler] ma_pullback register failed")
+    # 2026-10-28: 損切り後に下げ止まって戻り始めたら入り直す (trading/strategies/stop_reentry.py)
+    try:
+        from trading.strategies.stop_reentry import register_scheduler_safe as _register_stop_reentry
+        _register_stop_reentry()
+    except Exception:
+        logger.exception("[startup.scheduler] stop_reentry register failed")
     # 2026-10-26: 場中の決算直後の値動きを記録 (売買しない、trading/monitors/earnings_watch.py)
     try:
         from trading.monitors.earnings_watch import register_scheduler_safe as _register_earnings_watch
