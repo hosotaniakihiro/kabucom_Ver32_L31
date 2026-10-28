@@ -652,6 +652,68 @@ def _day_change_guard(*, symbol: Any, side: Any, source: Any, entry_row: Any):
         day_change_pct=round(day, 3), limit_pct=limit,
     )
 
+def _push_day_range(symbol: Any) -> Optional[Tuple[float, float, float]]:
+    """PUSH DB の最新行から (現在値, 当日高値, 当日安値)。取れなければ None。"""
+    try:
+        from trading.push.latest_price_db_feeder import _db_path
+
+        path = _db_path()
+        if not path or not os.path.exists(path):
+            return None
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        try:
+            r = conn.execute(
+                "SELECT price, high_price, low_price FROM stream_data_raw "
+                "WHERE symbol=? ORDER BY datetime DESC LIMIT 1",
+                (str(symbol or "").strip(),),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("[HIGH ZONE BUY] push db read failed symbol=%s", symbol, exc_info=True)
+        return None
+    if not r:
+        return None
+    px, hi, lo = (_safe_float(v, 0.0) for v in r)
+    if px <= 0 or hi <= 0 or lo <= 0 or hi <= lo:
+        return None
+    return px, hi, lo
+
+
+def _high_zone_buy_guard(*, symbol: Any, side: Any, source: Any):
+    """当日値幅の上のほうで、安値から十分上げた銘柄は買わない (2026-10-28 ユーザー判断)。
+
+    10/28 は買い 30 件のうち 14 件が当日値幅の上 85% 以上で、買った後 15 分の最大上昇は
+    平均 +0.23% (それ以外は +0.66%)。9984 は 12:51 に安値から +4% の高値圏で買い -0.4%。
+    10 月の 1 分足 (Yahoo、約 850 銘柄/日) では、安値 +3〜5% の高値圏は 30 分後に
+    空売りでもコスト前 ±0 で、買いはコストの分だけ負ける。
+    同じデータで「値幅の上 80% 以上・安値 +3% 以上」の買いは 1,544 回、30 分後 -0.40% (コスト 0.2% 込み)、
+    勝率 35%、前半 -0.35% / 後半 -0.46%。85%・90% にしても同じ (-0.41% / -0.40%)。
+    ENTRY_HIGH_ZONE_BUY_POS=0 で無効。
+    """
+    if str(side or "").upper() != "BUY":
+        return None
+    pos_min = _env_float_safe("ENTRY_HIGH_ZONE_BUY_POS", 0.8)
+    rise_min = _env_float_safe("ENTRY_HIGH_ZONE_BUY_RISE_PCT", 3.0)
+    if pos_min <= 0:
+        return None
+    rng = _push_day_range(symbol)
+    if rng is None:
+        return None
+    px, hi, lo = rng
+    pos = (px - lo) / (hi - lo)
+    rise = (px / lo - 1.0) * 100.0
+    if pos < pos_min or rise < rise_min:
+        return None
+    logger.warning(
+        "[HIGH ZONE BUY] reject symbol=%s source=%s price=%.1f day_high=%.1f day_low=%.1f "
+        "pos=%.2f>=%.2f rise_from_low=%.2f%%>=%.1f%% (高値圏の買いは 10 月の検証でコスト負け)",
+        symbol, source, px, hi, lo, pos, pos_min, rise, rise_min,
+    )
+    return _ng("HIGH_ZONE_BUY", symbol=symbol, side="BUY", price=px, day_high=hi, day_low=lo,
+               pos=round(pos, 3), rise_from_low_pct=round(rise, 2))
+
+
 def _entry_max_qty() -> int:
     """1 回の発注で許す最大株数 (2026-09-28)。0 で無効。
 
@@ -1376,6 +1438,10 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
     _day_ng = _day_change_guard(symbol=symbol, side=side, source=source, entry_row=entry_row)
     if _day_ng is not None:
         return _day_ng
+
+    _hz_ng = _high_zone_buy_guard(symbol=symbol, side=side, source=source)
+    if _hz_ng is not None:
+        return _hz_ng
 
     # 2026-10-08: テーマ (セキュリティ関連) に一斉に買いが入っている間は、その銘柄を空売りしない (ユーザー判断)。
     try:
