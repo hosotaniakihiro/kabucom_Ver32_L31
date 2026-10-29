@@ -736,13 +736,15 @@ def _entry_min_trading_value_hard() -> float:
     最小ロットなら入る」という緩い扱いで、7883 (当日 4.6 億) が通っていた。
     9/28 の実測では 4.6 億が明確に薄く、34 億以上はスリッページが
     1 株あたり 1 円未満だった。間を取って 10 億にする。
+    2026-10-29 (ユーザー判断「1 日で 1 億に届くぐらいまで敷居を下げたい」): 10 億 -> 1 億。
+    寄り直後に入れる銘柄が限られるため。7883 (1 日換算 7.3 億) のような薄い銘柄も通るようになる。
     """
     import os
 
     try:
-        return max(0.0, float(os.getenv("ENTRY_MIN_TRADING_VALUE_HARD", "1000000000") or 0.0))
+        return max(0.0, float(os.getenv("ENTRY_MIN_TRADING_VALUE_HARD", "100000000") or 0.0))
     except Exception:
-        return 1_000_000_000.0
+        return 100_000_000.0
 
 
 # 東証の立会時間 (前場 9:00-11:30 / 後場 12:30-15:30) の合計分数
