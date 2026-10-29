@@ -242,6 +242,15 @@ def _force_close_ws_for_reconnect(reason: str, *, stale_age: float | None, stale
         _safe_set_runtime("push_ws_stale_age_sec", stale_age)
         _safe_set_runtime("push_ws_stale_count", stale_count)
 
+        # 2026-10-29: 自分で閉じたことを runner に伝える。場中の再接続の待ちの「続いた回数」に数えない
+        #   (昼休み・寄り前の自己切断で回数が積み上がり、場が開いた時点で 15 秒待ちになっていた)。
+        try:
+            from .ws_callbacks import note_disconnect_info
+
+            note_disconnect_info(self_close_reason=reason)
+        except Exception:
+            logger.debug("[PUSH MONITOR][WS STALE] note self close failed", exc_info=True)
+
         state._connected_event.clear()
         _safe_set_runtime("ws_connected", False)
         _clear_sender()

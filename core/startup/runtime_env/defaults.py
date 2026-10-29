@@ -97,6 +97,20 @@ PUSH_DEFAULTS: Dict[str, str] = {
     # 即死が続くときの上限。1.0 だと 300 回連続でも 1 秒間隔で撃ち続けるため 15 秒まで許す。
     "PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC": "15.0",
     "PUSH_STREAM_RECONNECT_BACKOFF_LADDER_SEC": "1,2,4,8,15",
+    # 2026-10-29: 上の 2 つ (15 秒・1,2,4,8,15) は場外だけに使う。場中は下の INTRADAY_* を使う。
+    #   場中は kabu Station 側からの RST (10054) が数秒〜数十秒ごとに来るので、15 秒待つと
+    #   10/27 は場中の 56%・10/28 は 45% の秒で受信が 0 だった。上限 2 秒で、0 にはしない (8/28 の撃ち続けを避ける)。
+    #   その接続で 1 件でも受信していれば回数を 0 に戻す。monitor の自己切断は回数に数えない。
+    #   PUSH_STREAM_RECONNECT_SESSION_AWARE=0 で 10/28 以前の待ち方に戻る (docs/push_fix_20261029/PUSH_FIX.md)。
+    "PUSH_STREAM_RECONNECT_SESSION_AWARE": "1",
+    "PUSH_STREAM_RECONNECT_INTRADAY_LADDER_SEC": "0.3,0.5,1,2",
+    "PUSH_STREAM_RECONNECT_INTRADAY_MAX_SEC": "2.0",
+    "PUSH_STREAM_RECONNECT_RESET_ON_RECEIVE": "1",
+    # 2026-10-29: 差分登録で枠が足りない・一覧がずれたとき、全解除ではなく「はみ出し」の銘柄ごとの解除で収める。
+    #   0 で 10/28 以前 (全解除→全登録へ落とす) に戻る。
+    "PUSH_REGISTER_DIFF_TRIM_EXTRA": "1",
+    # 2026-10-29: 10054 の文言を含んでも捨てない logger (自分の push_stream の警告)。空文字で従来どおり全部捨てる。
+    "PUSH_WS_10054_KEEP_LOGGER_PREFIXES": "trading.push.push_stream",
     "PUSH_STREAM_RECONNECT_STABLE_RESET_SEC": "5.0",
     "PUSH_STREAM_SHORT_LIVED_SEC": "1.0",
     "PUSH_STREAM_SHORT_LIVED_EXTRA_COOLDOWN_SEC": "0.0",

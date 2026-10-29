@@ -1031,8 +1031,22 @@ def _try_differential_register(
 
     # 2026-10-22: 解除→登録は待たずに続けて撃つ(kabu は解除の応答を返した時点で RegistList から消えている)。
     #   解除の応答の一覧で追加分を計算し直し、枠(50)を超えないことを確かめてから登録する。
+    #
+    # 2026-10-29: 入れ替えで登録が 0 件になる瞬間を作らない。
+    #   残す銘柄 (keep) が 0 件のときは、解除する銘柄を 1 つだけ残して先に入れ替え、最後にその 1 つを入れ替える。
+    trim = _diff_trim_extra_enabled()
+    held_back: list[str] = []
+    if trim and vendor is not None and to_remove and to_add and not keep:
+        held_back = [to_remove[-1]]
+        to_remove = to_remove[:-1]
+        logger.info(
+            "[SUB MANAGER][DIFF REGISTER] keep=0 のため 1 銘柄 %s を残して入れ替える (登録 0 件の瞬間を作らない)",
+            held_back[0],
+        )
+
     t0 = time.perf_counter()
     t_unreg = t0
+    trimmed: list[str] = []
     if to_remove:
         if not run_unregister_symbols(to_remove):
             logger.warning(
@@ -1046,17 +1060,72 @@ def _try_differential_register(
             after_set = set(after)
             to_add = [s for s in target if s not in after_set]
             if len(after) + len(to_add) > REGISTER_LIMIT:
-                logger.warning(
-                    "[SUB MANAGER][DIFF REGISTER] 解除後も枠が足りない registered=%d add=%d limit=%d -> 全解除→全登録へ",
-                    len(after), len(to_add), REGISTER_LIMIT,
-                )
-                return None
+                if not trim:
+                    logger.warning(
+                        "[SUB MANAGER][DIFF REGISTER] 解除後も枠が足りない registered=%d add=%d limit=%d -> 全解除→全登録へ",
+                        len(after), len(to_add), REGISTER_LIMIT,
+                    )
+                    return None
+                # 2026-10-29: 解除の応答に、目標に無い銘柄が増えていることがある
+                #   (10/29 前場の 154 件はすべて「直前の一覧に無かった銘柄が増えた」形で、こちらの解除は効いていた。
+                #    この プロセス以外で登録できるのは kabu の /board・/symbol の自動登録だけ)。
+                #   旧実装はここで全解除→全登録へ落ちて、登録 0 件の瞬間を作っていた (10/29 前場 171 回)。
+                #   目標に無い銘柄 (はみ出し) だけを銘柄ごとに解除してから追加する。
+                r = _unregister_extras_for_room(after, tgt_set, held=set(held_back), stage="after_unregister")
+                if r is None:
+                    return None
+                trimmed += r
+                after = vendor_registered_symbols() or []
+                after_set = set(after)
+                to_add = [s for s in target if s not in after_set]
+                room = REGISTER_LIMIT - len(after)
+                if len(to_add) > room:
+                    # はみ出しを外しても足りない (=残しておいた 1 銘柄の分)。入るだけ入れ、残りは後段で入れる。
+                    (logger.info if held_back else logger.warning)(
+                        "[SUB MANAGER][DIFF REGISTER] はみ出しを外しても枠が足りない registered=%d add=%d limit=%d "
+                        "-> 入る %d 件だけ先に登録する (全解除しない)",
+                        len(after), len(to_add), REGISTER_LIMIT, max(0, room),
+                    )
+                    to_add = to_add[: max(0, room)]
+    elif held_back:
+        t_unreg = time.perf_counter()
 
-    if not to_add:
+    if held_back:
+        # 残した 1 銘柄の分は、最初の登録では枠に入らないことがある。入るだけ先に入れる。
+        cur_now = vendor_registered_symbols()
+        if cur_now is not None:
+            room = REGISTER_LIMIT - len(cur_now)
+            to_add = [s for s in to_add if s not in set(cur_now)][: max(0, room)]
+
+    if not to_add and not held_back:
+        if trimmed:
+            logger.info(
+                "[SUB MANAGER][DIFF REGISTER] done removed=%d trimmed=%d added=0", len(to_remove), len(trimmed),
+            )
         return True
 
     t_reg0 = time.perf_counter()
-    ok, content = _register_once_with_content(to_add, exchange=exchange)
+    if to_add:
+        ok, content = _register_once_with_content(to_add, exchange=exchange)
+    else:
+        ok, content = True, {"RegistList": [{"Symbol": s} for s in (vendor_registered_symbols() or [])]}
+    if ok and held_back:
+        # 2 段目: 残しておいた 1 銘柄を解除し、まだ入っていない目標を登録する。
+        if not run_unregister_symbols(held_back):
+            logger.warning(
+                "[SUB MANAGER][DIFF REGISTER] held-back unregister failed symbol=%s -> 全解除→全登録へフォールバック",
+                held_back[0],
+            )
+            return None
+        to_remove = to_remove + held_back
+        cur_now = vendor_registered_symbols() or []
+        rest = [s for s in target if s not in set(cur_now)]
+        rest = rest[: max(0, REGISTER_LIMIT - len(cur_now))]
+        if rest:
+            ok, content = _register_once_with_content(rest, exchange=exchange)
+            to_add = list(to_add) + rest
+        else:
+            content = {"RegistList": [{"Symbol": s} for s in cur_now]}
     t_reg1 = time.perf_counter()
     logger.info(
         "[SUB MANAGER][DIFF REGISTER][TIMING] unregister_ms=%.1f gap_ms=%.1f register_ms=%.1f "
@@ -1080,22 +1149,72 @@ def _try_differential_register(
     # vendor が返した実際の登録一覧と突き合わせる。
     # ここがズレたまま差分を続けると 4002006 レジスト数エラーになるので、
     # ズレたら一度だけ全解除→全登録へ落とす。
+    # 2026-10-29: 目標に無い銘柄 (はみ出し) は銘柄ごとに外す。足りない銘柄は記録だけして次の周期に任せる
+    #   (次の周期の current は kabu の一覧なので、足りない分は add に入る)。全解除はしない。
     actual = _registered_symbols_from_content(content)
     if actual and set(actual) != tgt_set:
+        missing = sorted(tgt_set - set(actual))
+        extra = sorted(set(actual) - tgt_set)
+        if not trim:
+            logger.warning(
+                "[SUB MANAGER][DIFF REGISTER] vendor RegistList mismatch actual=%d target=%d "
+                "missing=%s extra=%s -> 全解除→全登録で作り直す",
+                len(actual), len(target), missing[:10], extra[:10],
+            )
+            return None
         logger.warning(
             "[SUB MANAGER][DIFF REGISTER] vendor RegistList mismatch actual=%d target=%d "
-            "missing=%s extra=%s -> 全解除→全登録で作り直す",
-            len(actual), len(target),
-            sorted(tgt_set - set(actual))[:10],
-            sorted(set(actual) - tgt_set)[:10],
+            "missing=%s extra=%s -> はみ出しだけ銘柄ごとに解除する (全解除しない)",
+            len(actual), len(target), missing[:10], extra[:10],
         )
-        return None
+        if extra:
+            r = _unregister_extras_for_room(actual, tgt_set, held=set(), stage="after_register")
+            if r is None:
+                return None
+            trimmed += r
 
     logger.info(
-        "[SUB MANAGER][DIFF REGISTER] done removed=%d added=%d registered=%d",
-        len(to_remove), len(to_add), len(actual) if actual else len(target),
+        "[SUB MANAGER][DIFF REGISTER] done removed=%d trimmed=%d added=%d registered=%d",
+        len(to_remove), len(trimmed), len(to_add),
+        len(vendor_registered_symbols() or []) if actual else len(target),
     )
     return True
+
+
+def _diff_trim_extra_enabled() -> bool:
+    """差分登録で枠が足りない・一覧がずれたとき、全解除ではなく「はみ出し」の銘柄ごとの解除で収めるか。
+
+    PUSH_REGISTER_DIFF_TRIM_EXTRA=0 で 2026-10-28 以前の動き (全解除→全登録へ落とす) に戻る。
+    """
+    return _env_bool("PUSH_REGISTER_DIFF_TRIM_EXTRA", True)
+
+
+def _unregister_extras_for_room(
+    registered: Sequence[str],
+    target_set: set,
+    *,
+    held: set,
+    stage: str,
+) -> Optional[list]:
+    """kabu の一覧のうち目標に無い銘柄 (held は除く) を銘柄ごとに解除する。
+
+    戻り値: 解除した銘柄 (無ければ [])。解除に失敗したら None (呼び出し側は従来どおり全解除へ落とす)。
+    """
+    extra = [s for s in _normalize_symbols(registered) if s not in target_set and s not in held]
+    if not extra:
+        return []
+    logger.warning(
+        "[SUB MANAGER][DIFF REGISTER][TRIM] 目標に無い銘柄を銘柄ごとに解除する stage=%s registered=%d extra=%d head=%s "
+        "(kabu の /board・/symbol の自動登録と見られる。全解除はしない)",
+        stage, len(registered), len(extra), extra[:10],
+    )
+    if not run_unregister_symbols(extra):
+        logger.warning(
+            "[SUB MANAGER][DIFF REGISTER][TRIM] はみ出しの解除に失敗 stage=%s size=%d -> 全解除→全登録へフォールバック",
+            stage, len(extra),
+        )
+        return None
+    return extra
 
 
 def _reg_state():

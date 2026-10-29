@@ -73,6 +73,11 @@ _last_error_at: Optional[dt.datetime] = None
 _last_connect_at: Optional[dt.datetime] = None
 _last_disconnect_at: Optional[dt.datetime] = None
 
+# 2026-10-29: 直前の切断の理由。ws_callbacks (on_error/on_close) と monitor (自己切断) が書き、
+#   runner が接続ごとに取り出して 1 行のログにする。
+#   keys: cause / error / close_code / close_msg / self_close_reason
+_disconnect_info: dict = {}
+
 _total_received = 0
 _total_flushed = 0
 _total_dropped = 0

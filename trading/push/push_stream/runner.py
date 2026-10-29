@@ -5,6 +5,12 @@
 # 【概要】
 #   kabu Station PUSH WebSocket runner
 #
+# 【2026-10-29】
+#   ✔ 再接続の待ちを場中と場外で分ける (場中 0.3,0.5,1,2 秒・上限 2 秒)。
+#     受信のあった接続・monitor の自己切断は「続いた回数」に数えない。場が開いたら回数を 0 に戻す。
+#   ✔ 切断の理由 (10054 / close code / 自己切断) と接続中の受信件数を "reconnect after" の 1 行に出す。
+#   ✔ PUSH_STREAM_RECONNECT_SESSION_AWARE=0 で従来の待ち方に戻る。
+#
 # 【REV1.8】
 #   ✔ vendor sample compatible run_forever() を本体実装
 #   ✔ ローテーションREST登録中はWS再接続を一時停止
@@ -19,6 +25,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import importlib
 import logging
 import os
@@ -358,34 +365,46 @@ def _wait_while_rotation_registering() -> None:
 
 _RECONNECT_CONSECUTIVE = 0
 _RECONNECT_TOTAL = 0
+# 2026-10-29: 場外 (寄り前・昼休み・引け後・休日) の切断は別の回数で数える。
+#   場中の回数に混ぜると、昼休み・寄り前の monitor の自己切断で回数が積み上がり、
+#   場が開いた時点で既に 15 秒待ちになっていた (10/27 場中の受信 0 の秒 56%、10/28 45%)。
+_RECONNECT_OFF_CONSECUTIVE = 0
+_RECONNECT_LAST_SESSION: Optional[str] = None
+
+
+def _session_aware_enabled() -> bool:
+    """PUSH_STREAM_RECONNECT_SESSION_AWARE=0 で 2026-10-28 以前の待ち方 (1 本の回数・1,2,4,8,15 秒) に戻る。"""
+    return _env_bool("PUSH_STREAM_RECONNECT_SESSION_AWARE", True)
 
 
 def reconnect_stats() -> dict:
     """WS 再接続の状況。storm 判定用。"""
+    session = _RECONNECT_LAST_SESSION
+    consecutive = _RECONNECT_CONSECUTIVE
+    if _session_aware_enabled() and session == "off":
+        consecutive = _RECONNECT_OFF_CONSECUTIVE
     return {
-        "consecutive_fast_deaths": _RECONNECT_CONSECUTIVE,
+        "consecutive_fast_deaths": consecutive,
+        "consecutive_intraday": _RECONNECT_CONSECUTIVE,
+        "consecutive_off_session": _RECONNECT_OFF_CONSECUTIVE,
+        "session": session,
         "total_reconnects": _RECONNECT_TOTAL,
         "base_sec": _env_float("PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC", RECONNECT_WAIT_SEC),
         "max_sec": _env_float("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", 30.0),
+        "intraday_max_sec": _env_float("PUSH_STREAM_RECONNECT_INTRADAY_MAX_SEC", 2.0),
         "min_healthy_sec": _env_float("PUSH_STREAM_WS_MIN_HEALTHY_SEC", 60.0),
     }
 
 
 def reset_reconnect_stats_for_test() -> None:
-    global _RECONNECT_CONSECUTIVE, _RECONNECT_TOTAL
+    global _RECONNECT_CONSECUTIVE, _RECONNECT_TOTAL, _RECONNECT_OFF_CONSECUTIVE, _RECONNECT_LAST_SESSION
     _RECONNECT_CONSECUTIVE = 0
     _RECONNECT_TOTAL = 0
+    _RECONNECT_OFF_CONSECUTIVE = 0
+    _RECONNECT_LAST_SESSION = None
 
 
-def _reconnect_backoff_ladder() -> list:
-    """即死が続くときの待機秒ラダー (既定 1,2,4,8,15 秒で頭打ち)。
-
-    従来は base * 2**(n-1) を max_wait で頭打ちにしていたが、
-    max_wait の既定が 1.0 秒だったため 300 回連続の即死でも
-    1 秒間隔で再接続を撃ち続け、kabu Station とローカル資源を
-    無駄に叩いていた (2026-08-31 実測 consecutive=316 / next wait=1.0s)。
-    """
-    raw = os.environ.get("PUSH_STREAM_RECONNECT_BACKOFF_LADDER_SEC", "1,2,4,8,15")
+def _parse_ladder(raw: Any, fallback: list) -> list:
     out = []
     for part in str(raw).split(","):
         part = part.strip()
@@ -395,7 +414,74 @@ def _reconnect_backoff_ladder() -> list:
             out.append(max(0.0, float(part)))
         except Exception:
             continue
-    return out or [1.0, 2.0, 4.0, 8.0, 15.0]
+    return out or list(fallback)
+
+
+def _reconnect_backoff_ladder() -> list:
+    """即死が続くときの待機秒ラダー (既定 1,2,4,8,15 秒で頭打ち)。
+
+    従来は base * 2**(n-1) を max_wait で頭打ちにしていたが、
+    max_wait の既定が 1.0 秒だったため 300 回連続の即死でも
+    1 秒間隔で再接続を撃ち続け、kabu Station とローカル資源を
+    無駄に叩いていた (2026-08-31 実測 consecutive=316 / next wait=1.0s)。
+
+    2026-10-29: 場外 (と PUSH_STREAM_RECONNECT_SESSION_AWARE=0 のとき) だけこのラダーを使う。
+    """
+    return _parse_ladder(
+        os.environ.get("PUSH_STREAM_RECONNECT_BACKOFF_LADDER_SEC", "1,2,4,8,15"),
+        [1.0, 2.0, 4.0, 8.0, 15.0],
+    )
+
+
+def _intraday_backoff_ladder() -> list:
+    """場中の待機秒ラダー (既定 0.3,0.5,1,2 秒。上限は PUSH_STREAM_RECONNECT_INTRADAY_MAX_SEC=2)。
+
+    場中は kabu Station 側からの RST (WinError 10054) が数秒〜数十秒ごとに来る (2026-10-22〜、理由は未特定)。
+    15 秒待つと RST 1 回ごとに 16〜20 秒の空白になる。上限を 2 秒にして空白を約 1 秒にする。
+    8/28 のような「0.5 秒間隔で撃ち続ける」状態にはしないため、上限は 2 秒で止める (0 にはしない)。
+    """
+    return _parse_ladder(
+        os.environ.get("PUSH_STREAM_RECONNECT_INTRADAY_LADDER_SEC", "0.3,0.5,1,2"),
+        [0.3, 0.5, 1.0, 2.0],
+    )
+
+
+def _jst_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).replace(tzinfo=None)
+
+
+_OPEN_TIMES = ((9, 0), (12, 30))
+
+
+def _market_session(now: Optional[dt.datetime] = None) -> str:
+    """'intraday' (前場 9:00〜11:30・後場 12:30〜15:30 の平日) か 'off'。祝日は見ない (受信が無いだけで害は無い)。"""
+    now = now or _jst_now()
+    if now.weekday() >= 5:
+        return "off"
+    hm = now.hour * 60 + now.minute
+    if 9 * 60 <= hm < 11 * 60 + 30 or 12 * 60 + 30 <= hm < 15 * 60 + 30:
+        return "intraday"
+    return "off"
+
+
+def _seconds_until_open(now: Optional[dt.datetime] = None) -> Optional[float]:
+    """同じ日のうちに次に場が開く (9:00 / 12:30) までの秒数。無ければ None。"""
+    now = now or _jst_now()
+    if now.weekday() >= 5:
+        return None
+    for h, m in _OPEN_TIMES:
+        t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if t > now:
+            return (t - now).total_seconds()
+    return None
+
+
+def _ladder_wait(consecutive: int, *, base: float, max_wait: float, ladder: list) -> float:
+    if consecutive <= 1:
+        # 単発の切断はこれまで通り即復帰する (遅くしない)。
+        return float(base)
+    idx = min(len(ladder) - 1, consecutive - 2)
+    return float(min(max_wait, max(base, ladder[idx])))
 
 
 def _note_disconnect_and_wait(
@@ -404,31 +490,108 @@ def _note_disconnect_and_wait(
     base: float,
     max_wait: float,
     min_healthy: float,
+    received: Optional[int] = None,
+    self_close_reason: Optional[str] = None,
+    now: Optional[dt.datetime] = None,
 ) -> Tuple[float, str]:
     """切断を記録し、次の再接続までの待機秒数を返す。
 
     uptime >= min_healthy なら「正常な切断」として連続失敗を 0 に戻すので、
     通常の切断からの復帰は base 秒のまま (= 遅くしない)。
     即死が続くときだけ指数的に待つ。
+
+    2026-10-29 (PUSH_STREAM_RECONNECT_SESSION_AWARE=1、既定):
+      - 場中と場外で回数を分ける。場が開いたら場中の回数を 0 に戻す。
+      - 場中: その接続で 1 件でも受信していたら回数を 0 に戻す (PUSH_STREAM_RECONNECT_RESET_ON_RECEIVE)。
+              monitor の自己切断 (self_close_reason あり) は回数に数えない。
+              待ちは 0.3,0.5,1,2 秒・上限 2 秒 (PUSH_STREAM_RECONNECT_INTRADAY_*)。
+      - 場外: 従来のラダー (1,2,4,8,15 秒) で数える。ただし次に場が開く時刻をまたいで待たない。
     """
-    global _RECONNECT_CONSECUTIVE, _RECONNECT_TOTAL
+    global _RECONNECT_CONSECUTIVE, _RECONNECT_TOTAL, _RECONNECT_OFF_CONSECUTIVE, _RECONNECT_LAST_SESSION
 
     _RECONNECT_TOTAL += 1
-    if uptime >= min_healthy:
-        _RECONNECT_CONSECUTIVE = 0
-        verdict = "healthy_disconnect"
-    else:
-        _RECONNECT_CONSECUTIVE += 1
-        verdict = "fast_death"
 
-    if _RECONNECT_CONSECUTIVE <= 1:
-        # 単発の切断はこれまで通り即復帰する (遅くしない)。
-        wait_sec = base
+    if not _session_aware_enabled():
+        if uptime >= min_healthy:
+            _RECONNECT_CONSECUTIVE = 0
+            verdict = "healthy_disconnect"
+        else:
+            _RECONNECT_CONSECUTIVE += 1
+            verdict = "fast_death"
+        wait_sec = _ladder_wait(
+            _RECONNECT_CONSECUTIVE, base=base, max_wait=max_wait, ladder=_reconnect_backoff_ladder(),
+        )
+        return float(wait_sec), verdict
+
+    session = _market_session(now)
+    if session == "intraday" and _RECONNECT_LAST_SESSION != "intraday":
+        if _RECONNECT_CONSECUTIVE:
+            logger.warning(
+                "[push_stream] market session opened -> reset intraday reconnect count %d -> 0",
+                _RECONNECT_CONSECUTIVE,
+            )
+        _RECONNECT_CONSECUTIVE = 0
+    _RECONNECT_LAST_SESSION = session
+
+    if session == "intraday":
+        if self_close_reason:
+            verdict = "self_close"
+        elif uptime >= min_healthy:
+            _RECONNECT_CONSECUTIVE = 0
+            verdict = "healthy_disconnect"
+        elif (received or 0) > 0 and _env_bool("PUSH_STREAM_RECONNECT_RESET_ON_RECEIVE", True):
+            _RECONNECT_CONSECUTIVE = 0
+            verdict = "received_then_reset"
+        else:
+            _RECONNECT_CONSECUTIVE += 1
+            verdict = "fast_death"
+        intraday_max = max(base, _env_float("PUSH_STREAM_RECONNECT_INTRADAY_MAX_SEC", 2.0))
+        wait_sec = _ladder_wait(
+            _RECONNECT_CONSECUTIVE, base=base, max_wait=intraday_max, ladder=_intraday_backoff_ladder(),
+        )
+        return float(wait_sec), verdict
+
+    # 場外
+    if uptime >= min_healthy:
+        _RECONNECT_OFF_CONSECUTIVE = 0
+        verdict = "off_session_healthy_disconnect"
     else:
-        ladder = _reconnect_backoff_ladder()
-        idx = min(len(ladder) - 1, _RECONNECT_CONSECUTIVE - 2)
-        wait_sec = min(max_wait, max(base, ladder[idx]))
+        _RECONNECT_OFF_CONSECUTIVE += 1
+        verdict = "off_session_fast_death"
+    wait_sec = _ladder_wait(
+        _RECONNECT_OFF_CONSECUTIVE, base=base, max_wait=max_wait, ladder=_reconnect_backoff_ladder(),
+    )
+    until_open = _seconds_until_open(now)
+    if until_open is not None and until_open < wait_sec:
+        wait_sec = max(base, until_open)
+        verdict += "_until_open"
     return float(wait_sec), verdict
+
+
+def _take_disconnect_info() -> dict:
+    """ws_callbacks / monitor が記録した直前の切断の理由を取り出して消す。"""
+    try:
+        info = dict(getattr(state, "_disconnect_info", None) or {})
+    except Exception:
+        info = {}
+    try:
+        state._disconnect_info = {}
+    except Exception:
+        pass
+    return info
+
+
+def _format_disconnect_cause(info: dict) -> str:
+    parts = []
+    cause = info.get("cause")
+    if cause:
+        parts.append(str(cause))
+    if "close_code" in info or "close_msg" in info:
+        parts.append("close_code=%s close_msg=%s" % (info.get("close_code"), info.get("close_msg")))
+    err = info.get("error")
+    if err:
+        parts.append("error=%s" % str(err).replace("\n", " ")[:160])
+    return " ".join(parts) or "unknown(run_forever returned without callback)"
 
 
 def _run_forever_loop() -> None:
@@ -446,6 +609,9 @@ def _run_forever_loop() -> None:
         # 反復ごとに必ず初期化する (前回の値が残ると uptime を過大評価する)
         _conn_started = time.monotonic()
         _wait_while_rotation_registering()
+        # 2026-10-29: この接続で何件受けたか・なぜ切れたかを接続ごとに測る。
+        _recv_at_start = int(getattr(state, "_total_received", 0) or 0)
+        _take_disconnect_info()
         try:
             _safe_set_runtime("push_ws_url", ws_url)
             ws_app = websocket.WebSocketApp(
@@ -538,26 +704,37 @@ def _run_forever_loop() -> None:
         except Exception:
             uptime = -1.0
 
+        try:
+            recv_in_conn = max(0, int(getattr(state, "_total_received", 0) or 0) - _recv_at_start)
+        except Exception:
+            recv_in_conn = 0
+        dinfo = _take_disconnect_info()
+        cause_text = _format_disconnect_cause(dinfo)
+        self_close_reason = dinfo.get("self_close_reason")
+
         wait_sec, verdict = _note_disconnect_and_wait(
             uptime, base=base, max_wait=max_wait, min_healthy=min_healthy,
+            received=recv_in_conn, self_close_reason=self_close_reason,
         )
+        stats = reconnect_stats()
 
+        # 2026-10-29: 切断の理由を 1 行で残す (10054 / close code / 自己切断の理由 / 受信件数 / 次の待ち)。
         logger.warning(
             "[push_stream] reconnect after %.1fs uptime=%.1fs verdict=%s "
             "consecutive=%d total=%d base=%.1fs max=%.1fs min_healthy=%.0fs vendor_ws=%s "
-            "(即死が続く場合のみ指数バックオフ。正常切断は %.1fs で復帰)",
+            "cause=%s recv_in_conn=%d session=%s",
             wait_sec, uptime, verdict,
-            _RECONNECT_CONSECUTIVE, _RECONNECT_TOTAL,
+            stats.get("consecutive_fast_deaths", _RECONNECT_CONSECUTIVE), _RECONNECT_TOTAL,
             base, max_wait, min_healthy,
             _env_bool("PUSH_WS_VENDOR_RUN_FOREVER", True),
-            base,
+            cause_text, recv_in_conn, stats.get("session"),
         )
-        if _RECONNECT_CONSECUTIVE >= 5:
+        if stats.get("consecutive_fast_deaths", _RECONNECT_CONSECUTIVE) >= 5 and not self_close_reason:
             logger.error(
                 "[push_stream][WS RECONNECT STORM] 接続が %d 回連続で %.0f 秒未満で切れている。"
                 "サーバ側で弾かれている可能性が高い (別セッションが PUSH 購読を奪った / "
                 "認証失効 / 多重 websocket)。次の待機は %.1fs",
-                _RECONNECT_CONSECUTIVE, min_healthy, wait_sec,
+                stats.get("consecutive_fast_deaths", _RECONNECT_CONSECUTIVE), min_healthy, wait_sec,
             )
 
         if state._stop_event.wait(wait_sec):

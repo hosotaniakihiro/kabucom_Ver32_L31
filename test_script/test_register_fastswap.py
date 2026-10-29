@@ -68,7 +68,12 @@ def test_vendor_list_overrides_stale_program_state(kabu):
     target = A(50, "T")
     # プログラム側は 1 銘柄だけ登録していると思っている(10/21 の 4002006 の形)
     assert RO._try_differential_register(["4000"], target, exchange=1) is True
-    assert k.calls[0] == ("unregister", real)          # 実際に登録されている 46 を外す
+    # 実際に登録されている 46 を外す。2026-10-29 から、残す銘柄が 0 件の入れ替えは 1 銘柄を残して 2 段で行う
+    # (登録 0 件の瞬間を作らない)。外した銘柄の合計が実際の 46 と一致すればよい。
+    unreg = [s for c in k.calls if c[0] == "unregister" for s in c[1]]
+    assert sorted(unreg) == sorted(real)
+    assert k.calls[0] == ("unregister", real[:-1])
+    assert "unregister_all" not in [c[0] for c in k.calls]
     assert set(k.reg) == set(target)
 
 

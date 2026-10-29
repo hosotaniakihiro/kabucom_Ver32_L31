@@ -18,6 +18,9 @@
 #           実際に起動した時だけ started を出す。
 #   - V1.9: WS stale recover 後だけは PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 でも
 #           購読復旧 refresh を1回実行する。通常のA/Bローテーションではskipを尊重する。
+#   - 2026-10-29: 10054 フィルタが自分の push_stream の 1 行の警告まで捨てていたのを直す。
+#           切断の理由 (10054 / close code / 自己切断) を state._disconnect_info に残し、
+#           runner が "reconnect after ... cause=..." の 1 行に出す。
 # ============================================================
 
 from __future__ import annotations
@@ -81,10 +84,29 @@ def _is_expected_rotation_disconnect() -> bool:
     return False
 
 
+def _keep_logger_prefixes() -> tuple:
+    """10054 の文言を含んでも捨てない logger 名 (自分の push_stream の 1 行の警告)。
+
+    2026-10-29: このフィルタはルートのハンドラにも付くため、自分の
+      "[push_stream] ws reset by peer: [WinError 10054] 既存の接続は…" まで捨てていた。
+      場中の切断の 97〜100% が相手からの RST なのに、ログでは理由の無い切断に見えていた。
+      PUSH_WS_10054_KEEP_LOGGER_PREFIXES に空文字を入れると従来どおり (全部捨てる)。
+    """
+    raw = os.getenv("PUSH_WS_10054_KEEP_LOGGER_PREFIXES")
+    if raw is None:
+        raw = "trading.push.push_stream"
+    return tuple(p.strip() for p in str(raw).split(",") if p.strip())
+
+
 class _Expected10054Filter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             if not _env_bool("PUSH_WS_SUPPRESS_EXPECTED_10054_TEXT", True):
+                return True
+            name = str(getattr(record, "name", "") or "")
+            keep = _keep_logger_prefixes()
+            if keep and any(name == p or name.startswith(p + ".") for p in keep):
+                # 自分のログは 1 行の警告なので残す (traceback は付けていない)。
                 return True
             msg = record.getMessage()
             if not isinstance(msg, str):
@@ -182,6 +204,38 @@ def _ws_alive_safe() -> Any:
         return bool(_is_ws_alive())
     except Exception:
         return None
+
+
+def note_disconnect_info(
+    cause: Any = None,
+    *,
+    error: Any = None,
+    self_close_reason: Any = None,
+    close: bool = False,
+    close_code: Any = None,
+    close_msg: Any = None,
+) -> None:
+    """直前の切断の理由を state._disconnect_info に残す (runner が 1 行のログにする)。
+
+    最初に分かった理由を残す。monitor の自己切断だけは上書きする (自分で閉じたことが一番の理由)。
+    """
+    try:
+        info = getattr(state, "_disconnect_info", None)
+        if not isinstance(info, dict):
+            info = {}
+        if self_close_reason:
+            info["self_close_reason"] = str(self_close_reason)
+            info["cause"] = "self_close:%s" % self_close_reason
+        elif cause and not info.get("cause"):
+            info["cause"] = str(cause)
+        if error is not None and not info.get("error"):
+            info["error"] = str(error)[:300]
+        if close:
+            info["close_code"] = close_code
+            info["close_msg"] = close_msg
+        state._disconnect_info = info
+    except Exception:
+        logger.debug("[push_stream] note disconnect info failed", exc_info=True)
 
 
 def _mark_disconnected(reason: str, ws: Any = None) -> None:
@@ -309,25 +363,37 @@ def on_error(ws, error):
     # websocket-client 内部で、切断済み WebSocketApp の self.sock が None のまま
     # dispatcher.read(self.sock.sock, ...) に進むことがある。
     # これはアプリ側では接続断として扱い、ERROR traceback を連発させない。
+    current = _is_current_ws(ws)
+
     if "NoneType" in msg and "sock" in msg:
         logger.warning("[push_stream] ws socket already closed; mark disconnected: %s", msg)
+        if current:
+            note_disconnect_info("sock_none", error=msg)
         _mark_disconnected("sock_none", ws)
         return
 
     if "10054" in msg or isinstance(error, ConnectionResetError):
         if _is_expected_rotation_disconnect():
             logger.info("[push_stream] expected vendor ws reset during rotation; reconnecting")
+            if current:
+                note_disconnect_info("expected_rotation_reset(10054)", error=msg)
             _mark_disconnected("expected_rotation_reset", ws)
             return
         logger.warning("[push_stream] ws reset by peer: %s", msg)
+        if current:
+            note_disconnect_info("reset_by_peer(10054)", error=msg)
         _mark_disconnected("reset_by_peer", ws)
         return
 
     if "ping/pong timed out" in msg:
         logger.warning("[push_stream] ws ping timeout: %s", msg)
+        if current:
+            note_disconnect_info("ping_timeout", error=msg)
         _mark_disconnected("ping_timeout", ws)
         return
 
+    if current:
+        note_disconnect_info("error:%s" % type(error).__name__, error=msg)
     logger.error("--- ERROR ---")
     logger.error("%s", error, exc_info=True if isinstance(error, BaseException) else False)
 
@@ -344,6 +410,7 @@ def on_close(ws: websocket.WebSocketApp, close_status_code=None, close_msg=None)
         return
 
     state._last_disconnect_at = _now()
+    note_disconnect_info("close", close=True, close_code=close_status_code, close_msg=close_msg)
     if _is_expected_rotation_disconnect():
         logger.info("--- DISCONNECTED expected_rotation --- code=%s msg=%s", close_status_code, close_msg)
     else:
