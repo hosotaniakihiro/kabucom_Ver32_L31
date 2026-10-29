@@ -63,7 +63,17 @@
 - 追加: `test_script/test_push_reconnect_session_backoff.py`（22 件。待ち・場の切替・自己切断・ロールバック用の env・理由の記録・10054 フィルタ・偽の WebSocketApp で run loop を通しで）、`test_script/test_register_no_full_clear.py`（10 件。RegistList を持つ偽の kabu で、/board の自動登録の形・0 件にならない・48 を超えない・200 回のローテーション・ロールバック）。変更前のコードでは 32 件のうち 26 件が落ちる（通る 6 件は「env で従来どおり」「48 のまま」などを確かめる側）。
 - 直した既存のテスト: `test_script/test_register_fastswap.py::test_vendor_list_overrides_stale_program_state`（残す銘柄 0 件の入れ替えが 2 段になったので、解除の合計で確かめる形にした）。
 - push 関係の既存のテスト（p0_round15/18/20/22/23/27、test_no_undefined_names、test_push_*、test_register_*、test_rotation_and_ranking_flush）は、変更前と同じ結果（p0_round20 test_r20_cycle_break の既知の 1 件の失敗だけ）。
-- 全体テスト（run_all_tests.py --isolate）の結果はコミットのメッセージに書く。
+- 全体テスト（10/29 15:31〜15:41、引け後。`C:/tmp/order-safety/test_script/order_safety/run_all_tests.py <worktree> <json> --isolate`、システムの Python313、通信遮断・%LOCALAPPDATA% と NAS は一時フォルダ。同じ worktree で基準 b7ec820 → 変更後 5e479ea の順に流した）
+
+  | | 通過 | 失敗 | テスト無し | 計 |
+  |---|---|---|---|---|
+  | 基準 b7ec820 | 57 | 8 | 8 | 73 |
+  | 変更後 5e479ea | 60 | 7 | 8 | 75 |
+
+  - 変更後の失敗 7 本は、既知の 7 本と同じ（p0_round16 test_r16_fixes、p0_round18 test_r18_nas_root、p0_round20 test_r20_cycle_break・test_r20_fixes、test_main_database_token_gate、test_ranking_entry_source_schema、test_token_startup_recovery）。**新しい失敗は無い。**
+  - 基準だけ落ちた p0_round18 test_r18_tech_vec は、変更後は通った。push のコードは読まないテストで、実行のたびに結果が変わるものと見られる（今回の変更とは無関係）。
+  - 増えた 2 本は追加したテスト（どちらも通過）。
+  - fsguard が止めた書き込み（既存のテストが NAS の UNC と X: に書こうとしたもの）は、基準・変更後とも同じ 21 件。本番の場所には何も書いていない。
 
 ## 5. 反映の手順（引け後か寄り前。本番を止めている間に行う）
 
