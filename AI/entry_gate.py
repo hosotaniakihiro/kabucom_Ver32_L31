@@ -943,6 +943,13 @@ def ai_final_entry_check(row: dict) -> dict:
     result = _ai_final_entry_check_core(row)
     result = _ranking_entry_mtf_low_failopen(row, result)
     result = _low_volatility_entry_guard(row, result)
+    # 2026-10-30: 方向 AI (tv_csv2 で学習) の予測を記録するだけ。判定は変えない。
+    #   AI/mtf_shadow/runtime.py。MTF_SHADOW_ENABLED=0 で止まる。
+    try:
+        from AI.mtf_shadow import runtime as _mtf_shadow
+        _mtf_shadow.record(row, result)
+    except Exception:
+        logger.debug("[MTF SHADOW] hook failed", exc_info=True)
     return result
 
 
