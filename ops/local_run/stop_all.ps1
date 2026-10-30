@@ -8,7 +8,8 @@
 $procs = Get-CimInstance Win32_Process | Where-Object {
     $_.Name -like 'python*' -and
     ($_.CommandLine -match '株式自動売買システム' -or $_.CommandLine -match 'autostock\\src') -and
-    $_.CommandLine -notmatch 'TaskSchedule'
+    $_.CommandLine -notmatch 'TaskSchedule' -and
+    $_.CommandLine -notmatch 'rss_collector'  # 2026-10-30: 楽天 RSS の記録 (タスク autostock_rakuten_rss) は止めない
 }
 Write-Host ("stopping {0} processes" -f @($procs).Count)
 foreach ($p in $procs) {
@@ -20,7 +21,8 @@ Start-Sleep -Seconds 3
 $left = Get-CimInstance Win32_Process | Where-Object {
     $_.Name -like 'python*' -and
     ($_.CommandLine -match '株式自動売買システム' -or $_.CommandLine -match 'autostock\\src') -and
-    $_.CommandLine -notmatch 'TaskSchedule'
+    $_.CommandLine -notmatch 'TaskSchedule' -and
+    $_.CommandLine -notmatch 'rss_collector'  # 2026-10-30: 楽天 RSS の記録 (タスク autostock_rakuten_rss) は止めない
 }
 Write-Host ("left={0}" -f @($left).Count)
 
