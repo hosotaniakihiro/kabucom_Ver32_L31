@@ -80,6 +80,15 @@ def _post_order(payload: dict, token: str):
     except Exception:
         pass
 
+    # 2026-10-30: 売買しない銘柄 (kabu_api.send_order.NEVER_TRADE_SYMBOLS)。読み込めなくても 6702 は送らない。
+    try:
+        from kabu_api.send_order import _never_trade_block
+        if _never_trade_block(payload):
+            return None
+    except Exception:
+        if str(payload.get("Symbol") or "").strip() == "6702" and int(payload.get("CashMargin") or 0) != 3:
+            return None
+
     url = f"{API_URL}/sendorder"
     headers = {
         "Content-Type": "application/json",

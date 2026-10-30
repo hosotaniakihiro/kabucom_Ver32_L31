@@ -468,6 +468,96 @@ def _entry_paused_by_file(payload: dict) -> bool:
         return False
 
 
+# ============================================================
+# 2026-10-29 (ユーザー判断「注文の前に規制を確かめる」):
+#   新規注文の前に /regulations を引き、Level 2 (エラー) の規制がかかる注文は送らない。
+#   10 月は code=100033 (取引制限) で約 180 回断られ、うち 99 回が 3905 だった
+#   (30 分止めては出し直して、また断られるのを毎日くり返していた)。
+#   銘柄ごとに REGULATION_CACHE_SEC (既定 1800 秒) 覚えておく。照会に失敗したら止めない (fail-open)。
+#   売り買いとも止まる規制なら trade_restricted にも入れ、Summary AI などの候補の段階で外す。
+#   空売り規制 (価格規制、Level=null) は注文自体は通るので止めない。
+# ============================================================
+_REGULATION_CACHE: dict = {}  # symbol -> (取得時刻, RegulationsInfo list)
+
+
+def _regulations(symbol: str):
+    now = dt.datetime.now().timestamp()
+    hit = _REGULATION_CACHE.get(symbol)
+    try:
+        ttl = float(os.getenv("REGULATION_CACHE_SEC", "1800") or 1800)
+    except Exception:
+        ttl = 1800.0
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    token = get_valid_token()
+    if not token:
+        return None
+    try:
+        r = requests.get(f"{API_URL}/regulations/{symbol}@1", headers={"X-API-KEY": token}, timeout=3)
+        r.encoding = "utf-8"
+        if r.status_code != 200:
+            logger.warning("[REGULATION CHECK] status=%s symbol=%s body=%s", r.status_code, symbol, r.text[:200])
+            return None
+        info = (r.json() or {}).get("RegulationsInfo") or []
+    except Exception:
+        logger.warning("[REGULATION CHECK] request failed symbol=%s err=%s", symbol, _sys.exc_info()[1])
+        return None
+    _REGULATION_CACHE[symbol] = (now, info)
+    return info
+
+
+def _regulation_products(payload: dict) -> set:
+    """この注文に当たる規制取引区分 (Product)。0=全対象 4=新規 はいつも当たる。"""
+    cm = int(payload.get("CashMargin") or 0)
+    if cm == 1:
+        return {0, 1}
+    mtt = int(payload.get("MarginTradeType") or 0)
+    return {0, 4, 2 if mtt == 1 else 3}
+
+
+def _regulation_block_reason(payload: dict) -> str:
+    """新規注文に Level 2 の規制がかかっていれば理由を返す。それ以外 (返済・照会失敗を含む) は ""。"""
+    try:
+        cm = int(payload.get("CashMargin") or 0)
+        side = str(payload.get("Side"))
+        if not (cm == 2 or (cm == 1 and side == "2")):
+            return ""
+        if not _env_bool("REGULATION_CHECK_ENABLED", True):
+            return ""
+        sym = _safe_symbol(payload)
+        info = _regulations(sym) if sym else None
+        if not info:
+            return ""
+        products = _regulation_products(payload)
+        now_s = dt.datetime.now().strftime("%Y/%m/%d %H:%M")
+        for x in info:
+            try:
+                if int(x.get("Level") or 0) < 2:
+                    continue
+                if int(x.get("Exchange") or 0) not in (0, 1):
+                    continue
+                if int(x.get("Product") or 0) not in products:
+                    continue
+                if str(x.get("Side")) not in ("0", side):
+                    continue
+                start, end = str(x.get("LimitStartDay") or ""), str(x.get("LimitEndDay") or "")
+                if (start and now_s < start) or (end and now_s > end):
+                    continue
+            except Exception:
+                continue
+            if str(x.get("Side")) == "0":
+                try:
+                    _get_trade_restricted_root()[sym] = dt.datetime.now() + dt.timedelta(seconds=TRADE_RESTRICT_SEC)
+                except Exception:
+                    pass
+            return (f"reason={x.get('Reason')} product={x.get('Product')} side={x.get('Side')} "
+                    f"start={start} end={end}")
+        return ""
+    except Exception:
+        logger.exception("[REGULATION CHECK] failed")
+        return ""
+
+
 _PREMIUM_CACHE: dict = {}  # symbol -> (取得時刻, DayTrade dict)
 
 # 2026-10-20: 戦略ごとのプレミアム料上限 (%)。SURGE SHORT は 1 回 +2% 前後を取るので 0.4% まで払う (ユーザー判断)。
@@ -541,6 +631,28 @@ def _daytrade_short_premium_block_reason(payload: dict) -> str:
         return "reason=premium_check_error"
 
 
+# ============================================================
+# 2026-10-30 (ユーザー指示): 売買しない銘柄。どの戦略・経路からでも新規注文を送らない。
+#   6702 富士通: 家族が勤務 (インサイダー取引の疑いを避ける)。
+#   返済 (CashMargin=3) だけは通す (万一建玉があっても閉じられるように)。環境変数では外せない。
+# ============================================================
+NEVER_TRADE_SYMBOLS = frozenset({"6702"})
+
+
+def _never_trade_block(payload: dict) -> bool:
+    try:
+        if int(payload.get("CashMargin") or 0) == 3:
+            return False
+        sym = _safe_symbol(payload)
+    except Exception:
+        sym = str(payload.get("Symbol") or "")
+    if sym not in NEVER_TRADE_SYMBOLS:
+        return False
+    logger.warning("[NEVER TRADE] 売買しない銘柄なので注文を送らない symbol=%s side=%s qty=%s",
+                   sym, payload.get("Side"), payload.get("Qty"))
+    return True
+
+
 def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
     if not isinstance(payload, dict):
         logger.error("❌ send_order_common: payload is not dict type=%s payload=%s", type(payload).__name__, payload)
@@ -550,6 +662,10 @@ def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
 
     # 最重要: 市場休憩・引け後は、どの経路から来ても送信しない。
     if _block_if_market_closed(payload):
+        return None
+
+    if _never_trade_block(payload):
+        _set_last_send_order_error(payload, {"Code": "NEVER_TRADE", "Message": "symbol excluded by user"}, status_code="LOCAL")
         return None
 
     # 2026-10-19: 信用の新規買いを止める (ユーザー判断)。ENTRY_BUY_ENABLED=1 で戻す。
@@ -605,6 +721,13 @@ def send_order_common(payload: dict, *, _margin_fallback_done: bool = False):
 
     if _entry_paused_by_file(payload):
         _set_last_send_order_error(payload, {"Code": "ENTRY_PAUSE", "Message": "entry paused by file"}, status_code="LOCAL")
+        return None
+
+    _regulation_reason = _regulation_block_reason(payload)
+    if _regulation_reason:
+        logger.warning("[REGULATION CHECK] 規制があるので新規注文を送らない symbol=%s side=%s %s",
+                       _safe_symbol(payload), _payload_side_name(payload), _regulation_reason)
+        _set_last_send_order_error(payload, {"Code": "REGULATION", "Message": _regulation_reason}, status_code="LOCAL")
         return None
 
     token = get_valid_token()
